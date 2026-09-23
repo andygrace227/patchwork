@@ -1,0 +1,5 @@
+/rust/*/target/*
+/rust/target/
+.env
+./rust/data/
+./rust/*/target
