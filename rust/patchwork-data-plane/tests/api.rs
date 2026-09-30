@@ -50,12 +50,16 @@ async fn operations_are_scoped_and_persist_after_reopening() {
         .to_owned();
     let shard = ShardActor::spawn(ShardActor::new(path.clone()).await.unwrap());
     let app = api::router(shard.clone());
-    for (table_id, partition, hash) in [(1, 10, -1), (1, 10, 2), (1, 20, 3), (2, 10, -1)] {
+    for (table_id, partition_key, secondary_key) in
+        [(1, 10, -1), (1, 10, 2), (1, 20, 3), (2, 10, -1)]
+    {
         assert_eq!(
             request(
                 &app,
                 "PUT",
-                &format!("/tables/{table_id}/partitions/{partition}/records/{hash}"),
+                &format!(
+                    "/tables/{table_id}/partition-keys/{partition_key}/records/{secondary_key}"
+                ),
                 Some(json!({"value": "original"}))
             )
             .await
@@ -64,7 +68,7 @@ async fn operations_are_scoped_and_persist_after_reopening() {
         );
     }
     assert_eq!(
-        request(&app, "GET", "/tables/1/partitions/10/records/-1", None)
+        request(&app, "GET", "/tables/1/partition-keys/10/records/-1", None)
             .await
             .1["version"],
         1
@@ -73,20 +77,21 @@ async fn operations_are_scoped_and_persist_after_reopening() {
         request(
             &app,
             "PUT",
-            "/tables/1/partitions/10/records/-1",
+            "/tables/1/partition-keys/10/records/-1",
             Some(json!({"value": "updated", "version": 99}))
         )
         .await
         .0,
         StatusCode::NO_CONTENT
     );
-    let (status, record) = request(&app, "GET", "/tables/1/partitions/10/records/-1", None).await;
+    let (status, record) =
+        request(&app, "GET", "/tables/1/partition-keys/10/records/-1", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(record["version"], 2);
     assert_eq!(record["data"]["value"], "updated");
     assert_eq!(record["data"]["version"], 99); // Payload fields do not set the record version.
     assert_eq!(
-        request(&app, "GET", "/tables/1/partitions/10", None)
+        request(&app, "GET", "/tables/1/partition-keys/10", None)
             .await
             .1
             .as_array()
@@ -112,7 +117,7 @@ async fn operations_are_scoped_and_persist_after_reopening() {
         )
         .await
         .1,
-        json!([])
+        range
     );
     assert_eq!(
         request(
@@ -126,37 +131,47 @@ async fn operations_are_scoped_and_persist_after_reopening() {
         StatusCode::BAD_REQUEST
     );
     assert_eq!(
-        request(&app, "PUT", "/tables/1/partitions/10/records/-1", None)
+        request(&app, "PUT", "/tables/1/partition-keys/10/records/-1", None)
             .await
             .0,
         StatusCode::BAD_REQUEST
     );
     assert_eq!(
-        request(&app, "DELETE", "/tables/1/partitions/10/records/-1", None)
-            .await
-            .1,
+        request(
+            &app,
+            "DELETE",
+            "/tables/1/partition-keys/10/records/-1",
+            None
+        )
+        .await
+        .1,
         json!({"deleted": 1})
     );
     assert_eq!(
-        request(&app, "DELETE", "/tables/1/partitions/10/records/-1", None)
-            .await
-            .1,
+        request(
+            &app,
+            "DELETE",
+            "/tables/1/partition-keys/10/records/-1",
+            None
+        )
+        .await
+        .1,
         json!({"deleted": 0})
     );
     assert_eq!(
-        request(&app, "GET", "/tables/1/partitions/10/records/-1", None)
+        request(&app, "GET", "/tables/1/partition-keys/10/records/-1", None)
             .await
             .0,
         StatusCode::NOT_FOUND
     );
     assert_eq!(
-        request(&app, "DELETE", "/tables/1/partitions/10", None)
+        request(&app, "DELETE", "/tables/1/partition-keys/10", None)
             .await
             .1,
         json!({"deleted": 1})
     );
     assert_eq!(
-        request(&app, "GET", "/tables/1/partitions/10", None)
+        request(&app, "GET", "/tables/1/partition-keys/10", None)
             .await
             .1,
         json!([])
@@ -168,13 +183,13 @@ async fn operations_are_scoped_and_persist_after_reopening() {
     let shard = ShardActor::spawn(ShardActor::new(path).await.unwrap());
     let app = api::router(shard.clone());
     assert_eq!(
-        request(&app, "GET", "/tables/2/partitions/10/records/-1", None)
+        request(&app, "GET", "/tables/2/partition-keys/10/records/-1", None)
             .await
             .0,
         StatusCode::OK
     );
     assert_eq!(
-        request(&app, "GET", "/tables/1/partitions/20/records/3", None)
+        request(&app, "GET", "/tables/1/partition-keys/20/records/3", None)
             .await
             .0,
         StatusCode::OK
@@ -184,7 +199,7 @@ async fn operations_are_scoped_and_persist_after_reopening() {
             request(
                 &app,
                 "PUT",
-                "/tables/1/partitions/20/records/3",
+                "/tables/1/partition-keys/20/records/3",
                 Some(json!({"updated": true}))
             )
             .await
@@ -192,7 +207,7 @@ async fn operations_are_scoped_and_persist_after_reopening() {
             StatusCode::NO_CONTENT
         );
         assert_eq!(
-            request(&app, "GET", "/tables/1/partitions/20/records/3", None)
+            request(&app, "GET", "/tables/1/partition-keys/20/records/3", None)
                 .await
                 .1["version"],
             expected_version

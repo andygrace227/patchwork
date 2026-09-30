@@ -9,6 +9,7 @@ sea-orm = { version = "2", features = ["sqlx-mysql", "runtime-tokio-rustls", "ma
 serde = { version = "1", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1"
+anyhow = "1.0.104"
 
 [dev-dependencies]
 axum = "0.8"

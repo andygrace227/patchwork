@@ -1,2 +1,1 @@
-mod table;
-mod partition;
+pub mod make_table;

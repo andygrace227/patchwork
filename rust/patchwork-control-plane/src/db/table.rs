@@ -8,8 +8,12 @@ pub struct Model {
     pub table_id: i64,
     pub table_name: i64,
     pub owner: i64,
+    #[sea_orm(default_value = 0)]
+    pub owner_control_node: i64,
+    #[sea_orm(default_value = 0)]
+    pub backup_control_node: i64,
     pub partition_key_name: String,
-    pub sort_key_name: String
+    pub sort_key_name: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

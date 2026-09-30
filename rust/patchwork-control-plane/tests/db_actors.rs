@@ -30,7 +30,7 @@ async fn all_models_support_crud_and_overlapping_requests() {
     let partitions = PartitionActor::spawn(PartitionActor::new(db.clone()));
     let tables = TableActor::spawn(TableActor::new(db.clone()));
 
-    // Auto-generated keys, with no explicit key provided by the caller.
+    // Nodes and tables use generated keys; partitions use explicit composite keys.
     let mut node = nodes
         .ask(Create::<node::Entity> {
             data: node::ActiveModel {
@@ -43,8 +43,11 @@ async fn all_models_support_crud_and_overlapping_requests() {
     let mut partition = partitions
         .ask(Create::<partition::Entity> {
             data: partition::ActiveModel {
+                table_id: Set(1),
                 hash_start: Set(0),
+                forward_to: Set(0),
                 node_id: Set(node.node_id),
+                replicas: Set(partition::ReplicaNodes(vec![node.node_id])),
                 ..Default::default()
             },
         })
@@ -62,8 +65,40 @@ async fn all_models_support_crud_and_overlapping_requests() {
         })
         .await
         .unwrap();
+    for (table_id, hash_start) in [(1, 200), (2, 50), (1, 100)] {
+        partitions
+            .ask(Create::<partition::Entity> {
+                data: partition::ActiveModel {
+                    table_id: Set(table_id),
+                    hash_start: Set(hash_start),
+                    node_id: Set(node.node_id),
+                    replicas: Set(partition::ReplicaNodes(vec![node.node_id])),
+                    forward_to: Set(0),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+    }
+    let ring = partitions
+        .ask(partition::GetTablePartitions { table_id: 1 })
+        .await
+        .unwrap();
+    assert_eq!(
+        ring.iter().map(|p| p.hash_start).collect::<Vec<_>>(),
+        vec![0, 100, 200]
+    );
+    assert!(ring.iter().all(|p| p.table_id == 1));
+    assert!(
+        partitions
+            .ask(partition::GetTablePartitions { table_id: 99 })
+            .await
+            .unwrap()
+            .is_empty()
+    );
     node.url = "http://localhost:3001".into();
-    partition.hash_start = 100;
+    partition.forward_to = 100;
+    assert_eq!(partition.replication_factor(), 1);
     table.owner = 3;
     assert_eq!(
         nodes
@@ -94,7 +129,7 @@ async fn all_models_support_crud_and_overlapping_requests() {
         nodes.ask(Get { id: node.node_id }),
         nodes.ask(Get { id: node.node_id }),
         partitions.ask(Get {
-            id: partition.table_id
+            id: (partition.table_id, partition.hash_start)
         }),
         tables.ask(Get { id: table.table_id }),
     );
@@ -121,7 +156,7 @@ async fn all_models_support_crud_and_overlapping_requests() {
         partitions,
         partition::Entity,
         partition.clone(),
-        partition.table_id
+        (partition.table_id, partition.hash_start)
     );
     delete_and_check!(tables, table::Entity, table.clone(), table.table_id);
     nodes.stop_gracefully().await.unwrap();

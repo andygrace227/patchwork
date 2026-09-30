@@ -1284,6 +1284,7 @@ dependencies = [
 name = "patchwork-control-plane"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
  "kameo",
  "patchwork-data-plane",

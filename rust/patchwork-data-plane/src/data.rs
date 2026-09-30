@@ -7,9 +7,9 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub table_id: i64,
     #[sea_orm(primary_key, auto_increment = false)]
-    pub partition: i64,
+    pub partition_key: i64,
     #[sea_orm(primary_key, auto_increment = false)]
-    pub hash: i64,
+    pub secondary_key: i64,
     pub data: Json,
     pub version: i64,
 }

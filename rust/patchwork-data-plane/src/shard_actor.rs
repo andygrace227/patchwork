@@ -51,6 +51,27 @@ impl ShardActor {
     }
 }
 
+impl ShardActor {
+    async fn range_total(
+        &self,
+        table_id: i64,
+        upper_bound: i64,
+        lower_bound: i64,
+        aggregate: &str,
+    ) -> Result<u64> {
+        anyhow::ensure!(
+            lower_bound < upper_bound,
+            "lower_bound must be less than upper_bound"
+        );
+        let row = self.db.query_one_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            format!("SELECT {aggregate} AS total FROM data WHERE table_id = ? AND partition_key >= ? AND partition_key < ?"),
+            [table_id.into(), lower_bound.into(), upper_bound.into()],
+        )).await?.ok_or_else(|| anyhow::anyhow!("Missing range total"))?;
+        Ok(u64::try_from(row.try_get::<i64>("", "total")?)?)
+    }
+}
+
 #[messages]
 impl ShardActor {
     /// Main SQLite file length in bytes, excluding WAL and SHM sidecar files.
@@ -59,18 +80,47 @@ impl ShardActor {
         Ok(std::fs::metadata(&self.path)?.len())
     }
 
+    /// Number of records in one table's [lower_bound, upper_bound) range.
+    #[message]
+    pub async fn count_range(
+        &self,
+        table_id: i64,
+        upper_bound: i64,
+        lower_bound: i64,
+    ) -> Result<u64> {
+        self.range_total(table_id, upper_bound, lower_bound, "COUNT(*)")
+            .await
+    }
+
+    /// Stored JSON payload bytes, excluding keys, indexes and SQLite overhead.
+    #[message]
+    pub async fn get_range_size(
+        &self,
+        table_id: i64,
+        upper_bound: i64,
+        lower_bound: i64,
+    ) -> Result<u64> {
+        self.range_total(
+            table_id,
+            upper_bound,
+            lower_bound,
+            "COALESCE(SUM(LENGTH(CAST(data AS BLOB))), 0)",
+        )
+        .await
+    }
+
     #[message]
     pub async fn upsert(
         &mut self,
         table_id: i64,
-        partition: i64,
-        hash: i64,
+        partition_key: i64,
+        secondary_key: i64,
         data: serde_json::Value,
     ) -> Result<()> {
         let model = data::ActiveModel {
             table_id: Set(table_id),
-            partition: Set(partition),
-            hash: Set(hash),
+            partition_key: Set(partition_key),
+            secondary_key: Set(secondary_key),
             data: Set(data),
             version: Set(1),
         };
@@ -78,8 +128,8 @@ impl ShardActor {
             .on_conflict(
                 OnConflict::columns([
                     data::Column::TableId,
-                    data::Column::Partition,
-                    data::Column::Hash,
+                    data::Column::PartitionKey,
+                    data::Column::SecondaryKey,
                 ])
                 .update_column(data::Column::Data)
                 .value(
@@ -94,18 +144,25 @@ impl ShardActor {
     }
 
     #[message]
-    pub async fn delete(&mut self, table_id: i64, partition: i64, hash: i64) -> Result<u64> {
-        Ok(data::Entity::delete_by_id((table_id, partition, hash))
-            .exec(&self.db)
-            .await?
-            .rows_affected)
+    pub async fn delete(
+        &mut self,
+        table_id: i64,
+        partition_key: i64,
+        secondary_key: i64,
+    ) -> Result<u64> {
+        Ok(
+            data::Entity::delete_by_id((table_id, partition_key, secondary_key))
+                .exec(&self.db)
+                .await?
+                .rows_affected,
+        )
     }
 
     #[message]
-    pub async fn delete_partition(&mut self, table_id: i64, partition: i64) -> Result<u64> {
+    pub async fn delete_partition_key(&mut self, table_id: i64, partition_key: i64) -> Result<u64> {
         Ok(data::Entity::delete_many()
             .filter(data::Column::TableId.eq(table_id))
-            .filter(data::Column::Partition.eq(partition))
+            .filter(data::Column::PartitionKey.eq(partition_key))
             .exec(&self.db)
             .await?
             .rows_affected)
@@ -115,25 +172,48 @@ impl ShardActor {
     pub async fn get(
         &self,
         table_id: i64,
-        partition: i64,
-        hash: i64,
+        partition_key: i64,
+        secondary_key: i64,
     ) -> Result<Option<data::Model>> {
-        Ok(data::Entity::find_by_id((table_id, partition, hash))
-            .one(&self.db)
-            .await?)
+        Ok(
+            data::Entity::find_by_id((table_id, partition_key, secondary_key))
+                .one(&self.db)
+                .await?,
+        )
     }
 
     #[message]
-    pub async fn get_partition(&self, table_id: i64, partition: i64) -> Result<Vec<data::Model>> {
+    pub async fn get_partition_key(
+        &self,
+        table_id: i64,
+        partition_key: i64,
+    ) -> Result<Vec<data::Model>> {
         Ok(data::Entity::find()
             .filter(data::Column::TableId.eq(table_id))
-            .filter(data::Column::Partition.eq(partition))
-            .order_by_asc(data::Column::Hash)
+            .filter(data::Column::PartitionKey.eq(partition_key))
+            .order_by_asc(data::Column::SecondaryKey)
             .all(&self.db)
             .await?)
     }
 
-    /// Reads partitions strictly between the two bounds.
+    /// Deletes partition keys in [lower_bound, upper_bound), scoped to one table.
+    #[message]
+    pub async fn delete_range(
+        &mut self,
+        table_id: i64,
+        upper_bound: i64,
+        lower_bound: i64,
+    ) -> Result<u64> {
+        Ok(data::Entity::delete_many()
+            .filter(data::Column::TableId.eq(table_id))
+            .filter(data::Column::PartitionKey.gte(lower_bound))
+            .filter(data::Column::PartitionKey.lt(upper_bound))
+            .exec(&self.db)
+            .await?
+            .rows_affected)
+    }
+
+    /// Reads partition keys in [lower_bound, upper_bound).
     #[message]
     pub async fn get_range(
         &self,
@@ -143,10 +223,10 @@ impl ShardActor {
     ) -> Result<Vec<data::Model>> {
         Ok(data::Entity::find()
             .filter(data::Column::TableId.eq(table_id))
-            .filter(data::Column::Partition.gt(lower_bound))
-            .filter(data::Column::Partition.lt(upper_bound))
-            .order_by_asc(data::Column::Partition)
-            .order_by_asc(data::Column::Hash)
+            .filter(data::Column::PartitionKey.gte(lower_bound))
+            .filter(data::Column::PartitionKey.lt(upper_bound))
+            .order_by_asc(data::Column::PartitionKey)
+            .order_by_asc(data::Column::SecondaryKey)
             .all(&self.db)
             .await?)
     }

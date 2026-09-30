@@ -14,7 +14,7 @@ use sea_orm::{
 
 #[derive(Actor)]
 pub struct CrudActor<E: EntityTrait> {
-    db: DatabaseConnection,
+    pub(super) db: DatabaseConnection,
     entity: PhantomData<E>,
 }
 
@@ -34,8 +34,8 @@ pub struct Create<E: EntityTrait> {
     pub data: E::ActiveModel,
 }
 
-pub struct Get {
-    pub id: i64,
+pub struct Get<K = i64> {
+    pub id: K,
 }
 
 /// Replaces non-key fields of the row identified by the model's primary key.
@@ -45,8 +45,8 @@ pub struct Update<E: EntityTrait> {
 }
 
 /// Returns the number of rows deleted (zero or one).
-pub struct Delete {
-    pub id: i64,
+pub struct Delete<K = i64> {
+    pub id: K,
 }
 
 impl<E> Message<Create<E>> for CrudActor<E>
@@ -67,14 +67,15 @@ where
     }
 }
 
-impl<E> Message<Get> for CrudActor<E>
+impl<E, K> Message<Get<K>> for CrudActor<E>
 where
     E: EntityTrait,
-    E::PrimaryKey: PrimaryKeyTrait<ValueType = i64>,
+    E::PrimaryKey: PrimaryKeyTrait<ValueType = K>,
+    K: Send + 'static,
 {
     type Reply = DelegatedReply<Result<Option<E::Model>, DbErr>>;
 
-    async fn handle(&mut self, msg: Get, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+    async fn handle(&mut self, msg: Get<K>, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         let db = self.db.clone();
         ctx.spawn(async move { E::find_by_id(msg.id).one(&db).await })
     }
@@ -101,14 +102,19 @@ where
     }
 }
 
-impl<E> Message<Delete> for CrudActor<E>
+impl<E, K> Message<Delete<K>> for CrudActor<E>
 where
     E: EntityTrait,
-    E::PrimaryKey: PrimaryKeyTrait<ValueType = i64>,
+    E::PrimaryKey: PrimaryKeyTrait<ValueType = K>,
+    K: Send + 'static,
 {
     type Reply = DelegatedReply<Result<u64, DbErr>>;
 
-    async fn handle(&mut self, msg: Delete, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+    async fn handle(
+        &mut self,
+        msg: Delete<K>,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
         let db = self.db.clone();
         ctx.spawn(async move { Ok(E::delete_by_id(msg.id).exec(&db).await?.rows_affected) })
     }
