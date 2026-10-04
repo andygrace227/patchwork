@@ -56,7 +56,8 @@ async fn all_models_support_crud_and_overlapping_requests() {
     let mut table = tables
         .ask(Create::<table::Entity> {
             data: table::ActiveModel {
-                table_name: Set(1),
+                table_name: Set("accounts".into()),
+                is_ready: Set(false),
                 owner: Set(2),
                 partition_key_name: Set("account".into()),
                 sort_key_name: Set("id".into()),
@@ -137,6 +138,30 @@ async fn all_models_support_crud_and_overlapping_requests() {
     assert_eq!(b.unwrap(), Some(node.clone()));
     assert_eq!(c.unwrap(), Some(partition.clone()));
     assert_eq!(d.unwrap(), Some(table.clone()));
+
+    assert_eq!(
+        nodes
+            .ask(node::GetRandomNodes { count: 3 })
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    for idx in 0..4 {
+        nodes
+            .ask(Create::<node::Entity> {
+                data: node::ActiveModel {
+                    url: Set(format!("http://localhost:{}", 4000 + idx)),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+    }
+    let selected = nodes.ask(node::GetRandomNodes { count: 3 }).await.unwrap();
+    assert_eq!(selected.len(), 3);
+    let unique: std::collections::HashSet<_> = selected.iter().map(|node| node.node_id).collect();
+    assert_eq!(unique.len(), 3);
 
     macro_rules! delete_and_check {
         ($actor:expr, $entity:ty, $model:expr, $id:expr) => {

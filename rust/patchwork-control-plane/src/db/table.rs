@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = true)]
     pub table_id: i64,
-    pub table_name: i64,
+    pub table_name: String,
     pub owner: i64,
     #[sea_orm(default_value = 0)]
     pub owner_control_node: i64,
@@ -14,6 +14,7 @@ pub struct Model {
     pub backup_control_node: i64,
     pub partition_key_name: String,
     pub sort_key_name: String,
+    pub is_ready: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

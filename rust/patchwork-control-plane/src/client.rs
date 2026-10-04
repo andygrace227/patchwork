@@ -20,6 +20,15 @@ pub struct Record {
 pub struct Client;
 
 impl Client {
+    /// Delete all records for this table on one node; returns {"deleted": N}.
+    pub async fn delete_table(url: &str, table_id: i64) -> Result<Value, reqwest::Error> {
+        json(
+            Method::DELETE,
+            format!("{}/tables/{table_id}", url.trim_end_matches('/')),
+        )
+        .await
+    }
+
     /// Returns {"size_bytes": N} for the main SQLite file, excluding WAL and SHM.
     pub async fn get_size(url: &str) -> Result<Value, reqwest::Error> {
         json(

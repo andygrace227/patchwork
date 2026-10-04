@@ -62,6 +62,31 @@ async fn client_calls_all_shard_operations() {
             .unwrap()
             .is_empty()
     );
+    // Whole-table cleanup includes both ends of the ring and preserves other tables.
+    for key in [i64::MIN, 0, i64::MAX] {
+        Client::upsert(&url, 7, key, 1, &payload).await.unwrap();
+    }
+    Client::upsert(&url, 8, i64::MAX, 1, &payload)
+        .await
+        .unwrap();
+    assert_eq!(
+        Client::delete_table(&url, 7).await.unwrap(),
+        json!({"deleted": 3})
+    );
+    assert_eq!(
+        Client::delete_table(&url, 7).await.unwrap(),
+        json!({"deleted": 0})
+    );
+    for key in [i64::MIN, 0, i64::MAX] {
+        assert_eq!(
+            Client::get(&url, 7, key, 1).await.unwrap_err().status(),
+            Some(reqwest::StatusCode::NOT_FOUND)
+        );
+    }
+    assert_eq!(
+        Client::get(&url, 8, i64::MAX, 1).await.unwrap().data,
+        payload
+    );
     server.abort();
     let _ = server.await;
     shard.stop_gracefully().await.unwrap();

@@ -1,8 +1,8 @@
 use crate::{
     data,
     shard_actor::{
-        CountRange, Delete, DeletePartitionKey, DeleteRange, Get, GetPartitionKey, GetRange,
-        GetRangeSize, GetSize, ShardActor, Upsert,
+        CountRange, Delete, DeletePartitionKey, DeleteRange, DeleteTable, Get, GetPartitionKey,
+        GetRange, GetRangeSize, GetSize, ShardActor, Upsert,
     },
 };
 use axum::{
@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 pub fn router(shard: ActorRef<ShardActor>) -> Router {
     Router::new()
         .route("/shard/size", get(get_size))
+        .route("/tables/{table_id}", axum::routing::delete(delete_table))
         .route(
             "/tables/{table_id}/partition-keys/{partition_key}/records/{secondary_key}",
             get(get_record).delete(delete_record).put(upsert),
@@ -232,4 +233,15 @@ async fn get_range_size(
         .await
         .map_err(internal_error)?;
     Ok(Json(serde_json::json!({"size_bytes": total})))
+}
+
+async fn delete_table(
+    State(shard): State<ActorRef<ShardActor>>,
+    Path(table_id): Path<i64>,
+) -> Result<Json<Deleted>, ApiError> {
+    let deleted = shard
+        .ask(DeleteTable { table_id })
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(Deleted { deleted }))
 }

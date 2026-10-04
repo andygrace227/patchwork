@@ -43,3 +43,32 @@ impl Message<GetNodeExcluding> for NodeActor {
         })
     }
 }
+
+/// Pick distinct nodes at random for a new table's initial replicas.
+pub struct GetRandomNodes {
+    pub count: u64,
+}
+
+impl Message<GetRandomNodes> for NodeActor {
+    type Reply = DelegatedReply<Result<Vec<Model>, DbErr>>;
+
+    async fn handle(
+        &mut self,
+        msg: GetRandomNodes,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        use sea_orm::{DbBackend, Order, QuerySelect, sea_query::Expr};
+        let db = self.db.clone();
+        ctx.spawn(async move {
+            let random = match db.get_database_backend() {
+                DbBackend::MySql => "RAND()",
+                _ => "RANDOM()",
+            };
+            Entity::find()
+                .order_by(Expr::cust(random), Order::Asc)
+                .limit(msg.count)
+                .all(&db)
+                .await
+        })
+    }
+}

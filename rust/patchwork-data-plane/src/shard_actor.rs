@@ -143,6 +143,16 @@ impl ShardActor {
         Ok(())
     }
 
+    /// Delete all records for one table, including the full hash ring.
+    #[message]
+    pub async fn delete_table(&mut self, table_id: i64) -> Result<u64> {
+        Ok(data::Entity::delete_many()
+            .filter(data::Column::TableId.eq(table_id))
+            .exec(&self.db)
+            .await?
+            .rows_affected)
+    }
+
     #[message]
     pub async fn delete(
         &mut self,
