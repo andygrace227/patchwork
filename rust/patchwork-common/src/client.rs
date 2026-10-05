@@ -20,6 +20,50 @@ pub struct Record {
 pub struct Client;
 
 impl Client {
+    /// Save on this node and all supplied replica URLs (excluding this node).
+    /// An error may leave some copies written. An empty list writes locally only.
+    pub async fn put_with_replicas(
+        url: &str,
+        table_id: i64,
+        partition_key: i64,
+        secondary_key: i64,
+        data: &Value,
+        replicas: &[String],
+    ) -> Result<(), reqwest::Error> {
+        HTTP.put(format!(
+            "{}/with-replicas",
+            record_url(url, table_id, partition_key, secondary_key)
+        ))
+        .timeout(Duration::from_secs(60))
+        .json(&serde_json::json!({ "data": data, "replicas": replicas }))
+        .send()
+        .await?
+        .error_for_status()?;
+        Ok(())
+    }
+
+    /// Save locally and enqueue best-effort replica writes. URLs exclude this node.
+    /// Success does not confirm remote writes; the queue is not durable.
+    pub async fn put_with_replicas_inconsistent(
+        url: &str,
+        table_id: i64,
+        partition_key: i64,
+        secondary_key: i64,
+        data: &Value,
+        replicas: &[String],
+    ) -> Result<(), reqwest::Error> {
+        HTTP.put(format!(
+            "{}/with-replicas-inconsistent",
+            record_url(url, table_id, partition_key, secondary_key)
+        ))
+        .timeout(Duration::from_secs(30))
+        .json(&serde_json::json!({ "data": data, "replicas": replicas }))
+        .send()
+        .await?
+        .error_for_status()?;
+        Ok(())
+    }
+
     /// Delete all records for this table on one node; returns {"deleted": N}.
     pub async fn delete_table(url: &str, table_id: i64) -> Result<Value, reqwest::Error> {
         json(

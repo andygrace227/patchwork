@@ -162,3 +162,170 @@ async fn range_totals_are_scoped_and_measure_payload_bytes() {
     shard.stop_gracefully().await.unwrap();
     shard.wait_for_shutdown().await;
 }
+
+#[tokio::test]
+async fn put_with_replicas_writes_all_and_reports_partial_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut shards = Vec::new();
+    let mut servers = Vec::new();
+    let mut urls = Vec::new();
+    for index in 0..3 {
+        let shard = ShardActor::spawn(
+            ShardActor::new(
+                dir.path()
+                    .join(format!("{index}.sqlite"))
+                    .to_str()
+                    .unwrap()
+                    .into(),
+            )
+            .await
+            .unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        urls.push(format!("http://{}", listener.local_addr().unwrap()));
+        let app = api::router(shard.clone());
+        servers.push(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap()
+        }));
+        shards.push(shard);
+    }
+    let payload = json!({"data": "payload", "replicas": "also payload"});
+    let replicas = vec![urls[1].clone(), format!("{}/", urls[1]), urls[2].clone()];
+    Client::put_with_replicas(&urls[0], 1, 10, 20, &payload, &replicas)
+        .await
+        .unwrap();
+    for url in &urls {
+        let record = Client::get(url, 1, 10, 20).await.unwrap();
+        assert_eq!(record.data, payload);
+        assert_eq!(record.version, 1); // Duplicate replica URLs write only once.
+        assert!(Client::get(url, 2, 10, 20).await.is_err());
+    }
+    Client::put_with_replicas(&urls[0], 1, 10, 21, &payload, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        Client::get(&urls[0], 1, 10, 21).await.unwrap().data,
+        payload
+    );
+    assert!(Client::get(&urls[1], 1, 10, 21).await.is_err());
+
+    // A failed destination must not prevent writes to the remaining replicas.
+    let replicas = vec!["not a URL".into(), urls[1].clone(), urls[2].clone()];
+    let error = Client::put_with_replicas(&urls[0], 1, 10, 22, &payload, &replicas)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.status(),
+        Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+    );
+    for url in &urls {
+        assert_eq!(Client::get(url, 1, 10, 22).await.unwrap().data, payload);
+    }
+    for server in servers {
+        server.abort();
+        let _ = server.await;
+    }
+    for shard in shards {
+        shard.stop_gracefully().await.unwrap();
+        shard.wait_for_shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn inconsistent_writes_queue_while_all_writes_wait_for_ack() {
+    use patchwork_data_plane::subordinate_shard_writer::SubordinateShardWriter;
+    use std::{sync::Arc, time::Duration};
+    use tokio::sync::Semaphore;
+
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let replica = axum::Router::new().route(
+        "/tables/{table_id}/partition-keys/{partition_key}/records/{secondary_key}",
+        axum::routing::put({
+            let entered = entered.clone();
+            let release = release.clone();
+            move || {
+                let entered = entered.clone();
+                let release = release.clone();
+                async move {
+                    entered.add_permits(1);
+                    release.acquire().await.unwrap().forget();
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let replica_url = format!("http://{}", listener.local_addr().unwrap());
+    let replica_server = tokio::spawn(async move { axum::serve(listener, replica).await.unwrap() });
+
+    let dir = tempfile::tempdir().unwrap();
+    let shard = ShardActor::spawn(
+        ShardActor::new(dir.path().join("local.sqlite").to_str().unwrap().into())
+            .await
+            .unwrap(),
+    );
+    let writer = SubordinateShardWriter::spawn(SubordinateShardWriter);
+    let app = api::router_with_writer(shard.clone(), writer.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    // Both requests return while the first replica write is still blocked.
+    for key in [1, 2] {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            Client::put_with_replicas_inconsistent(
+                &url,
+                1,
+                10,
+                key,
+                &json!(key),
+                &[replica_url.clone()],
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            Client::get(&url, 1, 10, key).await.unwrap().data,
+            json!(key)
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert_eq!(entered.available_permits(), 0); // Second write is still queued.
+
+    // The all-replicas path bypasses the queue but waits for its remote reply.
+    let all = tokio::spawn({
+        let url = url.clone();
+        let replica_url = replica_url.clone();
+        async move { Client::put_with_replicas(&url, 1, 10, 3, &json!(3), &[replica_url]).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert!(!all.is_finished());
+    release.add_permits(3);
+    tokio::time::timeout(Duration::from_secs(5), all)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    writer.stop_gracefully().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), writer.wait_for_shutdown())
+        .await
+        .unwrap();
+    assert_eq!(entered.available_permits(), 1); // Queued second write was processed.
+    server.abort();
+    replica_server.abort();
+    let _ = server.await;
+    let _ = replica_server.await;
+    shard.stop_gracefully().await.unwrap();
+    shard.wait_for_shutdown().await;
+}

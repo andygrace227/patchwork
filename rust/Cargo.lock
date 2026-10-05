@@ -1278,6 +1278,11 @@ name = "patchwork-common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "kameo",
+ "reqwest",
+ "sea-orm",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1287,6 +1292,7 @@ dependencies = [
  "anyhow",
  "axum",
  "kameo",
+ "patchwork-common",
  "patchwork-data-plane",
  "reqwest",
  "sea-orm",
@@ -1304,6 +1310,7 @@ dependencies = [
  "axum",
  "dotenvy",
  "kameo",
+ "patchwork-common",
  "sea-orm",
  "serde",
  "serde_json",

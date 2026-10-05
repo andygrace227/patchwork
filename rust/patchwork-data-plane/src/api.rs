@@ -4,21 +4,37 @@ use crate::{
         CountRange, Delete, DeletePartitionKey, DeleteRange, DeleteTable, Get, GetPartitionKey,
         GetRange, GetRangeSize, GetSize, ShardActor, Upsert,
     },
+    subordinate_shard_writer::{Put, SubordinateShardWriter},
 };
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     routing::get,
 };
-use kameo::actor::ActorRef;
+use kameo::actor::{ActorRef, Spawn};
 use serde::{Deserialize, Serialize};
 
 /// Inject the same actor into every handler.
 pub fn router(shard: ActorRef<ShardActor>) -> Router {
+    router_with_writer(shard, SubordinateShardWriter::spawn(SubordinateShardWriter))
+}
+
+pub fn router_with_writer(
+    shard: ActorRef<ShardActor>,
+    writer: ActorRef<SubordinateShardWriter>,
+) -> Router {
     Router::new()
         .route("/shard/size", get(get_size))
+        .route(
+            "/tables/{table_id}/partition-keys/{partition_key}/records/{secondary_key}/with-replicas-inconsistent",
+            axum::routing::put(put_with_replicas_inconsistent),
+        )
         .route("/tables/{table_id}", axum::routing::delete(delete_table))
+        .route(
+            "/tables/{table_id}/partition-keys/{partition_key}/records/{secondary_key}/with-replicas",
+            axum::routing::put(put_with_replicas),
+        )
         .route(
             "/tables/{table_id}/partition-keys/{partition_key}/records/{secondary_key}",
             get(get_record).delete(delete_record).put(upsert),
@@ -33,6 +49,7 @@ pub fn router(shard: ActorRef<ShardActor>) -> Router {
         )
         .route("/tables/{table_id}/range/count", get(count_range))
         .route("/tables/{table_id}/range/size", get(get_range_size))
+        .layer(Extension(writer))
         .with_state(shard)
 }
 
@@ -57,6 +74,66 @@ async fn upsert(
             partition_key: partition_key,
             secondary_key: secondary_key,
             data: data,
+        })
+        .await
+        .map_err(internal_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct PutWithReplicas {
+    data: serde_json::Value,
+    replicas: Vec<String>,
+}
+
+async fn put_with_replicas(
+    State(shard): State<ActorRef<ShardActor>>,
+    Path((table_id, partition_key, secondary_key)): Path<(i64, i64, i64)>,
+    Json(request): Json<PutWithReplicas>,
+) -> Result<StatusCode, ApiError> {
+    shard
+        .ask(Upsert {
+            table_id,
+            partition_key,
+            secondary_key,
+            data: request.data.clone(),
+        })
+        .await
+        .map_err(internal_error)?;
+    crate::replicas::put(
+        table_id,
+        partition_key,
+        secondary_key,
+        request.data,
+        request.replicas,
+    )
+    .await
+    .map_err(internal_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn put_with_replicas_inconsistent(
+    State(shard): State<ActorRef<ShardActor>>,
+    Extension(writer): Extension<ActorRef<SubordinateShardWriter>>,
+    Path((table_id, partition_key, secondary_key)): Path<(i64, i64, i64)>,
+    Json(request): Json<PutWithReplicas>,
+) -> Result<StatusCode, ApiError> {
+    shard
+        .ask(Upsert {
+            table_id,
+            partition_key,
+            secondary_key,
+            data: request.data.clone(),
+        })
+        .await
+        .map_err(internal_error)?;
+    writer
+        .tell(Put {
+            table_id,
+            partition_key,
+            secondary_key,
+            data: request.data,
+            replicas: request.replicas,
         })
         .await
         .map_err(internal_error)?;
