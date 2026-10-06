@@ -10,6 +10,8 @@ pub(crate) async fn put(
     secondary_key: i64,
     data: Value,
     replicas: Vec<String>,
+    timestamp: i64,
+    deleted: bool,
 ) -> Result<()> {
     let mut replicas: Vec<_> = replicas
         .into_iter()
@@ -21,9 +23,17 @@ pub(crate) async fn put(
     for url in replicas {
         let data = data.clone();
         writes.spawn(async move {
-            Client::upsert(&url, table_id, partition_key, secondary_key, &data)
-                .await
-                .map_err(|error| anyhow::anyhow!("Replica {url}: {error}"))
+            Client::write_record(
+                &url,
+                table_id,
+                partition_key,
+                secondary_key,
+                &data,
+                timestamp,
+                deleted,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("Replica {url}: {error}"))
         });
     }
     // Wait for every replica even when another has failed.

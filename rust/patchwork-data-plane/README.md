@@ -17,40 +17,77 @@ Startup opens one SQLite shard through SeaORM, enables WAL, creates its data tab
 if missing, and injects one Kameo actor into the HTTP handlers. Existing tables
 are not migrated automatically. Ctrl-C drains HTTP requests before stopping the actor.
 
-| Operation | Request |
-|---|---|
-| Upsert | PUT /records |
-| Get record | GET /tables/{table_id}/partitions/{partition}/records/{hash} |
-| Delete record | DELETE /tables/{table_id}/partitions/{partition}/records/{hash} |
-| Get partition | GET /tables/{table_id}/partitions/{partition} |
-| Delete partition | DELETE /tables/{table_id}/partitions/{partition} |
-| Get range | GET /tables/{table_id}/range?lower_bound=0&upper_bound=100 |
-
-Upsert accepts the three keys and JSON data (no version):
+Writes use `PUT /tables/{table_id}/partition-keys/{partition_key}/records/{secondary_key}`.
+The body is the JSON payload. Every write requires `x-patchwork-timestamp`: a
+nonnegative signed 64-bit Unix timestamp in microseconds, chosen by the caller.
+Missing or invalid timestamps return 400. The server never generates one.
 
 ```sh
-curl -i -X PUT http://127.0.0.1:3000/records \
+curl -X PUT http://127.0.0.1:3000/tables/1/partition-keys/10/records/42 \
   -H 'Content-Type: application/json' \
-  -d '{"table_id":1,"partition":10,"hash":42,"data":{"name":"example"}}'
+  -H 'x-patchwork-timestamp: 1791158400000000' \
+  -d '{"name":"example"}'
 ```
 
-New records start at version 1. Upserting the same (table_id, partition, hash)
-replaces data and atomically increments the stored version. Client-supplied
-versions are rejected. Deleting and recreating a record starts again at 1. Hashes come from
-the client. All keys and versions are signed 64-bit integers; clients must preserve
-integer precision when encoding JSON.
+The highest timestamp wins for the entire JSON record. Deletion wins an equal
+timestamp tie; ties between live values use the greater serialized JSON byte
+sequence, so arrival order does not decide the winner. An older write is acknowledged without replacing newer
+data. Reuse the original timestamp for retries and copies. Clocks are the
+caller's responsibility; timestamps do not prove real-world event order.
 
-Upsert returns 204. Missing records return 404. Collection reads return arrays.
-Deletes return {"deleted": N}, including zero when nothing matches.
-Ranges exclude both bounds and reject lower_bound >= upper_bound with 400.
-Reads and deletes are scoped to the requested table. Database failures return 500
-with details logged on the server. This API operates on its single configured shard;
-routing to other shards belongs to the caller.
+The shared client requires a timestamp argument:
 
-GET /shard/size returns {"size_bytes": N}: the main SQLite file's current length
-in bytes, excluding the -wal and -shm files. Recent writes may still be in the WAL,
-so this is not the total disk usage. The control-plane client exposes
-Client::get_size(url).
+```rust,ignore
+Client::upsert(url, table_id, partition_key, secondary_key, &data, timestamp).await?;
+Client::put_with_replicas(url, table_id, partition_key, secondary_key, &data, &replicas, timestamp).await?;
+Client::put_with_replicas_inconsistent(url, table_id, partition_key, secondary_key, &data, &replicas, timestamp).await?;
+```
+
+The replica endpoints append `/with-replicas` or `/with-replicas-inconsistent`
+to the record path and accept `{"data": ..., "replicas": ["http://..."]}`.
+They use the same required timestamp header and pass it unchanged to every copy.
+The first waits for local storage and all supplied replicas. The second waits
+for local storage and the first supplied replica, then queues the others in
+`SubordinateShardWriter`. Its queue is in memory, without retries. Replica URLs
+must exclude the receiving node; the inconsistent call requires at least one.
+A failed request can leave some copies saved.
+
+GET on the record path returns the record including `timestamp` (replacing the
+old per-node `version` counter), or 404 if absent. Reads currently return the
+contacted node's copy; they do not reconcile multiple replicas.
+
+Record DELETE requires the timestamp header and stores a tombstone (`deleted:
+true`, `data: null`), even for a key not yet present. A later arrival with an
+older or equal timestamp cannot resurrect it. A strictly newer write can.
+The response `{"deleted": N}` counts stored tombstone changes, including markers
+for absent keys; stale deletes and identical retries return zero.
+
+`Client::delete(..., timestamp)`, `delete_with_replicas(..., replicas, timestamp)`,
+and `delete_with_replicas_inconsistent(..., replicas, timestamp)` use the same
+acknowledgment rules as writes. Replicated tombstones travel through the PUT
+endpoints with `x-patchwork-deleted: true`. The flag defaults to false for normal
+writes and is preserved by the asynchronous queue.
+
+Normal GET, partition-key and range reads, counts, and payload sizes exclude
+tombstones. Add `include_deleted=true` to record, partition-key, or range GETs
+for reconciliation. The shared client provides `get_including_deleted` and
+`get_range_including_deleted`; copy workflows use the latter and preserve both
+`timestamp` and `deleted` through `write_record`.
+
+Tombstones have no automatic expiry. Bulk table, partition-key, and range DELETE
+endpoints remain physical cleanup operations, including tombstones, for retiring
+local data. They are not replicated logical deletes or range tombstones; use
+record deletes for logical removal. Placement and multi-replica read workflows
+remain separate work.
+
+Existing test databases must be recreated for the `timestamp` and `deleted`
+columns. There is no schema migration.
+
+GET `/tables/{table_id}/partition-keys/{partition_key}` lists one partition key.
+GET `/tables/{table_id}/range?lower_bound=0&upper_bound=100` uses `[0, 100)`.
+Range count and size endpoints append `/count` and `/size` before the query.
+GET `/shard/size` returns `{"size_bytes": N}` for the main SQLite file,
+excluding WAL and SHM files.
 
 Shards use auto_vacuum=FULL to reclaim completely free pages on commit.
 Existing shards with auto-vacuum disabled are rebuilt once during startup; this

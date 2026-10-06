@@ -44,6 +44,7 @@ impl InconsistentDataplaneClient {
         partition_key: i64,
         secondary_key: i64,
         data: Value,
+        timestamp: i64,
     ) -> Result<()> {
         // Resolve the current ring. An exact boundary belongs to that partition;
         // otherwise use the previous boundary, wrapping around when necessary.
@@ -73,8 +74,15 @@ impl InconsistentDataplaneClient {
         // Await every write. Still try the remaining replicas if one fails.
         let mut failures = Vec::new();
         for node in nodes {
-            if let Err(error) =
-                Client::upsert(&node.url, table_id, partition_key, secondary_key, &data).await
+            if let Err(error) = Client::upsert(
+                &node.url,
+                table_id,
+                partition_key,
+                secondary_key,
+                &data,
+                timestamp,
+            )
+            .await
             {
                 failures.push(format!("node {}: {error}", node.node_id));
             }

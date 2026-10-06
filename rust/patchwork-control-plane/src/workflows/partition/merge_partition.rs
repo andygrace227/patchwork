@@ -146,7 +146,7 @@ impl MergePartition {
             // Stage 2: Copy the source range into the previous partition's replicas.
             // Fetch [source.hash_start, next.hash_start) once from the source root.
             // The source boundary stays in the database until copying finishes.
-            let records = Client::get_range(
+            let records = Client::get_range_including_deleted(
                 &source_node.url,
                 ctx.table_id,
                 next.hash_start,
@@ -160,12 +160,14 @@ impl MergePartition {
                 }
                 for record in &records {
                     check_lease(lease_end)?;
-                    Client::upsert(
+                    Client::write_record(
                         &node.url,
                         record.table_id,
                         record.partition_key,
                         record.secondary_key,
                         &record.data,
+                        record.timestamp,
+                        record.deleted,
                     )
                     .await?;
                 }

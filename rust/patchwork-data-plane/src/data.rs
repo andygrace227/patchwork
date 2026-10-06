@@ -11,7 +11,8 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub secondary_key: i64,
     pub data: Json,
-    pub version: i64,
+    pub timestamp: i64,
+    pub deleted: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -15,9 +15,19 @@ impl SubordinateShardWriter {
         secondary_key: i64,
         data: Value,
         replicas: Vec<String>,
+        timestamp: i64,
+        deleted: bool,
     ) {
-        if let Err(error) =
-            crate::replicas::put(table_id, partition_key, secondary_key, data, replicas).await
+        if let Err(error) = crate::replicas::put(
+            table_id,
+            partition_key,
+            secondary_key,
+            data,
+            replicas,
+            timestamp,
+            deleted,
+        )
+        .await
         {
             eprintln!(
                 "Queued replica write failed for {table_id}/{partition_key}/{secondary_key}: {error}"

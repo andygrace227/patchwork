@@ -203,7 +203,7 @@ impl SplitPartition {
             // Also propagate to the copies. [new_partition, end_hash_range)
 
             // Fetch once, then send the same snapshot to each selected replica.
-            let data = client::Client::get_range(
+            let data = client::Client::get_range_including_deleted(
                 &old_node.url,
                 ctx.table_id,
                 end_hash_range,
@@ -219,12 +219,14 @@ impl SplitPartition {
                     {
                         return Err(anyhow::anyhow!("Split lease expired during copying"));
                     }
-                    client::Client::upsert(
+                    client::Client::write_record(
                         &node.url,
                         record.table_id,
                         record.partition_key,
                         record.secondary_key,
                         &record.data,
+                        record.timestamp,
+                        record.deleted,
                     )
                     .await?;
                 }

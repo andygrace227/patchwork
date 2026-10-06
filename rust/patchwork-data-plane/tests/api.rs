@@ -14,6 +14,23 @@ async fn request(
     path: &str,
     body: Option<Value>,
 ) -> (StatusCode, Value) {
+    request_at(
+        app,
+        method,
+        path,
+        body,
+        if method == "DELETE" { 3 } else { 1 },
+    )
+    .await
+}
+
+async fn request_at(
+    app: &Router,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    timestamp: i64,
+) -> (StatusCode, Value) {
     let response = app
         .clone()
         .oneshot(
@@ -21,6 +38,7 @@ async fn request(
                 .method(method)
                 .uri(path)
                 .header("content-type", "application/json")
+                .header("x-patchwork-timestamp", timestamp.to_string())
                 .body(body.map_or_else(Body::empty, |v| Body::from(v.to_string())))
                 .unwrap(),
         )
@@ -70,15 +88,16 @@ async fn operations_are_scoped_and_persist_after_reopening() {
     assert_eq!(
         request(&app, "GET", "/tables/1/partition-keys/10/records/-1", None)
             .await
-            .1["version"],
+            .1["timestamp"],
         1
     );
     assert_eq!(
-        request(
+        request_at(
             &app,
             "PUT",
             "/tables/1/partition-keys/10/records/-1",
-            Some(json!({"value": "updated", "version": 99}))
+            Some(json!({"value": "updated", "timestamp": 99})),
+            2
         )
         .await
         .0,
@@ -87,9 +106,9 @@ async fn operations_are_scoped_and_persist_after_reopening() {
     let (status, record) =
         request(&app, "GET", "/tables/1/partition-keys/10/records/-1", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(record["version"], 2);
+    assert_eq!(record["timestamp"], 2);
     assert_eq!(record["data"]["value"], "updated");
-    assert_eq!(record["data"]["version"], 99); // Payload fields do not set the record version.
+    assert_eq!(record["data"]["timestamp"], 99); // Payload fields do not set the record timestamp.
     assert_eq!(
         request(&app, "GET", "/tables/1/partition-keys/10", None)
             .await
@@ -168,7 +187,7 @@ async fn operations_are_scoped_and_persist_after_reopening() {
         request(&app, "DELETE", "/tables/1/partition-keys/10", None)
             .await
             .1,
-        json!({"deleted": 1})
+        json!({"deleted": 2})
     );
     assert_eq!(
         request(&app, "GET", "/tables/1/partition-keys/10", None)
@@ -194,13 +213,14 @@ async fn operations_are_scoped_and_persist_after_reopening() {
             .0,
         StatusCode::OK
     );
-    for expected_version in [2, 3] {
+    for expected_timestamp in [2, 2] {
         assert_eq!(
-            request(
+            request_at(
                 &app,
                 "PUT",
                 "/tables/1/partition-keys/20/records/3",
-                Some(json!({"updated": true}))
+                Some(json!({"updated": true})),
+                expected_timestamp
             )
             .await
             .0,
@@ -209,10 +229,185 @@ async fn operations_are_scoped_and_persist_after_reopening() {
         assert_eq!(
             request(&app, "GET", "/tables/1/partition-keys/20/records/3", None)
                 .await
-                .1["version"],
-            expected_version
+                .1["timestamp"],
+            expected_timestamp
         );
     }
+    shard.stop_gracefully().await.unwrap();
+    shard.wait_for_shutdown().await;
+}
+
+#[tokio::test]
+async fn timestamp_wins_regardless_of_arrival_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let shard = ShardActor::spawn(
+        ShardActor::new(
+            dir.path()
+                .join("timestamps.sqlite")
+                .to_str()
+                .unwrap()
+                .into(),
+        )
+        .await
+        .unwrap(),
+    );
+    let app = api::router(shard.clone());
+    for (key, writes) in [
+        (1, vec![(20, "new"), (10, "old"), (20, "new")]),
+        (2, vec![(10, "old"), (20, "new")]),
+        (3, vec![(30, "a"), (30, "z")]),
+        (4, vec![(30, "z"), (30, "a")]),
+    ] {
+        let path = format!("/tables/1/partition-keys/1/records/{key}");
+        for (timestamp, value) in writes {
+            assert_eq!(
+                request_at(&app, "PUT", &path, Some(json!(value)), timestamp)
+                    .await
+                    .0,
+                StatusCode::NO_CONTENT
+            );
+        }
+        let record = request(&app, "GET", &path, None).await.1;
+        assert_eq!(
+            record["data"],
+            if key <= 2 { json!("new") } else { json!("z") }
+        );
+        assert_eq!(record["timestamp"], if key <= 2 { 20 } else { 30 });
+    }
+    let path = "/tables/1/partition-keys/1/records/1";
+    for header in [None, Some("bad"), Some("-1")] {
+        let mut req = Request::builder()
+            .method("PUT")
+            .uri(path)
+            .header("content-type", "application/json");
+        if let Some(header) = header {
+            req = req.header("x-patchwork-timestamp", header);
+        }
+        let response = app
+            .clone()
+            .oneshot(req.body(Body::from("null")).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(request(&app, "GET", path, None).await.1["timestamp"], 20);
+    shard.stop_gracefully().await.unwrap();
+    shard.wait_for_shutdown().await;
+}
+
+#[tokio::test]
+async fn tombstones_win_ties_and_survive_reopening() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("tombstones.sqlite")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let shard = ShardActor::spawn(ShardActor::new(path.clone()).await.unwrap());
+    let app = api::router(shard.clone());
+    let record = "/tables/1/partition-keys/10/records/1";
+    // Delete before the original write arrives, including an exact timestamp tie.
+    assert_eq!(
+        request_at(&app, "DELETE", record, None, 20).await.1,
+        json!({"deleted": 1})
+    );
+    for timestamp in [10, 20] {
+        assert_eq!(
+            request_at(&app, "PUT", record, Some(json!("late")), timestamp)
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            request(&app, "GET", record, None).await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
+    let stored = request(&app, "GET", &format!("{record}?include_deleted=true"), None)
+        .await
+        .1;
+    assert_eq!(stored["deleted"], true);
+    assert_eq!(stored["timestamp"], 20);
+    assert_eq!(stored["data"], Value::Null);
+    assert_eq!(
+        request(&app, "GET", "/tables/1/partition-keys/10", None)
+            .await
+            .1,
+        json!([])
+    );
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/tables/1/range?lower_bound=0&upper_bound=20",
+            None
+        )
+        .await
+        .1,
+        json!([])
+    );
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/tables/1/range/count?lower_bound=0&upper_bound=20",
+            None
+        )
+        .await
+        .1,
+        json!({"count": 0})
+    );
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/tables/1/range/size?lower_bound=0&upper_bound=20",
+            None
+        )
+        .await
+        .1,
+        json!({"size_bytes": 0})
+    );
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/tables/1/range?lower_bound=0&upper_bound=20&include_deleted=true",
+            None
+        )
+        .await
+        .1,
+        json!([stored])
+    );
+    // A newer write restores the record, but an older delete cannot remove it.
+    request_at(&app, "PUT", record, Some(json!("new")), 30).await;
+    assert_eq!(
+        request_at(&app, "DELETE", record, None, 29).await.1,
+        json!({"deleted": 0})
+    );
+    assert_eq!(request(&app, "GET", record, None).await.1["data"], "new");
+    request_at(&app, "DELETE", record, None, 30).await;
+    assert_eq!(
+        request(&app, "GET", record, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    drop(app);
+    shard.stop_gracefully().await.unwrap();
+    shard.wait_for_shutdown().await;
+    let shard = ShardActor::spawn(ShardActor::new(path).await.unwrap());
+    let app = api::router(shard.clone());
+    request_at(&app, "PUT", record, Some(json!("late")), 30).await;
+    assert_eq!(
+        request(&app, "GET", record, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(&app, "GET", &format!("{record}?include_deleted=true"), None)
+            .await
+            .1["timestamp"],
+        30
+    );
     shard.stop_gracefully().await.unwrap();
     shard.wait_for_shutdown().await;
 }

@@ -1,10 +1,8 @@
 use anyhow::Result;
 use kameo::{Actor, messages};
 use sea_orm::{
-    ActiveValue::Set,
     ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection, EntityTrait,
     QueryFilter, QueryOrder, Schema,
-    sea_query::{Expr, ExprTrait, OnConflict},
 };
 
 use crate::data;
@@ -65,7 +63,7 @@ impl ShardActor {
         );
         let row = self.db.query_one_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DbBackend::Sqlite,
-            format!("SELECT {aggregate} AS total FROM data WHERE table_id = ? AND partition_key >= ? AND partition_key < ?"),
+            format!("SELECT {aggregate} AS total FROM data WHERE table_id = ? AND partition_key >= ? AND partition_key < ? AND deleted = 0"),
             [table_id.into(), lower_bound.into(), upper_bound.into()],
         )).await?.ok_or_else(|| anyhow::anyhow!("Missing range total"))?;
         Ok(u64::try_from(row.try_get::<i64>("", "total")?)?)
@@ -116,31 +114,60 @@ impl ShardActor {
         partition_key: i64,
         secondary_key: i64,
         data: serde_json::Value,
+        timestamp: i64,
     ) -> Result<()> {
-        let model = data::ActiveModel {
-            table_id: Set(table_id),
-            partition_key: Set(partition_key),
-            secondary_key: Set(secondary_key),
-            data: Set(data),
-            version: Set(1),
-        };
-        data::Entity::insert(model)
-            .on_conflict(
-                OnConflict::columns([
-                    data::Column::TableId,
-                    data::Column::PartitionKey,
-                    data::Column::SecondaryKey,
-                ])
-                .update_column(data::Column::Data)
-                .value(
-                    data::Column::Version,
-                    Expr::col((data::Entity, data::Column::Version)).add(1),
-                )
-                .to_owned(),
-            )
-            .exec_without_returning(&self.db)
-            .await?;
+        self.write_record(
+            table_id,
+            partition_key,
+            secondary_key,
+            data,
+            timestamp,
+            false,
+        )
+        .await?;
         Ok(())
+    }
+
+    #[message]
+    pub async fn write_record(
+        &mut self,
+        table_id: i64,
+        partition_key: i64,
+        secondary_key: i64,
+        data: serde_json::Value,
+        timestamp: i64,
+        deleted: bool,
+    ) -> Result<u64> {
+        anyhow::ensure!(timestamp >= 0, "timestamp must be nonnegative");
+        // Atomic comparison: old arrivals and retries cannot overwrite newer data.
+        // Deletion wins ties; live values then compare serialized JSON bytes.
+        let data = if deleted {
+            serde_json::Value::Null
+        } else {
+            data
+        };
+        let result = self.db
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                "INSERT INTO data (table_id, partition_key, secondary_key, data, timestamp, deleted)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT (table_id, partition_key, secondary_key) DO UPDATE
+             SET data = excluded.data, timestamp = excluded.timestamp, deleted = excluded.deleted
+             WHERE excluded.timestamp > data.timestamp
+                OR (excluded.timestamp = data.timestamp
+                    AND (excluded.deleted > data.deleted
+                         OR (excluded.deleted = data.deleted AND CAST(excluded.data AS BLOB) > CAST(data.data AS BLOB))))",
+                [
+                    table_id.into(),
+                    partition_key.into(),
+                    secondary_key.into(),
+                    serde_json::to_string(&data)?.into(),
+                    timestamp.into(),
+                    deleted.into(),
+                ],
+            ))
+            .await?;
+        Ok(result.rows_affected())
     }
 
     /// Delete all records for one table, including the full hash ring.
@@ -159,13 +186,17 @@ impl ShardActor {
         table_id: i64,
         partition_key: i64,
         secondary_key: i64,
+        timestamp: i64,
     ) -> Result<u64> {
-        Ok(
-            data::Entity::delete_by_id((table_id, partition_key, secondary_key))
-                .exec(&self.db)
-                .await?
-                .rows_affected,
+        self.write_record(
+            table_id,
+            partition_key,
+            secondary_key,
+            serde_json::Value::Null,
+            timestamp,
+            true,
         )
+        .await
     }
 
     #[message]
@@ -184,9 +215,15 @@ impl ShardActor {
         table_id: i64,
         partition_key: i64,
         secondary_key: i64,
+        include_deleted: bool,
     ) -> Result<Option<data::Model>> {
         Ok(
             data::Entity::find_by_id((table_id, partition_key, secondary_key))
+                .filter(if include_deleted {
+                    sea_orm::Condition::all()
+                } else {
+                    sea_orm::Condition::all().add(data::Column::Deleted.eq(false))
+                })
                 .one(&self.db)
                 .await?,
         )
@@ -197,11 +234,17 @@ impl ShardActor {
         &self,
         table_id: i64,
         partition_key: i64,
+        include_deleted: bool,
     ) -> Result<Vec<data::Model>> {
         Ok(data::Entity::find()
             .filter(data::Column::TableId.eq(table_id))
             .filter(data::Column::PartitionKey.eq(partition_key))
             .order_by_asc(data::Column::SecondaryKey)
+            .filter(if include_deleted {
+                sea_orm::Condition::all()
+            } else {
+                sea_orm::Condition::all().add(data::Column::Deleted.eq(false))
+            })
             .all(&self.db)
             .await?)
     }
@@ -230,6 +273,7 @@ impl ShardActor {
         table_id: i64,
         upper_bound: i64,
         lower_bound: i64,
+        include_deleted: bool,
     ) -> Result<Vec<data::Model>> {
         Ok(data::Entity::find()
             .filter(data::Column::TableId.eq(table_id))
@@ -237,6 +281,11 @@ impl ShardActor {
             .filter(data::Column::PartitionKey.lt(upper_bound))
             .order_by_asc(data::Column::PartitionKey)
             .order_by_asc(data::Column::SecondaryKey)
+            .filter(if include_deleted {
+                sea_orm::Condition::all()
+            } else {
+                sea_orm::Condition::all().add(data::Column::Deleted.eq(false))
+            })
             .all(&self.db)
             .await?)
     }
@@ -298,11 +347,11 @@ mod tests {
                 assert_eq!(row.try_get::<String>("", "value").unwrap(), "preserved");
             }
             shard
-                .upsert(1, 1, 1, serde_json::json!("x".repeat(100_000)))
+                .upsert(1, 1, 1, serde_json::json!("x".repeat(100_000)), 1)
                 .await
                 .unwrap();
             let before = pragma(&shard.db, "page_count").await;
-            shard.delete(1, 1, 1).await.unwrap();
+            shard.delete(1, 1, 1, 2).await.unwrap();
             assert!(pragma(&shard.db, "page_count").await < before);
             assert_eq!(pragma(&shard.db, "freelist_count").await, 0);
             shard.db.close().await.unwrap();

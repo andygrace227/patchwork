@@ -141,7 +141,7 @@ impl IncreaseReplication {
 
             // Stage 2: Copy the partition range from the root to each new replica.
             // Existing replicas stay in place. New ones are published only after copying.
-            let records = Client::get_range(
+            let records = Client::get_range_including_deleted(
                 &source_node.url,
                 ctx.table_id,
                 next.hash_start,
@@ -151,12 +151,14 @@ impl IncreaseReplication {
             for node in targets {
                 for record in &records {
                     check_lease(lease_end)?;
-                    Client::upsert(
+                    Client::write_record(
                         &node.url,
                         record.table_id,
                         record.partition_key,
                         record.secondary_key,
                         &record.data,
+                        record.timestamp,
+                        record.deleted,
                     )
                     .await?;
                 }
