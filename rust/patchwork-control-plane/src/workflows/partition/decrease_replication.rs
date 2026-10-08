@@ -1,3 +1,5 @@
+use super::copy_range::copy_range;
+use crate::workflows::data::fetch_range::FetchRangeCtx;
 use anyhow::{Context, Result, ensure};
 use kameo::actor::ActorRef;
 use sea_orm::ActiveValue::Set;
@@ -15,7 +17,7 @@ use crate::{
 pub struct DecreaseReplicationContext {
     pub table_id: i64,
     pub hash_start: i64,
-    /// Desired total number of copies, including the root.
+    /// Desired total number of copies.
     pub replication_factor: usize,
 }
 
@@ -56,13 +58,10 @@ impl DecreaseReplication {
             .await?;
         let (source, next) = boundaries(&partitions, ctx.hash_start)?;
         ensure!(
-            source.forward_to == 0,
+            source.forward_to.is_none(),
             "Cannot change replication while bootstrapping"
         );
-        ensure!(
-            source.replicas.0.contains(&source.node_id),
-            "Replica list must include the root node"
-        );
+        ensure!(!source.replicas.0.is_empty(), "Partition has no replicas");
         let mut unique = source.replicas.0.clone();
         unique.sort_unstable();
         unique.dedup();
@@ -117,7 +116,14 @@ impl DecreaseReplication {
                 "Partition ring changed; retry the replication change"
             );
 
-            // Stage 1: Keep the root and enough existing replicas to reach the target.
+            ensure!(
+                !current
+                    .iter()
+                    .any(|p| p.forward_to == Some(source.hash_start)),
+                "Another partition is still copying from this partition"
+            );
+
+            // Stage 1: Keep enough existing replicas to reach the target.
             // Resolve the removed nodes before changing the replica list.
             let replicas = retained_replicas(source, ctx.replication_factor);
             let mut obsolete = Vec::new();
@@ -132,8 +138,22 @@ impl DecreaseReplication {
                 }
             }
 
+            // Copy every source version to the retained nodes before dropping copies.
+            copy_range(
+                &self.node,
+                FetchRangeCtx {
+                    table_id: ctx.table_id,
+                    lower_bound: source.hash_start,
+                    upper_bound: next.hash_start,
+                },
+                &source.replicas.0,
+                &replicas,
+                lease_end,
+            )
+            .await?;
+
             // Stage 2: Remove those nodes from the replica list first.
-            // Keep the root unchanged. Updating checks that we still hold the leases.
+            // Updating checks that we still hold the leases.
 
             self.partition
                 .ask(UpdateLockedPartition {
@@ -184,25 +204,9 @@ impl DecreaseReplication {
     }
 }
 
-// Preserve replica order, always retaining the root even when it is not first.
+// Preserve replica order; no node has special status.
 fn retained_replicas(source: &partition::Model, count: usize) -> Vec<i64> {
-    let mut remaining = count - 1;
-    source
-        .replicas
-        .0
-        .iter()
-        .copied()
-        .filter(|id| {
-            if *id == source.node_id {
-                return true;
-            }
-            if remaining == 0 {
-                return false;
-            }
-            remaining -= 1;
-            true
-        })
-        .collect()
+    source.replicas.0.iter().copied().take(count).collect()
 }
 
 #[cfg(test)]
@@ -210,16 +214,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decrease_keeps_root_even_when_it_is_last() {
+    fn decrease_keeps_requested_number_of_replicas() {
         let source = partition::Model {
             table_id: 1,
             hash_start: 10,
-            node_id: 3,
-            forward_to: 0,
+
+            forward_to: None,
             replicas: partition::ReplicaNodes(vec![1, 2, 3]),
         };
-        assert_eq!(retained_replicas(&source, 1), vec![3]);
-        assert_eq!(retained_replicas(&source, 2), vec![1, 3]);
+        assert_eq!(retained_replicas(&source, 1), vec![1]);
+        assert_eq!(retained_replicas(&source, 2), vec![1, 2]);
         assert_eq!(retained_replicas(&source, 3), vec![1, 2, 3]);
         assert!(boundaries(&[], 10).is_err());
     }

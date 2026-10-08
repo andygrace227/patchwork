@@ -1,3 +1,5 @@
+use super::copy_range::copy_range;
+use crate::workflows::data::fetch_range::FetchRangeCtx;
 use anyhow::{Context, Result, ensure};
 use kameo::actor::ActorRef;
 
@@ -57,13 +59,13 @@ impl MergePartition {
             .await?;
         let (previous, source, next) = neighbors(&partitions, ctx.hash_start)?;
         ensure!(
-            source.forward_to == 0 && previous.forward_to == 0,
+            source.forward_to.is_none() && previous.forward_to.is_none(),
             "Cannot merge a bootstrapping partition"
         );
         for partition in [source, previous] {
             ensure!(
-                partition.replicas.0.contains(&partition.node_id),
-                "Replica list must include the root node"
+                !partition.replicas.0.is_empty(),
+                "Partition has no replicas"
             );
             let mut unique = partition.replicas.0.clone();
             unique.sort_unstable();
@@ -114,23 +116,15 @@ impl MergePartition {
                 "Partition ring changed; retry the merge"
             );
 
-            // Stage 1: Identify the source root and the previous partition's replicas.
-            // We keep the previous partition's root and replication factor.
-            // Resolve the cleanup nodes here too, before copying or changing the ring.
-            let source_node = self
-                .node
-                .ask(Get { id: source.node_id })
-                .await?
-                .context("Source node no longer exists")?;
-            let mut targets = Vec::new();
-            for id in &previous.replicas.0 {
-                targets.push(
-                    self.node
-                        .ask(Get { id: *id })
-                        .await?
-                        .context("Destination node no longer exists")?,
-                );
-            }
+            ensure!(
+                !current
+                    .iter()
+                    .any(|p| p.forward_to == Some(source.hash_start)
+                        || p.forward_to == Some(previous.hash_start)),
+                "Another partition is still copying from a merge partition"
+            );
+
+            // Stage 1: Resolve obsolete replicas before copying or changing the ring.
             let mut obsolete = Vec::new();
             for id in &source.replicas.0 {
                 if !previous.replicas.0.contains(id) {
@@ -143,35 +137,20 @@ impl MergePartition {
                 }
             }
 
-            // Stage 2: Copy the source range into the previous partition's replicas.
-            // Fetch [source.hash_start, next.hash_start) once from the source root.
-            // The source boundary stays in the database until copying finishes.
-            let records = Client::get_range_including_deleted(
-                &source_node.url,
-                ctx.table_id,
-                next.hash_start,
-                source.hash_start,
+            // Stage 2: Copy every source replica into the previous partition's replicas.
+            // Keep the source boundary until every destination acknowledges the copy.
+            copy_range(
+                &self.node,
+                FetchRangeCtx {
+                    table_id: ctx.table_id,
+                    lower_bound: source.hash_start,
+                    upper_bound: next.hash_start,
+                },
+                &source.replicas.0,
+                &previous.replicas.0,
+                lease_end,
             )
             .await?;
-            for node in targets {
-                // Shared replicas already hold the source range.
-                if source.replicas.0.contains(&node.node_id) {
-                    continue;
-                }
-                for record in &records {
-                    check_lease(lease_end)?;
-                    Client::write_record(
-                        &node.url,
-                        record.table_id,
-                        record.partition_key,
-                        record.secondary_key,
-                        &record.data,
-                        record.timestamp,
-                        record.deleted,
-                    )
-                    .await?;
-                }
-            }
 
             // Stage 3: Remove the source partition from the database.
             // The previous partition now owns the combined range; its row stays as-is.
@@ -184,7 +163,7 @@ impl MergePartition {
                 })
                 .await?;
 
-            // Stage 4: Clean up the source range on its old root and replicas.
+            // Stage 4: Clean up the source range on its old replicas.
             // Only remove the records we moved, not the node's other partitions.
             // Shared replicas are excluded from obsolete: they must keep their copies.
             for node in obsolete {
@@ -232,8 +211,8 @@ mod tests {
             .map(|hash_start| Model {
                 table_id: 1,
                 hash_start,
-                node_id: 1,
-                forward_to: 0,
+
+                forward_to: None,
                 replicas: ReplicaNodes(vec![1]),
             })
             .collect();

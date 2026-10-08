@@ -69,15 +69,11 @@ impl DeleteTable {
                 "Partition ring changed; retry deleting the table"
             );
 
-            // Stage 3: Find every node holding this table, including bootstrap sources.
+            // Stage 3: Find every node holding this table, including bootstrap sources in this same table.
             // A node may hold several partitions. Delete this table there only once.
             let mut node_ids = Vec::new();
             for partition in &partitions {
-                node_ids.push(partition.node_id);
                 node_ids.extend(&partition.replicas.0);
-                if partition.forward_to != 0 {
-                    node_ids.push(partition.forward_to);
-                }
             }
             node_ids.sort_unstable();
             node_ids.dedup();

@@ -1,3 +1,5 @@
+use super::copy_range::copy_range;
+use crate::workflows::data::fetch_range::FetchRangeCtx;
 use crate::{client, db::actor::Get};
 use crate::{
     db::{
@@ -124,24 +126,24 @@ impl SplitPartition {
                 return Err(anyhow::anyhow!("Partition ring changed; retry the split"));
             }
 
+            anyhow::ensure!(
+                !current
+                    .iter()
+                    .any(|p| p.forward_to == Some(split_p.hash_start)),
+                "Another partition is still copying from this partition"
+            );
+
             // Stage 1: Identify the new nodes in the database.
-            // The root node, and the replicas.
+            // All nodes are equal replicas.
             if replication_factor == 0 {
                 return Err(anyhow::anyhow!("Replication factor must be positive"));
             }
 
-            // Exclude the previous partition's root when choosing the new nodes.
             let mut node_ids = Vec::new();
-            node_ids.push(split_p.node_id);
 
-            if split_p.forward_to != 0 {
+            if split_p.forward_to.is_some() {
                 return Err(anyhow::anyhow!(
                     "Cannot split a partition that is still bootstrapping"
-                ));
-            }
-            if !split_p.replicas.0.contains(&split_p.node_id) {
-                return Err(anyhow::anyhow!(
-                    "The replica list must include the root node"
                 ));
             }
             let mut unique_replicas = split_p.replicas.0.clone();
@@ -150,16 +152,6 @@ impl SplitPartition {
             if unique_replicas.len() != replication_factor {
                 return Err(anyhow::anyhow!("The replica list contains duplicate nodes"));
             }
-            let old_node = self
-                .node
-                .ask(Get {
-                    id: split_p.node_id,
-                })
-                .await?
-                .context("Source node no longer exists")?;
-            let mut target_nodes = Vec::new();
-
-            // Form the replica array, which does include the root node.
             let mut replicas = Vec::new();
             for _ in 0..replication_factor {
                 let node_id_copy = node_ids.clone();
@@ -175,7 +167,6 @@ impl SplitPartition {
 
                 node_ids.push(node.node_id);
                 replicas.push(node.node_id);
-                target_nodes.push(node);
             }
 
             // Stage 2: Push the new partition into the DB. Its key is already locked.
@@ -183,12 +174,10 @@ impl SplitPartition {
 
             // So:
             // Replication_factor is the length of replicas
-            // Root node == replicas[0]
             let proposed_partition = partition::ActiveModel {
                 table_id: Set(ctx.table_id),
                 hash_start: Set(ctx.new_partition),
-                node_id: Set(*replicas.first().unwrap()),
-                forward_to: Set(split_p.node_id), // Send read traffic to old node while this one is bootstrapping. Send write traffic but also interpret it here too and forward to replicas.
+                forward_to: Set(Some(split_p.hash_start)), // Reads use the source partition until copying finishes.
                 replicas: Set(partition::ReplicaNodes(replicas.clone())), // Preserve the old partition's number of copies.
             };
 
@@ -199,38 +188,20 @@ impl SplitPartition {
                 })
                 .await?;
 
-            // Stage 3: Start copying data FROM the previous root node for the affected partition range
-            // Also propagate to the copies. [new_partition, end_hash_range)
-
-            // Fetch once, then send the same snapshot to each selected replica.
-            let data = client::Client::get_range_including_deleted(
-                &old_node.url,
-                ctx.table_id,
-                end_hash_range,
-                ctx.new_partition,
+            // Stage 3: Scan all old replicas and consistently write every version.
+            // Timestamp ordering on the destinations also preserves tombstones.
+            copy_range(
+                &self.node,
+                FetchRangeCtx {
+                    table_id: ctx.table_id,
+                    lower_bound: ctx.new_partition,
+                    upper_bound: end_hash_range,
+                },
+                &split_p.replicas.0,
+                &replicas,
+                lease_end,
             )
             .await?;
-            for node in &target_nodes {
-                for record in &data {
-                    if std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)?
-                        .as_secs() as i64
-                        >= lease_end
-                    {
-                        return Err(anyhow::anyhow!("Split lease expired during copying"));
-                    }
-                    client::Client::write_record(
-                        &node.url,
-                        record.table_id,
-                        record.partition_key,
-                        record.secondary_key,
-                        &record.data,
-                        record.timestamp,
-                        record.deleted,
-                    )
-                    .await?;
-                }
-            }
 
             // Stage 4: Mark the new partition as live.
             self.partition
@@ -238,14 +209,14 @@ impl SplitPartition {
                     data: partition::ActiveModel {
                         table_id: Set(ctx.table_id),
                         hash_start: Set(ctx.new_partition),
-                        forward_to: Set(0), // No forwarding: reads and writes use the new nodes.
+                        forward_to: Set(None), // No forwarding: reads and writes use the new nodes.
                         ..Default::default()
                     },
                     locks: locks.clone(),
                 })
                 .await?;
 
-            // Stage 5: Start removing that chunk from split_p's old replicas and its root node.
+            // Stage 5: Start removing that chunk from split_p's old replicas.
             // Nodes shared with the new replica list must keep their copies.
             for replica in &split_p.replicas.0 {
                 if replicas.contains(replica) {

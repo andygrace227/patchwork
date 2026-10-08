@@ -1,22 +1,20 @@
+use super::copy_range::copy_range;
+use crate::workflows::data::fetch_range::FetchRangeCtx;
 use anyhow::{Context, Result, ensure};
 use kameo::actor::ActorRef;
 use sea_orm::ActiveValue::Set;
 
-use crate::{
-    client::Client,
-    db::{
-        NodeActor, PartitionActor,
-        actor::Get,
-        node::GetNodeExcluding,
-        parition_lock::{AttemptLock, FreeLock},
-        partition::{self, GetTablePartitions, UpdateLockedPartition},
-    },
+use crate::db::{
+    NodeActor, PartitionActor,
+    node::GetNodeExcluding,
+    parition_lock::{AttemptLock, FreeLock},
+    partition::{self, GetTablePartitions, UpdateLockedPartition},
 };
 
 pub struct IncreaseReplicationContext {
     pub table_id: i64,
     pub hash_start: i64,
-    /// Desired total number of copies, including the root.
+    /// Desired total number of copies.
     pub replication_factor: usize,
 }
 
@@ -41,11 +39,6 @@ fn now() -> Result<i64> {
         .as_secs() as i64)
 }
 
-fn check_lease(lease_end: i64) -> Result<()> {
-    ensure!(now()? < lease_end, "Replication lease expired");
-    Ok(())
-}
-
 impl IncreaseReplication {
     pub async fn run(&self, ctx: IncreaseReplicationContext) -> Result<()> {
         // Fetch the hash ring. The next boundary marks the end of this partition.
@@ -57,13 +50,10 @@ impl IncreaseReplication {
             .await?;
         let (source, next) = boundaries(&partitions, ctx.hash_start)?;
         ensure!(
-            source.forward_to == 0,
+            source.forward_to.is_none(),
             "Cannot change replication while bootstrapping"
         );
-        ensure!(
-            source.replicas.0.contains(&source.node_id),
-            "Replica list must include the root node"
-        );
+        ensure!(!source.replicas.0.is_empty(), "Partition has no replicas");
         let mut unique = source.replicas.0.clone();
         unique.sort_unstable();
         unique.dedup();
@@ -118,13 +108,15 @@ impl IncreaseReplication {
                 "Partition ring changed; retry the replication change"
             );
 
+            ensure!(
+                !current
+                    .iter()
+                    .any(|p| p.forward_to == Some(source.hash_start)),
+                "Another partition is still copying from this partition"
+            );
+
             // Stage 1: Select additional nodes outside the current replica list.
             // Resolve all destinations before starting the copy.
-            let source_node = self
-                .node
-                .ask(Get { id: source.node_id })
-                .await?
-                .context("Source node no longer exists")?;
             let mut replicas = source.replicas.0.clone();
             let mut targets = Vec::new();
             while replicas.len() < ctx.replication_factor {
@@ -136,33 +128,22 @@ impl IncreaseReplication {
                     .await?
                     .context("Not enough nodes to reach the requested replication factor")?;
                 replicas.push(node.node_id);
-                targets.push(node);
+                targets.push(node.node_id);
             }
 
-            // Stage 2: Copy the partition range from the root to each new replica.
-            // Existing replicas stay in place. New ones are published only after copying.
-            let records = Client::get_range_including_deleted(
-                &source_node.url,
-                ctx.table_id,
-                next.hash_start,
-                source.hash_start,
+            // Stage 2: Copy all source versions before publishing the new replicas.
+            copy_range(
+                &self.node,
+                FetchRangeCtx {
+                    table_id: ctx.table_id,
+                    lower_bound: source.hash_start,
+                    upper_bound: next.hash_start,
+                },
+                &source.replicas.0,
+                &targets,
+                lease_end,
             )
             .await?;
-            for node in targets {
-                for record in &records {
-                    check_lease(lease_end)?;
-                    Client::write_record(
-                        &node.url,
-                        record.table_id,
-                        record.partition_key,
-                        record.secondary_key,
-                        &record.data,
-                        record.timestamp,
-                        record.deleted,
-                    )
-                    .await?;
-                }
-            }
 
             // Stage 3: Publish the expanded replica list.
             // Updating checks that we still hold both boundary leases.

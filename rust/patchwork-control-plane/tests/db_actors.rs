@@ -45,8 +45,7 @@ async fn all_models_support_crud_and_overlapping_requests() {
             data: partition::ActiveModel {
                 table_id: Set(1),
                 hash_start: Set(0),
-                forward_to: Set(0),
-                node_id: Set(node.node_id),
+                forward_to: Set(None),
                 replicas: Set(partition::ReplicaNodes(vec![node.node_id])),
                 ..Default::default()
             },
@@ -72,9 +71,8 @@ async fn all_models_support_crud_and_overlapping_requests() {
                 data: partition::ActiveModel {
                     table_id: Set(table_id),
                     hash_start: Set(hash_start),
-                    node_id: Set(node.node_id),
                     replicas: Set(partition::ReplicaNodes(vec![node.node_id])),
-                    forward_to: Set(0),
+                    forward_to: Set(None),
                     ..Default::default()
                 },
             })
@@ -98,7 +96,7 @@ async fn all_models_support_crud_and_overlapping_requests() {
             .is_empty()
     );
     node.url = "http://localhost:3001".into();
-    partition.forward_to = 100;
+    partition.forward_to = Some(100);
     assert_eq!(partition.replication_factor(), 1);
     table.owner = 3;
     assert_eq!(

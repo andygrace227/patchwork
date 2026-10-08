@@ -119,3 +119,25 @@ where
         ctx.spawn(async move { Ok(E::delete_by_id(msg.id).exec(&db).await?.rows_affected) })
     }
 }
+
+/// Cache hook. Reads through to the database until caching is implemented.
+pub struct GetCached<K = i64> {
+    pub id: K,
+}
+
+impl<E, K> Message<GetCached<K>> for CrudActor<E>
+where
+    E: EntityTrait,
+    E::PrimaryKey: PrimaryKeyTrait<ValueType = K>,
+    K: Send + 'static,
+{
+    type Reply = DelegatedReply<Result<Option<E::Model>, DbErr>>;
+
+    async fn handle(
+        &mut self,
+        msg: GetCached<K>,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        <Self as Message<Get<K>>>::handle(self, Get { id: msg.id }, ctx).await
+    }
+}

@@ -33,8 +33,7 @@ fn initial_partitions(table_id: i64, nodes: [i64; 3]) -> Vec<partition::ActiveMo
             partition::ActiveModel {
                 table_id: Set(table_id),
                 hash_start: Set(hash_start),
-                node_id: Set(nodes[idx]),
-                forward_to: Set(0),
+                forward_to: Set(None),
                 replicas: Set(partition::ReplicaNodes(replicas)),
             }
         })
@@ -43,7 +42,7 @@ fn initial_partitions(table_id: i64, nodes: [i64; 3]) -> Vec<partition::ActiveMo
 
 impl MakeTable {
     pub async fn run(&self, ctx: MakeTableContext) -> Result<table::Model> {
-        // Check capacity before creating anything. Three copies includes the root.
+        // Check capacity before creating anything. Use three copies.
         ensure!(
             !ctx.table_name.trim().is_empty(),
             "Table name must not be empty"
@@ -86,8 +85,8 @@ impl MakeTable {
         // Keep failures inside the block so we always attempt to release acquired locks.
         let result: Result<()> = async {
             // Stage 2: Lock all three partition keys before publishing any of them.
-            // The keys are already sorted. Each partition gets a different root,
-            // with the same three nodes rotated through its replica list.
+            // The keys are already sorted. Each partition uses the same three nodes,
+            // with their replica order rotated.
             let lease_end = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs() as i64
@@ -160,7 +159,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn initial_ring_has_even_ranges_distinct_roots_and_three_copies() {
+    fn initial_ring_has_even_ranges_and_three_copies() {
         let partitions = initial_partitions(42, [7, 11, 19]);
         let starts: Vec<_> = partitions
             .iter()
@@ -174,14 +173,12 @@ mod tests {
         assert_eq!(starts[0], i64::MIN as i128);
         assert!(widths.iter().max().unwrap() - widths.iter().min().unwrap() <= 1);
         assert_eq!(widths.iter().sum::<i128>(), 1_i128 << 64);
-        for (idx, p) in partitions.iter().enumerate() {
+        for p in &partitions {
             assert_eq!(*p.table_id.as_ref(), 42);
-            assert_eq!(*p.node_id.as_ref(), [7, 11, 19][idx]);
-            assert_eq!(p.replicas.as_ref().0[0], *p.node_id.as_ref());
             let mut replicas = p.replicas.as_ref().0.clone();
             replicas.sort_unstable();
             assert_eq!(replicas, vec![7, 11, 19]);
-            assert_eq!(*p.forward_to.as_ref(), 0);
+            assert_eq!(*p.forward_to.as_ref(), None);
         }
     }
 }

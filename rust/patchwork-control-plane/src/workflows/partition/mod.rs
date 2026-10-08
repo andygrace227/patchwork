@@ -11,3 +11,5 @@ pub fn circular_get<T>(vec: &Vec<T>, idx: usize) -> Option<&T> {
     let idx = idx % vec.len();
     return vec.get(idx);
 }
+
+mod copy_range;

@@ -4,7 +4,7 @@ use kameo::{
     reply::DelegatedReply,
 };
 use sea_orm::entity::prelude::*;
-use sea_orm::{FromJsonQueryResult, QueryFilter, QueryOrder};
+use sea_orm::{FromJsonQueryResult, QueryFilter, QueryOrder, QuerySelect};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
@@ -15,16 +15,15 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub hash_start: i64,
 
-    #[sea_orm(indexed)]
-    pub node_id: i64,
-
-    pub forward_to: i64, // A flag. If this is not NULL, then send reads to the forwarded node exclusively, and writes here and to the forwarded node.
+    /// Another partition's hash_start in this table. Reads use its replicas;
+    /// writes use both replica lists until copying finishes.
+    pub forward_to: Option<i64>,
 
     #[sea_orm(column_type = "Json")]
     pub replicas: ReplicaNodes,
 }
 
-/// All nodes holding this partition, including its primary node.
+/// All nodes holding this partition, with no designated primary.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, FromJsonQueryResult)]
 pub struct ReplicaNodes(pub Vec<i64>);
 
@@ -58,6 +57,33 @@ impl Message<GetTablePartitions> for PartitionActor {
                 .filter(Column::TableId.eq(msg.table_id))
                 .order_by_asc(Column::HashStart)
                 .all(&db)
+                .await
+        })
+    }
+}
+
+/// Returns the table's closest partition at or before the supplied hash, or None.
+pub struct GetPartitionAtOrBefore {
+    pub table_id: i64,
+    pub hash_start: i64,
+}
+
+impl Message<GetPartitionAtOrBefore> for PartitionActor {
+    type Reply = DelegatedReply<Result<Option<Model>, DbErr>>;
+
+    async fn handle(
+        &mut self,
+        msg: GetPartitionAtOrBefore,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let db = self.db.clone();
+        ctx.spawn(async move {
+            Entity::find()
+                .filter(Column::TableId.eq(msg.table_id))
+                .filter(Column::HashStart.lte(msg.hash_start))
+                .order_by_desc(Column::HashStart)
+                .limit(1)
+                .one(&db)
                 .await
         })
     }
@@ -184,5 +210,31 @@ impl Message<DeleteLockedPartition> for PartitionActor {
             txn.commit().await?;
             Ok(deleted.rows_affected)
         })
+    }
+}
+
+/// Cache hook. Reads through to the database until caching is implemented.
+pub struct GetPartitionAtOrBeforeCached {
+    pub table_id: i64,
+    pub hash_start: i64,
+}
+
+impl Message<GetPartitionAtOrBeforeCached> for PartitionActor {
+    type Reply = DelegatedReply<Result<Option<Model>, DbErr>>;
+
+    async fn handle(
+        &mut self,
+        msg: GetPartitionAtOrBeforeCached,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        <Self as Message<GetPartitionAtOrBefore>>::handle(
+            self,
+            GetPartitionAtOrBefore {
+                table_id: msg.table_id,
+                hash_start: msg.hash_start,
+            },
+            ctx,
+        )
+        .await
     }
 }
