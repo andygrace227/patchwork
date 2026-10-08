@@ -89,6 +89,21 @@ Range count and size endpoints append `/count` and `/size` before the query.
 GET `/shard/size` returns `{"size_bytes": N}` for the main SQLite file,
 excluding WAL and SHM files.
 
+GET `/shard/telemetry` returns an array grouped by `table_id` and `partition_key`,
+with `reads_per_second`, `writes_per_second`, `average_write_position`,
+`median_write_position`, and `window_seconds`. Positions refer to secondary keys;
+the median uses the upper middle observed key when the write count is even.
+Positions are null when the window has no writes.
+
+Telemetry lives in the shard actor's memory and resets on restart. Each tracker
+retains at most 1024 accesses from the last ten seconds. During startup or buffer
+overflow, both rates use the shorter retained window reported in `window_seconds`.
+Inactive trackers are discarded when telemetry is requested or during periodic
+cleanup on access. Successful point reads count misses too; bulk reads count
+returned records. Writes include tombstones, replicas, and acknowledged stale
+writes or retries. Physical cleanup deletes clear affected trackers; count, size,
+and telemetry requests do not count as record accesses.
+
 Shards use auto_vacuum=FULL to reclaim completely free pages on commit.
 Existing shards with auto-vacuum disabled are rebuilt once during startup; this
 can take time and temporary disk space. Later opens skip the rebuild. In WAL

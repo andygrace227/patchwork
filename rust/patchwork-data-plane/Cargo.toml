@@ -13,6 +13,7 @@ sea-orm = { version = "2", features = ["sqlx-sqlite", "runtime-tokio-rustls", "m
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+ringbuffer = "0.16.0"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

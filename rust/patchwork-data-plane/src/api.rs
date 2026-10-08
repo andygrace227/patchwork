@@ -2,9 +2,10 @@ use crate::{
     data,
     shard_actor::{
         CountRange, Delete, DeletePartitionKey, DeleteRange, DeleteTable, Get, GetPartitionKey,
-        GetRange, GetRangeSize, GetSize, ShardActor, WriteRecord,
+        GetRange, GetRangeSize, GetSize, GetTelemetry, ShardActor, WriteRecord,
     },
     subordinate_shard_writer::{Put, SubordinateShardWriter},
+    telemetry,
 };
 use axum::{
     Extension, Json, Router,
@@ -26,6 +27,7 @@ pub fn router_with_writer(
 ) -> Router {
     Router::new()
         .route("/shard/size", get(get_size))
+        .route("/shard/telemetry", get(get_telemetry))
         .route(
             "/tables/{table_id}/partition-keys/{partition_key}/records/{secondary_key}/with-replicas-inconsistent",
             axum::routing::put(put_with_replicas_inconsistent),
@@ -354,6 +356,14 @@ async fn get_size(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let size_bytes = shard.ask(GetSize {}).await.map_err(internal_error)?;
     Ok(Json(serde_json::json!({ "size_bytes": size_bytes })))
+}
+
+async fn get_telemetry(
+    State(shard): State<ActorRef<ShardActor>>,
+) -> Result<Json<Vec<telemetry::Model>>, ApiError> {
+    Ok(Json(
+        shard.ask(GetTelemetry {}).await.map_err(internal_error)?,
+    ))
 }
 
 async fn count_range(

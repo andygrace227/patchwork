@@ -58,6 +58,95 @@ async fn request_at(
 }
 
 #[tokio::test]
+async fn telemetry_tracks_local_accesses_and_clears_with_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shard.sqlite").to_str().unwrap().to_owned();
+    let shard = ShardActor::spawn(ShardActor::new(path.clone()).await.unwrap());
+    let app = api::router(shard.clone());
+    assert_eq!(
+        request(&app, "GET", "/shard/telemetry", None).await,
+        (StatusCode::OK, json!([]))
+    );
+    for (table, partition, key) in [
+        (1, 10, 10),
+        (1, 10, 10),
+        (1, 10, 1000),
+        (1, 20, 20),
+        (2, 10, 30),
+    ] {
+        request(
+            &app,
+            "PUT",
+            &format!("/tables/{table}/partition-keys/{partition}/records/{key}"),
+            Some(json!(key)),
+        )
+        .await;
+    }
+    request(&app, "GET", "/tables/1/partition-keys/10/records/99", None).await;
+    request(&app, "GET", "/tables/1/partition-keys/10", None).await;
+    request(
+        &app,
+        "GET",
+        "/tables/1/range?lower_bound=20&upper_bound=21",
+        None,
+    )
+    .await;
+    request(
+        &app,
+        "DELETE",
+        "/tables/2/partition-keys/10/records/30",
+        None,
+    )
+    .await;
+    let stats = request(&app, "GET", "/shard/telemetry", None).await.1;
+    assert_eq!(stats.as_array().unwrap().len(), 3);
+    assert_eq!(stats[0]["table_id"], 1);
+    assert_eq!(stats[0]["partition_key"], 10);
+    assert_eq!(stats[0]["average_write_position"], 340);
+    assert_eq!(stats[0]["median_write_position"], 10);
+    assert!(
+        (stats[0]["reads_per_second"].as_f64().unwrap()
+            / stats[0]["writes_per_second"].as_f64().unwrap()
+            - 1.0)
+            .abs()
+            < 1e-9
+    );
+    assert!(stats[1]["reads_per_second"].as_f64().unwrap() > 0.0);
+    assert_eq!(stats[2]["median_write_position"], 30);
+    request(&app, "DELETE", "/tables/1/partition-keys/20", None).await;
+    request(
+        &app,
+        "DELETE",
+        "/tables/1/range?lower_bound=10&upper_bound=11",
+        None,
+    )
+    .await;
+    let stats = request(&app, "GET", "/shard/telemetry", None).await.1;
+    assert_eq!(stats.as_array().unwrap().len(), 1);
+    assert_eq!(stats[0]["table_id"], 2);
+    shard.stop_gracefully().await.unwrap();
+    shard.wait_for_shutdown().await;
+    drop(app);
+    let reopened = ShardActor::spawn(ShardActor::new(path).await.unwrap());
+    let app = api::router(reopened.clone());
+    assert_eq!(
+        request(&app, "GET", "/shard/telemetry", None).await.1,
+        json!([])
+    );
+    request(&app, "GET", "/tables/2/partition-keys/10/records/99", None).await;
+    let stats = request(&app, "GET", "/shard/telemetry", None).await.1;
+    assert_eq!(stats[0]["average_write_position"], Value::Null);
+    assert_eq!(stats[0]["median_write_position"], Value::Null);
+    request(&app, "DELETE", "/tables/2", None).await;
+    assert_eq!(
+        request(&app, "GET", "/shard/telemetry", None).await.1,
+        json!([])
+    );
+    reopened.stop_gracefully().await.unwrap();
+    reopened.wait_for_shutdown().await;
+}
+
+#[tokio::test]
 async fn operations_are_scoped_and_persist_after_reopening() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir
