@@ -1,9 +1,5 @@
-use crate::workflows::stages::{RunState, task_error};
-use cano::{
-    CancellationToken, CanoError, Resources, TaskConfig, TaskResult, Workflow as CanoWorkflow,
-};
+use crate::workflows::stages::workflow_steps;
 use std::collections::HashMap;
-use tokio::sync::Mutex;
 
 use anyhow::{Context, Result};
 use kameo::actor::ActorRef;
@@ -32,14 +28,6 @@ pub struct CheckTableScale {
     pub orchestrator: ActorRef<LongRunningWorkflowExecutor>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum State {
-    FetchPartitions,
-    CollectTelemetry,
-    Decide,
-    Done,
-}
-
 struct ScaleCheck {
     workflow: CheckTableScale,
     ctx: CheckTableScaleContext,
@@ -47,48 +35,28 @@ struct ScaleCheck {
     global_telemetry: HashMap<i64, AccessStatistics>,
 }
 
-#[cano::task]
-impl cano::Task<State> for State {
-    fn config(&self) -> TaskConfig {
-        TaskConfig::minimal()
-    }
-
-    async fn run(
-        &self,
-        resources: &Resources,
-    ) -> std::result::Result<TaskResult<State>, CanoError> {
-        let check = resources.get::<RunState<ScaleCheck>, _>("check")?;
-        let mut check = check.0.lock().await;
-        let next = match self {
-            Self::FetchPartitions => check.fetch_partitions().await,
-            Self::CollectTelemetry => check.collect_telemetry().await,
-            Self::Decide => check.decide(),
-            Self::Done => Ok(State::Done),
-        }
-        .map_err(task_error)?;
-        Ok(TaskResult::Single(next))
-    }
+workflow_steps! {
+    run: ScaleCheck,
+    state: State,
+    start: FetchPartitions,
+    done: Done,
+    cleanup: none,
+    FetchPartitions => fetch_partitions,
+    CollectTelemetry => collect_telemetry,
+    Decide => decide,
 }
 
 impl CheckTableScale {
     pub async fn run(&self, ctx: CheckTableScaleContext) -> Result<()> {
-        let workflow = CanoWorkflow::new(Resources::new().insert(
-            "check",
-            RunState(Mutex::new(ScaleCheck {
-                workflow: self.clone(),
-                ctx,
-                partitions: Vec::new(),
-                global_telemetry: HashMap::new(),
-            })),
-        ))
-        .register(State::FetchPartitions, State::FetchPartitions)
-        .register(State::CollectTelemetry, State::CollectTelemetry)
-        .register(State::Decide, State::Decide)
-        .add_exit_state(State::Done);
-        workflow
-            .orchestrate(State::FetchPartitions, CancellationToken::disabled())
-            .await?;
-        Ok(())
+        ScaleCheck {
+            workflow: self.clone(),
+            ctx,
+            partitions: Vec::new(),
+            global_telemetry: HashMap::new(),
+        }
+        .execute()
+        .await
+        .map(|_| ())
     }
 }
 
@@ -133,7 +101,7 @@ impl ScaleCheck {
         }
         Ok(State::Decide)
     }
-    fn decide(&mut self) -> Result<State> {
+    async fn decide(&mut self) -> Result<State> {
         let partition_lookup_map: HashMap<i64, usize> = self
             .partitions
             .iter()

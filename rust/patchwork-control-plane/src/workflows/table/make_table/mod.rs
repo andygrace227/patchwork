@@ -1,11 +1,7 @@
-use crate::workflows::stages::{RunState, finish, task_error, unlock};
+use crate::workflows::stages::{unlock, workflow_steps};
 use anyhow::{Context, Result, ensure};
-use cano::{
-    CancellationToken, CanoError, Resources, TaskConfig, TaskResult, Workflow as CanoWorkflow,
-};
 use kameo::actor::ActorRef;
 use sea_orm::ActiveValue::Set;
-use tokio::sync::Mutex;
 
 use crate::db::{
     NodeActor, PartitionActor, TableActor,
@@ -49,17 +45,6 @@ fn initial_partitions(table_id: i64, nodes: [i64; 3]) -> Vec<partition::ActiveMo
 
 mod steps;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum State {
-    Validate,
-    Create,
-    Lock,
-    Publish,
-    Unlock,
-    Ready,
-    Done,
-}
-
 struct Run {
     workflow: MakeTable,
     ctx: MakeTableContext,
@@ -69,68 +54,34 @@ struct Run {
     created: Option<table::Model>,
 }
 
-#[cano::task]
-impl cano::Task<State> for State {
-    fn config(&self) -> TaskConfig {
-        // Copying and metadata changes must not be retried automatically.
-        TaskConfig::minimal()
-    }
-
-    async fn run(
-        &self,
-        resources: &Resources,
-    ) -> std::result::Result<TaskResult<State>, CanoError> {
-        let run = resources.get::<RunState<Run>, _>("run")?;
-        let mut run = run.0.lock().await;
-        let next = match self {
-            Self::Validate => run.validate().await,
-            Self::Create => run.create().await,
-            Self::Lock => run.lock().await,
-            Self::Publish => run.publish().await,
-            Self::Unlock => run.unlock().await,
-            Self::Ready => run.ready().await,
-            Self::Done => Ok(State::Done),
-        }
-        .map_err(task_error)?;
-        Ok(TaskResult::Single(next))
-    }
+workflow_steps! {
+    run: Run,
+    state: State,
+    start: Validate,
+    done: Done,
+    cleanup: unlock,
+    Validate => validate,
+    Create => create,
+    Lock => lock,
+    Publish => publish,
+    Unlock => unlock,
+    Ready => ready,
 }
 
 impl MakeTable {
     pub async fn run(&self, ctx: MakeTableContext) -> Result<table::Model> {
-        let resources = Resources::new().insert(
-            "run",
-            RunState(Mutex::new(Run {
-                workflow: self.clone(),
-                ctx,
-                locks: Vec::new(),
-                nodes: [0; 3],
-                partitions: Vec::new(),
-                created: None,
-            })),
-        );
-        let run = resources.get::<RunState<Run>, _>("run")?;
-        let workflow = CanoWorkflow::new(resources)
-            .register(State::Validate, State::Validate)
-            .register(State::Create, State::Create)
-            .register(State::Lock, State::Lock)
-            .register(State::Publish, State::Publish)
-            .register(State::Unlock, State::Unlock)
-            .register(State::Ready, State::Ready)
-            .add_exit_state(State::Done);
-        let result = workflow
-            .orchestrate(State::Validate, CancellationToken::disabled())
-            .await
-            .map(|_| ())
-            .map_err(anyhow::Error::from);
-
-        // Cano reports step failures and panics. Always release partially acquired locks.
-        let mut run = run.0.lock().await;
-        let released = run.unlock().await;
-        finish(result, released.map(|_| ()))?;
-        run.created
-            .clone()
-            .context("Table creation did not produce a table")
+        let run = Run {
+            workflow: self.clone(),
+            ctx,
+            locks: Vec::new(),
+            nodes: [0; 3],
+            partitions: Vec::new(),
+            created: None,
+        }
+        .execute()
+        .await?;
+        let created = run.0.lock().await.created.clone();
+        created.context("Table creation did not produce a table")
     }
 }
 

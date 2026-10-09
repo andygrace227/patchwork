@@ -1,13 +1,9 @@
 use super::copy_range::copy_range;
 use crate::workflows::data::fetch_range::FetchRangeCtx;
-use crate::workflows::stages::{RunState, finish, task_error, unlock};
+use crate::workflows::stages::{unlock, workflow_steps};
 use anyhow::{Context, Result, ensure};
-use cano::{
-    CancellationToken, CanoError, Resources, TaskConfig, TaskResult, Workflow as CanoWorkflow,
-};
 use kameo::actor::ActorRef;
 use sea_orm::ActiveValue::Set;
-use tokio::sync::Mutex;
 
 use crate::{
     dataplane_client::Client,
@@ -35,18 +31,6 @@ pub struct DecreaseReplication {
 
 mod steps;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum State {
-    Prepare,
-    Lock,
-    SelectNodes,
-    Copy,
-    Metadata,
-    Cleanup,
-    Unlock,
-    Done,
-}
-
 struct Run {
     workflow: DecreaseReplication,
     ctx: DecreaseReplicationContext,
@@ -58,69 +42,36 @@ struct Run {
     obsolete: Vec<crate::db::node::Model>,
 }
 
-#[cano::task]
-impl cano::Task<State> for State {
-    fn config(&self) -> TaskConfig {
-        // Copying and metadata changes must not be retried automatically.
-        TaskConfig::minimal()
-    }
-
-    async fn run(
-        &self,
-        resources: &Resources,
-    ) -> std::result::Result<TaskResult<State>, CanoError> {
-        let run = resources.get::<RunState<Run>, _>("run")?;
-        let mut run = run.0.lock().await;
-        let next = match self {
-            Self::Prepare => run.prepare().await,
-            Self::Lock => run.lock().await,
-            Self::SelectNodes => run.select_nodes().await,
-            Self::Copy => run.copy().await,
-            Self::Metadata => run.metadata().await,
-            Self::Cleanup => run.cleanup().await,
-            Self::Unlock => run.unlock().await,
-            Self::Done => Ok(State::Done),
-        }
-        .map_err(task_error)?;
-        Ok(TaskResult::Single(next))
-    }
+workflow_steps! {
+    run: Run,
+    state: State,
+    start: Prepare,
+    done: Done,
+    cleanup: unlock,
+    Prepare => prepare,
+    Lock => lock,
+    SelectNodes => select_nodes,
+    Copy => copy,
+    Metadata => metadata,
+    Cleanup => cleanup,
+    Unlock => unlock,
 }
 
 impl DecreaseReplication {
     pub async fn run(&self, ctx: DecreaseReplicationContext) -> Result<()> {
-        let resources = Resources::new().insert(
-            "run",
-            RunState(Mutex::new(Run {
-                workflow: self.clone(),
-                ctx,
-                locks: Vec::new(),
-                boundaries: None,
-                keys: Vec::new(),
-                lease_end: 0,
-                replicas: Vec::new(),
-                obsolete: Vec::new(),
-            })),
-        );
-        let run = resources.get::<RunState<Run>, _>("run")?;
-        let workflow = CanoWorkflow::new(resources)
-            .register(State::Prepare, State::Prepare)
-            .register(State::Lock, State::Lock)
-            .register(State::SelectNodes, State::SelectNodes)
-            .register(State::Copy, State::Copy)
-            .register(State::Metadata, State::Metadata)
-            .register(State::Cleanup, State::Cleanup)
-            .register(State::Unlock, State::Unlock)
-            .add_exit_state(State::Done);
-        let result = workflow
-            .orchestrate(State::Prepare, CancellationToken::disabled())
-            .await
-            .map(|_| ())
-            .map_err(anyhow::Error::from);
-
-        // Cano reports step failures and panics. Always release partially acquired locks.
-        let mut run = run.0.lock().await;
-        let released = run.unlock().await;
-        finish(result, released.map(|_| ()))
+        Run {
+            workflow: self.clone(),
+            ctx,
+            locks: Vec::new(),
+            boundaries: None,
+            keys: Vec::new(),
+            lease_end: 0,
+            replicas: Vec::new(),
+            obsolete: Vec::new(),
+        }
+        .execute()
+        .await
+        .map(|_| ())
     }
 }
 

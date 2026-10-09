@@ -1325,6 +1325,7 @@ dependencies = [
  "anyhow",
  "axum",
  "cano",
+ "dotenvy",
  "kameo",
  "patchwork-common",
  "patchwork-data-plane",
