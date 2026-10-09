@@ -1,5 +1,5 @@
 use anyhow::Result;
-use patchwork_common::client::Client;
+use patchwork_common::dataplane_client::Client;
 use serde_json::Value;
 use tokio::task::JoinSet;
 

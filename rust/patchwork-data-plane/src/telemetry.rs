@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
+pub use patchwork_common::dataplane_client::{AccessStatistics, Telemetry as Model};
 use ringbuffer::{AllocRingBuffer, RingBuffer};
-use serde::{Deserialize, Serialize};
 
 pub const WINDOW: Duration = Duration::from_secs(10);
 pub const BUFFER_SIZE: usize = 1024;
@@ -15,24 +15,6 @@ pub struct Access {
 pub struct KeyTracker {
     bins: AllocRingBuffer<Access>,
     start: Instant,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct AccessStatistics {
-    pub reads_per_second: f64,
-    pub writes_per_second: f64,
-    pub average_write_position: Option<i64>,
-    // Upper middle key for an even number of writes; always an observed key.
-    pub median_write_position: Option<i64>,
-    pub window_seconds: f64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Model {
-    pub table_id: i64,
-    pub partition_key: i64,
-    #[serde(flatten)]
-    pub statistics: AccessStatistics,
 }
 
 impl KeyTracker {
@@ -108,6 +90,10 @@ impl KeyTracker {
                 Some((sum / write_count as i128) as i64)
             },
             median_write_position,
+            contributing_nodes: 1,
+            read_count,
+            write_count: write_count as u64,
+            write_position_sum: sum,
             window_seconds,
         }
     }
@@ -123,6 +109,8 @@ mod tests {
         let empty = tracker.stats();
         assert_eq!(empty.reads_per_second, 0.0);
         assert_eq!(empty.writes_per_second, 0.0);
+        assert_eq!(empty.read_count, 0);
+        assert_eq!(empty.contributing_nodes, 1);
         assert_eq!(empty.average_write_position, None);
         assert_eq!(empty.median_write_position, None);
 
@@ -138,6 +126,7 @@ mod tests {
         let stats = tracker.stats();
         assert_eq!(tracker.bins.len(), 1);
         assert_eq!(stats.reads_per_second, 0.1);
+        assert_eq!(stats.read_count, 1);
         assert_eq!(stats.writes_per_second, 0.0);
         assert_eq!(stats.average_write_position, None);
         assert_eq!(stats.median_write_position, None);

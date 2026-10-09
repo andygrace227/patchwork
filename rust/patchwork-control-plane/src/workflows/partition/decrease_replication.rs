@@ -5,7 +5,7 @@ use kameo::actor::ActorRef;
 use sea_orm::ActiveValue::Set;
 
 use crate::{
-    client::Client,
+    dataplane_client::Client,
     db::{
         NodeActor, PartitionActor,
         actor::Get,

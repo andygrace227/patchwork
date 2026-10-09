@@ -1,10 +1,95 @@
 use kameo::actor::Spawn;
 use patchwork_control_plane::db::{
     NodeActor, PartitionActor, TableActor,
-    actor::{Create, Delete, Get, Update},
+    actor::{Create, Delete, Get, GetCached, Update},
     node, partition, table,
 };
 use sea_orm::{ActiveValue::Set, ConnectOptions, ConnectionTrait, Database, Schema};
+
+#[tokio::test]
+async fn node_cache_reuses_reads_expires_and_invalidates_on_writes() {
+    use std::time::Duration;
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    db.execute(&Schema::new(db.get_database_backend()).create_table_from_entity(node::Entity))
+        .await
+        .unwrap();
+    let nodes = NodeActor::spawn(NodeActor::new(db.clone()));
+    let mut row = nodes
+        .ask(Create::<node::Entity> {
+            data: node::ActiveModel {
+                url: Set("http://original".into()),
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        nodes.ask(Get { id: row.node_id }).await.unwrap(),
+        Some(row.clone())
+    );
+    db.execute_unprepared("UPDATE node SET url = 'http://external'")
+        .await
+        .unwrap();
+    // An external change is hidden until TTL expiry; both read messages share the cache.
+    assert_eq!(
+        nodes.ask(GetCached { id: row.node_id }).await.unwrap(),
+        Some(row.clone())
+    );
+
+    let expiring = NodeActor::spawn(NodeActor::with_cache_ttl(db.clone(), Duration::ZERO));
+    assert_eq!(
+        expiring
+            .ask(Get { id: row.node_id })
+            .await
+            .unwrap()
+            .unwrap()
+            .url,
+        "http://external"
+    );
+    db.execute_unprepared("UPDATE node SET url = 'http://external-again'")
+        .await
+        .unwrap();
+    assert_eq!(
+        expiring
+            .ask(GetCached { id: row.node_id })
+            .await
+            .unwrap()
+            .unwrap()
+            .url,
+        "http://external-again"
+    );
+
+    row.url = "http://actor-update".into();
+    nodes
+        .ask(Update::<node::Entity> { data: row.clone() })
+        .await
+        .unwrap();
+    assert_eq!(
+        nodes.ask(Get { id: row.node_id }).await.unwrap(),
+        Some(row.clone())
+    );
+    nodes.ask(Delete { id: row.node_id }).await.unwrap();
+    assert_eq!(
+        nodes.ask(GetCached { id: row.node_id }).await.unwrap(),
+        None
+    );
+    // Missing nodes aren't cached, so registering that ID is immediately visible.
+    nodes
+        .ask(Create::<node::Entity> {
+            data: node::ActiveModel {
+                node_id: Set(row.node_id),
+                url: Set(row.url.clone()),
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(nodes.ask(Get { id: row.node_id }).await.unwrap(), Some(row));
+    for actor in [nodes, expiring] {
+        actor.stop_gracefully().await.unwrap();
+        actor.wait_for_shutdown().await;
+    }
+    db.close().await.unwrap();
+}
 
 #[tokio::test]
 async fn all_models_support_crud_and_overlapping_requests() {

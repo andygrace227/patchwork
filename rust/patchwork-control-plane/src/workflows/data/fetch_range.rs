@@ -1,10 +1,10 @@
 use anyhow::{Context, Result, ensure};
 use kameo::actor::ActorRef;
-use patchwork_common::client::Record;
+use patchwork_common::dataplane_client::Record;
 use rand::seq::IndexedRandom;
 
 use crate::{
-    client::Client,
+    dataplane_client::Client,
     db::{NodeActor, PartitionActor, TableActor, actor::Get, partition::GetTablePartitions},
 };
 

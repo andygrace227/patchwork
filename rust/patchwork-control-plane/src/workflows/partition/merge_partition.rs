@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use kameo::actor::ActorRef;
 
 use crate::{
-    client::Client,
+    dataplane_client::Client,
     db::{
         NodeActor, PartitionActor,
         actor::Get,

@@ -1,6 +1,6 @@
 use super::copy_range::copy_range;
 use crate::workflows::data::fetch_range::FetchRangeCtx;
-use crate::{client, db::actor::Get};
+use crate::{dataplane_client, db::actor::Get};
 use crate::{
     db::{
         NodeActor, PartitionActor, TableActor,
@@ -234,7 +234,7 @@ impl SplitPartition {
                     .ask(Get { id: *replica })
                     .await?
                     .context("Old replica node no longer exists")?;
-                client::Client::delete_range(
+                dataplane_client::Client::delete_range(
                     &node.url,
                     ctx.table_id,
                     end_hash_range,

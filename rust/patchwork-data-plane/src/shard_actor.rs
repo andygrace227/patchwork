@@ -5,7 +5,10 @@ use sea_orm::{
     QueryFilter, QueryOrder, Schema,
 };
 
-use std::{collections::BTreeMap, time::Instant};
+use std::{
+    collections::{BTreeMap, HashMap},
+    time::Instant,
+};
 
 use crate::{
     data,
@@ -108,6 +111,29 @@ impl ShardActor {
                 table_id,
                 partition_key,
                 statistics: tracker.stats(),
+            })
+            .collect()
+    }
+
+    /// Recent accesses for one table, keyed by partition key.
+    #[message]
+    pub async fn get_telemetry_for_table(
+        &mut self,
+        table_id: i64,
+    ) -> HashMap<i64, telemetry::Model> {
+        self.telemetry.retain(|_, tracker| !tracker.is_idle());
+        self.telemetry
+            .iter()
+            .filter(|((table, _), _)| *table == table_id)
+            .map(|(&(_, partition_key), tracker)| {
+                (
+                    partition_key,
+                    telemetry::Model {
+                        table_id,
+                        partition_key,
+                        statistics: tracker.stats(),
+                    },
+                )
             })
             .collect()
     }

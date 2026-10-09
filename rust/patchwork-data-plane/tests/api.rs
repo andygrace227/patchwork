@@ -102,6 +102,7 @@ async fn telemetry_tracks_local_accesses_and_clears_with_data() {
     assert_eq!(stats.as_array().unwrap().len(), 3);
     assert_eq!(stats[0]["table_id"], 1);
     assert_eq!(stats[0]["partition_key"], 10);
+    assert_eq!(stats[0]["contributing_nodes"], 1);
     assert_eq!(stats[0]["average_write_position"], 340);
     assert_eq!(stats[0]["median_write_position"], 10);
     assert!(
@@ -113,6 +114,19 @@ async fn telemetry_tracks_local_accesses_and_clears_with_data() {
     );
     assert!(stats[1]["reads_per_second"].as_f64().unwrap() > 0.0);
     assert_eq!(stats[2]["median_write_position"], 30);
+    let (status, table_stats) = request(&app, "GET", "/tables/1/telemetry", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(table_stats.as_object().unwrap().len(), 2);
+    assert_eq!(table_stats["10"]["table_id"], 1);
+    assert_eq!(table_stats["10"]["partition_key"], 10);
+    assert_eq!(table_stats["10"]["contributing_nodes"], 1);
+    assert_eq!(table_stats["10"]["average_write_position"], 340);
+    assert_eq!(table_stats["20"]["table_id"], 1);
+    assert_eq!(table_stats["20"]["partition_key"], 20);
+    assert_eq!(
+        request(&app, "GET", "/tables/99/telemetry", None).await,
+        (StatusCode::OK, json!({}))
+    );
     request(&app, "DELETE", "/tables/1/partition-keys/20", None).await;
     request(
         &app,
@@ -124,6 +138,10 @@ async fn telemetry_tracks_local_accesses_and_clears_with_data() {
     let stats = request(&app, "GET", "/shard/telemetry", None).await.1;
     assert_eq!(stats.as_array().unwrap().len(), 1);
     assert_eq!(stats[0]["table_id"], 2);
+    assert_eq!(
+        request(&app, "GET", "/tables/1/telemetry", None).await.1,
+        json!({})
+    );
     shard.stop_gracefully().await.unwrap();
     shard.wait_for_shutdown().await;
     drop(app);

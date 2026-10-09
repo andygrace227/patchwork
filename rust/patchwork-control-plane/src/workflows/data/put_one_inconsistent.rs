@@ -4,7 +4,7 @@ use rand::seq::SliceRandom;
 use serde_json::Value;
 
 use crate::{
-    client::Client,
+    dataplane_client::Client,
     db::{
         NodeActor, PartitionActor, TableActor, actor::GetCached as Get,
         partition::GetPartitionAtOrBeforeCached as GetPartitionAtOrBefore,

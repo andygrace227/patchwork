@@ -1,5 +1,5 @@
 use kameo::actor::Spawn;
-use patchwork_control_plane::client::Client;
+use patchwork_control_plane::dataplane_client::Client;
 use patchwork_data_plane::{api, shard_actor::ShardActor};
 use serde_json::json;
 
@@ -21,11 +21,36 @@ async fn client_calls_all_shard_operations() {
         .len();
     assert!(actual > 0);
     assert_eq!(size, json!({"size_bytes": actual}));
+    assert!(Client::get_telemetry(&url).await.unwrap().is_empty());
     let payload = json!({"name": "example", "nested": [1, true]});
     Client::upsert(&url, 1, 10, -42, &payload, 1).await.unwrap();
     let record = Client::get(&url, 1, 10, -42).await.unwrap();
     assert_eq!(record.data, payload);
     assert_eq!(record.timestamp, 1);
+    let telemetry = Client::get_telemetry(url.trim_end_matches('/'))
+        .await
+        .unwrap();
+    assert_eq!(telemetry.len(), 1);
+    assert_eq!(telemetry[0].table_id, 1);
+    assert_eq!(telemetry[0].partition_key, 10);
+    assert_eq!(telemetry[0].statistics.average_write_position, Some(-42));
+    assert_eq!(telemetry[0].statistics.median_write_position, Some(-42));
+    assert!(telemetry[0].statistics.reads_per_second > 0.0);
+    assert!(telemetry[0].statistics.writes_per_second > 0.0);
+    assert_eq!(telemetry[0].statistics.read_count, 1);
+    assert_eq!(telemetry[0].statistics.contributing_nodes, 1);
+    let table_telemetry = Client::get_telemetry_for_table(&url, 1).await.unwrap();
+    assert_eq!(table_telemetry.len(), 1);
+    assert_eq!(
+        table_telemetry[&10].statistics.median_write_position,
+        Some(-42)
+    );
+    assert!(
+        Client::get_telemetry_for_table(&url, 99)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     Client::upsert(&url, 1, 10, -42, &json!({"updated": true}), 2)
         .await
         .unwrap();
@@ -69,6 +94,14 @@ async fn client_calls_all_shard_operations() {
     Client::upsert(&url, 8, i64::MAX, 1, &payload, 1)
         .await
         .unwrap();
+    let table_telemetry = Client::get_telemetry_for_table(url.trim_end_matches('/'), 7)
+        .await
+        .unwrap();
+    assert_eq!(table_telemetry.len(), 3);
+    for key in [i64::MIN, 0, i64::MAX] {
+        assert_eq!(table_telemetry[&key].table_id, 7);
+        assert_eq!(table_telemetry[&key].partition_key, key);
+    }
     assert_eq!(
         Client::delete_table(&url, 7).await.unwrap(),
         json!({"deleted": 3})

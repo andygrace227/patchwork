@@ -1,4 +1,4 @@
-pub use patchwork_common::{client, db};
+pub use patchwork_common::{dataplane_client, db};
 
 pub mod api;
 pub mod data;

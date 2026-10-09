@@ -40,7 +40,7 @@ fn check_lease(lease_end: i64) -> Result<()> {
 mod tests {
     use super::*;
     use crate::{
-        client::Client,
+        dataplane_client::Client,
         db::{actor::Create, node},
     };
     use kameo::actor::Spawn;

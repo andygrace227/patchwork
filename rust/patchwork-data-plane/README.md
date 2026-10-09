@@ -38,6 +38,8 @@ caller's responsibility; timestamps do not prove real-world event order.
 The shared client requires a timestamp argument:
 
 ```rust,ignore
+use patchwork_common::dataplane_client::Client;
+
 Client::upsert(url, table_id, partition_key, secondary_key, &data, timestamp).await?;
 Client::put_with_replicas(url, table_id, partition_key, secondary_key, &data, &replicas, timestamp).await?;
 Client::put_with_replicas_inconsistent(url, table_id, partition_key, secondary_key, &data, &replicas, timestamp).await?;
@@ -94,6 +96,20 @@ with `reads_per_second`, `writes_per_second`, `average_write_position`,
 `median_write_position`, and `window_seconds`. Positions refer to secondary keys;
 the median uses the upper middle observed key when the write count is even.
 Positions are null when the window has no writes.
+`contributing_nodes` is 1 for local statistics and is added during merges. Divide
+summed rates by this count to get the average per reporting node. Merge each node
+once per partition key; idle nodes without telemetry are not counted.
+`read_count` counts sampled reads. `write_count` and `write_position_sum` carry the sampled write count and exact key
+sum (a decimal string in JSON, `i128` in Rust). `AccessStatistics::merge(&other)` adds rates and combines these totals to
+calculate the average. Combining two nonempty write samples clears the median,
+since individual medians cannot determine the combined median. The merged
+`window_seconds` is the shortest contributing window; rates remain sums of the
+individual nodes' rates, measured over their own windows.
+`Client::get_telemetry(url)` returns these entries as `Vec<Telemetry>` from
+`patchwork_common::dataplane_client`.
+GET `/tables/{table_id}/telemetry` returns only that table's entries as an object
+keyed by partition key. `Client::get_telemetry_for_table(url, table_id)` returns
+`HashMap<i64, Telemetry>`; no recent accesses returns an empty map.
 
 Telemetry lives in the shard actor's memory and resets on restart. Each tracker
 retains at most 1024 accesses from the last ten seconds. During startup or buffer

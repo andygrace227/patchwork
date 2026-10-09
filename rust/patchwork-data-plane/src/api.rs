@@ -2,7 +2,8 @@ use crate::{
     data,
     shard_actor::{
         CountRange, Delete, DeletePartitionKey, DeleteRange, DeleteTable, Get, GetPartitionKey,
-        GetRange, GetRangeSize, GetSize, GetTelemetry, ShardActor, WriteRecord,
+        GetRange, GetRangeSize, GetSize, GetTelemetry, GetTelemetryForTable, ShardActor,
+        WriteRecord,
     },
     subordinate_shard_writer::{Put, SubordinateShardWriter},
     telemetry,
@@ -15,6 +16,7 @@ use axum::{
 };
 use kameo::actor::{ActorRef, Spawn};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Inject the same actor into every handler.
 pub fn router(shard: ActorRef<ShardActor>) -> Router {
@@ -28,6 +30,7 @@ pub fn router_with_writer(
     Router::new()
         .route("/shard/size", get(get_size))
         .route("/shard/telemetry", get(get_telemetry))
+        .route("/tables/{table_id}/telemetry", get(get_telemetry_for_table))
         .route(
             "/tables/{table_id}/partition-keys/{partition_key}/records/{secondary_key}/with-replicas-inconsistent",
             axum::routing::put(put_with_replicas_inconsistent),
@@ -186,7 +189,7 @@ async fn put_with_replicas_inconsistent(
         })
         .await
         .map_err(internal_error)?;
-    crate::client::Client::write_record(
+    crate::dataplane_client::Client::write_record(
         first,
         table_id,
         partition_key,
@@ -363,6 +366,18 @@ async fn get_telemetry(
 ) -> Result<Json<Vec<telemetry::Model>>, ApiError> {
     Ok(Json(
         shard.ask(GetTelemetry {}).await.map_err(internal_error)?,
+    ))
+}
+
+async fn get_telemetry_for_table(
+    State(shard): State<ActorRef<ShardActor>>,
+    Path(table_id): Path<i64>,
+) -> Result<Json<HashMap<i64, telemetry::Model>>, ApiError> {
+    Ok(Json(
+        shard
+            .ask(GetTelemetryForTable { table_id })
+            .await
+            .map_err(internal_error)?,
     ))
 }
 
