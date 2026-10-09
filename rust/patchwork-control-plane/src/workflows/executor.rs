@@ -13,6 +13,9 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    future::Future,
+    pin::Pin,
+    sync::Arc,
     time::Duration,
 };
 
@@ -25,116 +28,20 @@ use kameo::{
 };
 use tokio::task::JoinHandle;
 
-use super::{
-    partition::{
-        decrease_replication::{DecreaseReplication, DecreaseReplicationContext},
-        increase_replication::{IncreaseReplication, IncreaseReplicationContext},
-        merge_partition::{MergePartition, MergePartitionContext},
-        split_partition::{SplitPartition, SplitPartitionContext},
-    },
-    table::{
-        check_table_scale::{CheckTableScale, CheckTableScaleContext},
-        delete_table::{DeleteTable, DeleteTableContext},
-        make_table::{MakeTable, MakeTableContext},
-    },
+use super::job::JobCompletion;
+pub use super::{
+    Workflow,
+    job::{JobHandle, JobStatus},
 };
 use crate::{
     db::{NodeActor, PartitionActor, TableActor},
     scale,
 };
 
-pub enum Workflow {
-    MakeTable(MakeTableContext),
-    DeleteTable(DeleteTableContext),
-    CheckTableScale(CheckTableScaleContext),
-    SplitPartition(SplitPartitionContext),
-    MergePartition(MergePartitionContext),
-    IncreaseReplication(IncreaseReplicationContext),
-    DecreaseReplication(DecreaseReplicationContext),
-}
-
-impl Workflow {
-    fn table_id(&self) -> Option<i64> {
-        match self {
-            Self::MakeTable(_) => None,
-            Self::DeleteTable(ctx) => Some(ctx.table_id),
-            Self::CheckTableScale(ctx) => Some(ctx.table_id),
-            Self::SplitPartition(ctx) => Some(ctx.table_id),
-            Self::MergePartition(ctx) => Some(ctx.table_id),
-            Self::IncreaseReplication(ctx) => Some(ctx.table_id),
-            Self::DecreaseReplication(ctx) => Some(ctx.table_id),
-        }
-    }
-
-    fn key(&self) -> String {
-        match self {
-            Self::MakeTable(ctx) => format!("make_table:{}:{}", ctx.table_owner, ctx.table_name),
-            Self::DeleteTable(ctx) => format!("delete_table:{}", ctx.table_id),
-            Self::CheckTableScale(ctx) => format!("check_table_scale:{}", ctx.table_id),
-            Self::SplitPartition(ctx) => format!("split:{}:{}", ctx.table_id, ctx.new_partition),
-            Self::MergePartition(ctx) => format!("merge:{}:{}", ctx.table_id, ctx.hash_start),
-            Self::IncreaseReplication(ctx) => format!(
-                "increase:{}:{}:{}",
-                ctx.table_id, ctx.hash_start, ctx.replication_factor
-            ),
-            Self::DecreaseReplication(ctx) => format!(
-                "decrease:{}:{}:{}",
-                ctx.table_id, ctx.hash_start, ctx.replication_factor
-            ),
-        }
-    }
-
-    async fn run(
-        self,
-        node: ActorRef<NodeActor>,
-        partition: ActorRef<PartitionActor>,
-        table: ActorRef<TableActor>,
-    ) -> Result<()> {
-        match self {
-            Self::MakeTable(ctx) => MakeTable {
-                node,
-                partition,
-                table,
-            }
-            .run(ctx)
-            .await
-            .map(|_| ()),
-            Self::DeleteTable(ctx) => {
-                DeleteTable {
-                    node,
-                    partition,
-                    table,
-                }
-                .run(ctx)
-                .await
-            }
-            Self::CheckTableScale(ctx) => {
-                CheckTableScale {
-                    node,
-                    partition,
-                    table,
-                }
-                .run(ctx)
-                .await
-            }
-            Self::SplitPartition(ctx) => {
-                SplitPartition {
-                    node,
-                    partition,
-                    table,
-                }
-                .run(ctx)
-                .await
-            }
-            Self::MergePartition(ctx) => MergePartition { node, partition }.run(ctx).await,
-            Self::IncreaseReplication(ctx) => {
-                IncreaseReplication { node, partition }.run(ctx).await
-            }
-            Self::DecreaseReplication(ctx) => {
-                DecreaseReplication { node, partition }.run(ctx).await
-            }
-        }
-    }
+struct QueuedJob {
+    key: String,
+    table_id: Option<i64>,
+    run: Pin<Box<dyn Future<Output = Result<(), Arc<anyhow::Error>>> + Send>>,
 }
 
 #[derive(Clone, Copy)]
@@ -161,7 +68,7 @@ pub struct LongRunningWorkflowExecutor {
     partition: ActorRef<PartitionActor>,
     table: ActorRef<TableActor>,
     config: ExecutorConfig,
-    queued: VecDeque<Workflow>,
+    queued: VecDeque<QueuedJob>,
     running: HashMap<String, Option<i64>>,
     completed: u64,
     failed: u64,
@@ -219,24 +126,16 @@ impl LongRunningWorkflowExecutor {
     fn start_ready_jobs<R: kameo::reply::Reply>(&mut self, ctx: &Context<Self, R>) {
         while self.running.len() < self.config.max_running {
             let Some(index) = self.queued.iter().position(|job| {
-                job.table_id()
+                job.table_id
                     .is_none_or(|table_id| !self.running.values().any(|id| *id == Some(table_id)))
             }) else {
                 break;
             };
             let job = self.queued.remove(index).expect("queued job exists");
-            let key = job.key();
-            self.running.insert(key.clone(), job.table_id());
-            let node = self.node.clone();
-            let partition = self.partition.clone();
-            let table = self.table.clone();
-            // Await the task through pipe so failures and panics both release the slot.
-            let task = tokio::spawn(job.run(node, partition, table));
+            let key = job.key;
+            self.running.insert(key.clone(), job.table_id);
             ctx.pipe(async move {
-                let result = match task.await {
-                    Ok(result) => result,
-                    Err(error) => Err(error.into()),
-                };
+                let result = job.run.await;
                 WorkflowFinished { key, result }
             });
         }
@@ -249,6 +148,8 @@ impl Actor for LongRunningWorkflowExecutor {
 
     async fn on_start(mut state: Self, actor_ref: ActorRef<Self>) -> Result<Self, Infallible> {
         state.scale_checks = Some(tokio::spawn(scale::run_random_scale_checks(
+            state.node.clone(),
+            state.partition.clone(),
             state.table.clone(),
             actor_ref.downgrade(),
             state.config.min_check_interval,
@@ -270,40 +171,60 @@ impl Actor for LongRunningWorkflowExecutor {
     }
 }
 
-pub struct SubmitWorkflow {
-    pub workflow: Workflow,
+pub struct SubmitWorkflow<W: Workflow> {
+    pub workflow: W,
+    pub context: W::Context,
 }
 
-impl Message<SubmitWorkflow> for LongRunningWorkflowExecutor {
-    /// True means accepted; false means this job is already queued or running.
-    type Reply = Result<bool>;
+impl<W: Workflow> SubmitWorkflow<W> {
+    pub fn new(workflow: W, context: W::Context) -> Self {
+        Self { workflow, context }
+    }
+}
+
+impl<W: Workflow> Message<SubmitWorkflow<W>> for LongRunningWorkflowExecutor {
+    /// Accepted jobs return a handle; duplicates return None.
+    type Reply = Result<Option<JobHandle<W::Output>>>;
 
     async fn handle(
         &mut self,
-        msg: SubmitWorkflow,
+        msg: SubmitWorkflow<W>,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let key = msg.workflow.key();
-        if self.running.contains_key(&key) || self.queued.iter().any(|job| job.key() == key) {
-            return Ok(false);
+        let key = msg.workflow.key(&msg.context);
+        let table_id = msg.workflow.table_id(&msg.context);
+        if self.running.contains_key(&key) || self.queued.iter().any(|job| job.key == key) {
+            return Ok(None);
         }
         let can_start = self.running.len() < self.config.max_running
-            && msg.workflow.table_id().is_none_or(|table_id| {
-                !self.running.values().any(|id| *id == Some(table_id))
-            });
+            && table_id.is_none_or(|id| !self.running.values().any(|running| *running == Some(id)));
         ensure!(
             self.queued.len() < self.config.max_queued || can_start,
             "The workflow queue is full"
         );
-        self.queued.push_back(msg.workflow);
+        let (handle, completion) = JobCompletion::new();
+        self.queued.push_back(QueuedJob {
+            key,
+            table_id,
+            run: Box::pin(async move {
+                completion.running();
+                // Also catch a panic outside Cano's steps, so the queue slot is released.
+                let result =
+                    match tokio::spawn(async move { msg.workflow.run(msg.context).await }).await {
+                        Ok(result) => result,
+                        Err(error) => Err(error.into()),
+                    };
+                completion.finish(result)
+            }),
+        });
         self.start_ready_jobs(ctx);
-        Ok(true)
+        Ok(Some(handle))
     }
 }
 
 struct WorkflowFinished {
     key: String,
-    result: Result<()>,
+    result: Result<(), Arc<anyhow::Error>>,
 }
 
 impl Message<WorkflowFinished> for LongRunningWorkflowExecutor {

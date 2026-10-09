@@ -225,6 +225,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
+name = "cano"
+version = "0.15.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "575fbe1191e227ab06ee622a29fd0c0197a6049ba30fdd65199655d0b426dc99"
+dependencies = [
+ "cano-macros",
+ "futures-util",
+ "parking_lot",
+ "rand 0.10.2",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "cano-macros"
+version = "0.15.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43d6d5e78b9067616caf505cd931fefc6238827e972879ecf8b5426285720b67"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "cc"
 version = "1.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1298,6 +1324,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "cano",
  "kameo",
  "patchwork-common",
  "patchwork-data-plane",

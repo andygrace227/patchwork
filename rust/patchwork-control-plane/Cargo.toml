@@ -12,7 +12,8 @@ serde_json = "1"
 anyhow = "1.0.104"
 rand = "0.9"
 patchwork-common = { workspace = true }
-tokio = { version = "1", features = ["rt", "time"] }
+tokio = { version = "1", features = ["rt", "time", "sync"] }
+cano = "=0.15.2"
 
 [dev-dependencies]
 axum = "0.8"

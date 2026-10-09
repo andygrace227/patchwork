@@ -11,11 +11,11 @@ use patchwork_control_plane::{
     },
     workflows::{
         executor::{
-            ExecutorConfig, GetExecutorStatus, LongRunningWorkflowExecutor, SubmitWorkflow,
-            Workflow,
+            ExecutorConfig, GetExecutorStatus, JobStatus, LongRunningWorkflowExecutor,
+            SubmitWorkflow,
         },
-        partition::split_partition::SplitPartitionContext,
-        table::check_table_scale::CheckTableScaleContext,
+        partition::split_partition::{SplitPartition, SplitPartitionContext},
+        table::check_table_scale::{CheckTableScale, CheckTableScaleContext},
     },
 };
 use sea_orm::{ActiveValue::Set, ConnectionTrait, Database, Schema};
@@ -43,10 +43,22 @@ async fn actors() -> (
     )
 }
 
-fn check(table_id: i64) -> SubmitWorkflow {
-    SubmitWorkflow {
-        workflow: Workflow::CheckTableScale(CheckTableScaleContext { table_id }),
-    }
+fn check(
+    table_id: i64,
+    node: &ActorRef<NodeActor>,
+    partition: &ActorRef<PartitionActor>,
+    table: &ActorRef<TableActor>,
+    executor: &ActorRef<LongRunningWorkflowExecutor>,
+) -> SubmitWorkflow<CheckTableScale> {
+    SubmitWorkflow::new(
+        CheckTableScale {
+            node: node.clone(),
+            partition: partition.clone(),
+            table: table.clone(),
+            orchestrator: executor.clone(),
+        },
+        CheckTableScaleContext { table_id },
+    )
 }
 
 #[tokio::test]
@@ -107,37 +119,65 @@ async fn executor_limits_jobs_keeps_tables_separate_and_recovers_after_failure()
         .unwrap(),
     );
 
-    assert!(executor.ask(check(1)).await.unwrap());
+    let check_job = executor
+        .ask(check(1, &node, &partition, &table, &executor))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(2), requests.recv())
             .await
             .unwrap(),
         Some(1)
     );
-    assert!(!executor.ask(check(1)).await.unwrap());
+    assert_eq!(check_job.status(), JobStatus::Running);
+    assert!(!check_job.is_finished());
     assert!(
         executor
-            .ask(SubmitWorkflow {
-                // Existing boundary fails before acquiring any MySQL locks.
-                workflow: Workflow::SplitPartition(SplitPartitionContext {
-                    table_id: 1,
-                    new_partition: 0
-                }),
-            })
+            .ask(check(1, &node, &partition, &table, &executor))
             .await
             .unwrap()
+            .is_none()
     );
+    let split_job = executor
+        .ask(SubmitWorkflow::new(
+            // Existing boundary fails before acquiring any MySQL locks.
+            SplitPartition {
+                node: node.clone(),
+                partition: partition.clone(),
+                table: table.clone(),
+            },
+            SplitPartitionContext {
+                table_id: 1,
+                new_partition: 0,
+            },
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(split_job.status(), JobStatus::Queued);
     let status = executor.ask(GetExecutorStatus).await.unwrap();
     assert_eq!((status.running, status.queued), (1, 1));
     // A full pending queue must not block a job that can run immediately.
-    assert!(executor.ask(check(2)).await.unwrap());
+    assert!(
+        executor
+            .ask(check(2, &node, &partition, &table, &executor))
+            .await
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(2), requests.recv())
             .await
             .unwrap(),
         Some(2)
     );
-    assert!(executor.ask(check(3)).await.is_err());
+    assert!(
+        executor
+            .ask(check(3, &node, &partition, &table, &executor))
+            .await
+            .is_err()
+    );
     gates[0].add_permits(1);
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -157,7 +197,25 @@ async fn executor_limits_jobs_keeps_tables_separate_and_recovers_after_failure()
     })
     .await
     .unwrap();
-    assert!(executor.ask(check(1)).await.unwrap());
+    check_job.result().await.unwrap();
+    assert!(check_job.is_finished());
+    assert!(!check_job.is_error());
+    let result = check_job.result().await.unwrap();
+    assert!(Arc::ptr_eq(
+        &result,
+        &check_job.clone().result().await.unwrap()
+    ));
+    assert!(split_job.is_finished());
+    assert!(split_job.is_error());
+    let error = split_job.result().await.unwrap_err();
+    assert!(format!("{error:#}").contains("Prepare"));
+    assert!(
+        executor
+            .ask(check(1, &node, &partition, &table, &executor))
+            .await
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(2), requests.recv())
             .await
