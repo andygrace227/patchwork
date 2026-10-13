@@ -65,7 +65,7 @@
           <label>Control nodes<select id="load-node"><option value="all">All control nodes · round robin</option></select></label>
           <label>Target requests / second<input id="load-tps" type="number" min="1" max="100000" value="100" required></label>
           <label>Duration (seconds)<input id="load-duration" type="number" min="1" max="3600" value="30" required></label>
-          <label>Concurrent requests<input id="load-workers" type="number" min="1" max="128" value="8" required></label>
+          <label>Concurrent requests<input id="load-workers" type="number" min="1" max="1024" value="64" required></label>
           <label>Reads (%) · 0 means all writes<input id="load-reads" type="number" min="0" max="100" value="0" required></label>
           <label>Unique records<input id="load-records" type="number" min="1" max="100000" value="1000" required></label>
           <label>Payload padding (bytes)<input id="load-payload" type="number" min="0" max="1048576" value="256" required></label>
@@ -76,7 +76,7 @@
           <label class="check"><input id="load-telemetry" type="checkbox"> Measure fetch / put timings</label>
           <label class="check"><input id="load-seed" type="checkbox" checked> Seed records before read or mixed tests</label>
         </fieldset>
-        <p class="hint">TPS counts HTTP requests to control nodes. Seeding runs before the timed load. Generated records remain in the table.</p>
+        <p class="hint">Rust worker · pooled HTTP connections. TPS counts requests to control nodes. Seeding runs before the timed load. Generated records remain in the table.</p>
         <div class="load-buttons"><button id="load-start" class="primary" type="submit">Start load</button><button id="load-stop" class="secondary" type="button" disabled>Stop load</button><a class="hint" href="/api/load" download="patchwork-load.json">Download results</a></div>
       </form>
       <div class="load-metrics" aria-live="polite">

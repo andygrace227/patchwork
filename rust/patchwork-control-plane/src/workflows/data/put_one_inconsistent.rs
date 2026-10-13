@@ -84,7 +84,7 @@ impl PutOneInconsistent {
             "Inconsistent writes require at least two nodes"
         );
         time(
-            "replica_http",
+            "replica_grpc",
             Client::put_with_replicas_inconsistent(
                 url,
                 ctx.table_id,

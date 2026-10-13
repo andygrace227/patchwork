@@ -15,6 +15,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit, urlunsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -160,7 +161,7 @@ class Cluster:
             self.wait_ready(lambda: request(url + "/shard/size"), url)
         for i, url in enumerate(self.control_urls):
             self.start_process(f"control-{i + 1}", [str(TARGET / "patchwork-control-plane")], {
-                "BIND_ADDR": url.removeprefix("http://"), "DATABASE_URL": self.database_url,
+                "BIND_ADDR": ("0.0.0.0:" + urlsplit(url).netloc.rsplit(":", 1)[1]) if self.args.lan_host else url.removeprefix("http://"), "DATABASE_URL": self.database_url,
             })
         for url in self.control_urls:
             self.wait_ready(lambda: request(url + "/", expected=404), url)
@@ -168,6 +169,7 @@ class Cluster:
             "control_urls": self.control_urls, "data_urls": self.data_urls,
             "database_url": self.database_url,
             "dashboard_url": None if self.args.no_web else f"http://127.0.0.1:{self.args.web_port}",
+            "lan_host": self.args.lan_host,
             "processes": {name: process.pid for name, process in self.processes},
         }
         (self.directory / "cluster.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -252,6 +254,46 @@ class Cluster:
         print(f"Cluster stopped. Logs and databases kept in {self.directory}", flush=True)
 
 
+class RemoteCluster:
+    """Attach a load dashboard to an existing rig without starting MySQL or nodes."""
+    def __init__(self, args):
+        self.args = args
+        self.remote_dashboard = args.remote.rstrip("/")
+        self.directory = Path(tempfile.mkdtemp(prefix="patchwork-load-"))
+        nodes = self.metadata()["nodes"]
+        self.control_urls = [node["url"] for node in nodes if node["kind"] == "control"]
+        self.data_urls = [node["url"] for node in nodes if node["kind"] == "data"]
+        if not self.control_urls:
+            raise RuntimeError("Remote dashboard returned no control nodes")
+        for url in self.control_urls:
+            try:
+                request(url + "/", expected=404)
+            except (OSError, RuntimeError) as error:
+                raise RuntimeError("Cannot reach remote control nodes. Start the server rig with --lan-host SERVER_IP.") from error
+        print(f"Remote cluster: {self.remote_dashboard}\nLoad runs on THIS PC. Reports: {self.directory}", flush=True)
+
+    def metadata(self):
+        result = request(self.remote_dashboard + "/api/cluster")
+        server = urlsplit(self.remote_dashboard).hostname
+        for node in result["nodes"]:
+            parts = urlsplit(node["url"])
+            if parts.hostname in ("127.0.0.1", "localhost", "::1"):
+                host = f"[{server}]" if ":" in server else server
+                node["url"] = urlunsplit(parts._replace(netloc=f"{host}:{parts.port}"))
+        return result
+
+    def start(self):
+        if not self.args.no_build:
+            subprocess.run(["cargo", "build", "--release", "--manifest-path", str(ROOT / "rust" / "Cargo.toml"),
+                            "--target-dir", str(TARGET.parent), "-p", "patchwork-control-plane", "--bin", "patchwork-load"], cwd=ROOT, check=True)
+
+    def check_processes(self):
+        pass
+
+    def stop(self):
+        print(f"Load dashboard stopped. Remote cluster left running. Reports: {self.directory}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--control-nodes", type=int, default=2)
@@ -260,11 +302,22 @@ def main():
     parser.add_argument("--data-port", type=int, default=3200, help="first data node port")
     parser.add_argument("--mysql-port", type=int, default=13306)
     parser.add_argument("--web-port", type=int, default=3300, help="local Flask dashboard port")
+    parser.add_argument("--lan-host", help="this server's LAN IP or hostname; trust it and expose control HTTP ports")
+    parser.add_argument("--trusted-host", action="append", default=[], help="additional dashboard hostname/IP to trust; repeat as needed")
+    parser.add_argument("--remote", help="run load on this PC against an existing dashboard, e.g. http://192.168.1.50:3300")
     parser.add_argument("--no-web", action="store_true", help="run without the Flask dashboard")
     parser.add_argument("--open-browser", action="store_true", help="open the dashboard after startup")
     parser.add_argument("--no-build", action="store_true", help="reuse the last optimized release build")
     parser.add_argument("--smoke-test", action="store_true", help="test the cluster, then stop and exit")
     args = parser.parse_args()
+    if args.lan_host and (urlsplit("http://" + args.lan_host).hostname != args.lan_host or any(c in args.lan_host for c in "/:@ ")):
+        parser.error("--lan-host must be an IPv4 address or hostname, without a port or scheme")
+    if args.remote:
+        remote = urlsplit(args.remote)
+        if remote.scheme not in ("http", "https") or not remote.hostname or remote.username or remote.query or remote.fragment or remote.path not in ("", "/"):
+            parser.error("--remote must be the dashboard's HTTP(S) origin, without credentials or a path")
+        if args.no_web or args.smoke_test:
+            parser.error("--remote uses the dashboard and cannot be combined with --no-web or --smoke-test")
     if args.control_nodes < 1 or args.data_nodes < 1:
         parser.error("at least one control and one data node are required")
     if args.smoke_test and args.data_nodes < 3:
@@ -284,7 +337,7 @@ def main():
                 from werkzeug.serving import make_server
             except ImportError as error:
                 raise RuntimeError("Install the dashboard dependency: python3 -m pip install -r scripts/requirements.txt (or use --no-web)") from error
-        cluster = Cluster(args)
+        cluster = RemoteCluster(args) if args.remote else Cluster(args)
         cluster.start()
         if not args.no_web:
             web_app = create_app(cluster, request)
@@ -292,6 +345,8 @@ def main():
             threading.Thread(target=server.serve_forever, daemon=True).start()
             web_url = f"http://127.0.0.1:{args.web_port}"
             print(f"Dashboard: {web_url}", flush=True)
+            if args.lan_host:
+                print(f"LAN dashboard: http://{args.lan_host}:{args.web_port}", flush=True)
             if args.open_browser:
                 import webbrowser
                 webbrowser.open(web_url)

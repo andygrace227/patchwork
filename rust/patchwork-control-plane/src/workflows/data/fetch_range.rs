@@ -80,7 +80,7 @@ impl FetchRange {
                 .context("Replica node no longer exists")?;
             records.extend(
                 time(
-                    "replica_http",
+                    "replica_grpc",
                     Client::get_range(&node.url, ctx.table_id, upper_bound, lower_bound),
                 )
                 .await?,

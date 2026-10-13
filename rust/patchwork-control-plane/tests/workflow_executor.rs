@@ -1,6 +1,10 @@
 use std::{sync::Arc, time::Duration};
 
-use axum::{Json, Router, extract::Path, routing::get};
+use axum::{
+    body::{Body, to_bytes},
+    extract::Request,
+    middleware::{self, Next},
+};
 use kameo::actor::{ActorRef, Spawn};
 use patchwork_control_plane::{
     db::{
@@ -18,8 +22,8 @@ use patchwork_control_plane::{
         table::check_table_scale::{CheckTableScale, CheckTableScaleContext},
     },
 };
+use prost::Message;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, Database, Schema};
-use serde_json::json;
 use tokio::sync::{Semaphore, mpsc};
 
 async fn actors() -> (
@@ -67,18 +71,39 @@ async fn executor_limits_jobs_keeps_tables_separate_and_recovers_after_failure()
     let gates = [Arc::new(Semaphore::new(0)), Arc::new(Semaphore::new(0))];
     let handler_gates = gates.clone();
     let (started, mut requests) = mpsc::unbounded_channel();
-    let app = Router::new().route(
-        "/tables/{table_id}/telemetry",
-        get(move |Path(id): Path<i64>| {
-            let gate = handler_gates[(id - 1) as usize].clone();
+    let dir = tempfile::tempdir().unwrap();
+    let shard = patchwork_data_plane::shard_actor::ShardActor::spawn(
+        patchwork_data_plane::shard_actor::ShardActor::new(
+            dir.path().join("shard.sqlite").to_str().unwrap().into(),
+        )
+        .await
+        .unwrap(),
+    );
+    let app = patchwork_data_plane::api::router(shard.clone()).layer(middleware::from_fn(
+        move |request: Request, next: Next| {
+            let handler_gates = handler_gates.clone();
             let started = started.clone();
             async move {
+                assert_eq!(
+                    request.uri().path(),
+                    "/patchwork.dataplane.DataPlane/GetTelemetryForTable"
+                );
+                let (parts, body) = request.into_parts();
+                let bytes = to_bytes(body, 1024).await.unwrap();
+                let id = patchwork_common::grpc::proto::TableRequest::decode(&bytes[5..])
+                    .unwrap()
+                    .table_id;
                 started.send(id).unwrap();
-                gate.acquire().await.unwrap().forget();
-                Json(json!({}))
+                handler_gates[(id - 1) as usize]
+                    .acquire()
+                    .await
+                    .unwrap()
+                    .forget();
+                next.run(Request::from_parts(parts, Body::from(bytes)))
+                    .await
             }
-        }),
-    );
+        },
+    ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -235,6 +260,9 @@ async fn executor_limits_jobs_keeps_tables_separate_and_recovers_after_failure()
     executor.stop_gracefully().await.unwrap();
     executor.wait_for_shutdown().await;
     server.abort();
+    let _ = server.await;
+    shard.stop_gracefully().await.unwrap();
+    shard.wait_for_shutdown().await;
     node.stop_gracefully().await.unwrap();
     partition.stop_gracefully().await.unwrap();
     table.stop_gracefully().await.unwrap();

@@ -262,7 +262,7 @@ async fn routes_invoke_record_workflows_and_report_table_job_results() {
             response.headers()["server-timing"]
                 .to_str()
                 .unwrap()
-                .contains("replica_http;dur=")
+                .contains("replica_grpc;dur=")
         );
     }
     let response = http
@@ -306,7 +306,7 @@ async fn routes_invoke_record_workflows_and_report_table_job_results() {
             "partition_lookup",
             "replica_resolution",
             "replica_lookup",
-            "replica_http",
+            "replica_grpc",
         ] {
             assert!(stats["stages"][stage]["calls"].as_u64().unwrap() > 0);
             assert!(stats["stages"][stage]["average_ms"].as_f64().unwrap() >= 0.0);

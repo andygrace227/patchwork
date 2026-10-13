@@ -1,0 +1,82 @@
+syntax = "proto3";
+package patchwork.dataplane;
+
+service DataPlane {
+  rpc WriteRecord(WriteRequest) returns (Empty);
+  rpc WriteWithReplicas(WriteRequest) returns (Empty);
+  rpc WriteWithReplicasInconsistent(WriteRequest) returns (Empty);
+  rpc GetRecord(RecordRequest) returns (Record);
+  rpc DeleteRecord(DeleteRequest) returns (Count);
+  rpc GetPartitionKey(PartitionRequest) returns (Records);
+  rpc DeletePartitionKey(PartitionRequest) returns (Count);
+  rpc GetRange(RangeRequest) returns (Records);
+  rpc DeleteRange(RangeRequest) returns (Count);
+  rpc CountRange(RangeRequest) returns (Count);
+  rpc GetRangeSize(RangeRequest) returns (Size);
+  rpc DeleteTable(TableRequest) returns (Count);
+  rpc GetSize(Empty) returns (Size);
+  rpc GetTelemetry(Empty) returns (TelemetryEntries);
+  rpc GetTelemetryForTable(TableRequest) returns (TelemetryEntries);
+}
+
+message Empty {}
+message TableRequest { int64 table_id = 1; }
+message PartitionRequest {
+  int64 table_id = 1;
+  int64 partition_key = 2;
+  bool include_deleted = 3;
+}
+message RecordRequest {
+  int64 table_id = 1;
+  int64 partition_key = 2;
+  int64 secondary_key = 3;
+  bool include_deleted = 4;
+}
+message RangeRequest {
+  int64 table_id = 1;
+  int64 lower_bound = 2;
+  int64 upper_bound = 3;
+  bool include_deleted = 4;
+}
+message WriteRequest {
+  int64 table_id = 1;
+  int64 partition_key = 2;
+  int64 secondary_key = 3;
+  bytes data_json = 4;
+  // Required even for timestamp zero; never minted by a data node.
+  optional int64 timestamp = 5;
+  bool deleted = 6;
+  repeated string replicas = 7;
+}
+message DeleteRequest {
+  int64 table_id = 1;
+  int64 partition_key = 2;
+  int64 secondary_key = 3;
+  optional int64 timestamp = 4;
+}
+message Record {
+  int64 table_id = 1;
+  int64 partition_key = 2;
+  int64 secondary_key = 3;
+  bytes data_json = 4;
+  int64 timestamp = 5;
+  bool deleted = 6;
+}
+message Records { repeated Record records = 1; }
+message Count { uint64 count = 1; }
+message Size { uint64 size_bytes = 1; }
+message TelemetryEntries { repeated Telemetry entries = 1; }
+message Telemetry {
+  int64 table_id = 1;
+  int64 partition_key = 2;
+  double reads_per_second = 3;
+  double writes_per_second = 4;
+  uint64 contributing_nodes = 5;
+  optional int64 average_write_position = 6;
+  optional int64 median_write_position = 7;
+  uint64 read_count = 8;
+  uint64 write_count = 9;
+  // Exact i128 sum, carried as decimal text.
+  string write_position_sum = 10;
+  double window_seconds = 11;
+}

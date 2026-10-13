@@ -219,6 +219,7 @@ async function updateLoad() {
     $("load-progress").max = state.phase === "seeding" ? state.config.records : state.config.duration || 1;
     $("load-progress").value = state.phase === "seeding" ? count.seeded || 0 : state.elapsed;
     $("load-detail").textContent = state.phase === "idle" ? "Choose a ready table to get started." : state.phase === "seeding" ? `Seeding ${count.seeded || 0} / ${state.config.records} records before timed load…` : `${state.elapsed}s · target ${state.config.tps} TPS · ${count.reads || 0} reads / ${count.writes || 0} writes · HTTP ${JSON.stringify(state.statuses)}`;
+    $("load-detail").textContent += ` · ${count.skipped || 0} scheduling slots skipped`;
     if (state.report) $("load-detail").textContent += ` · report: ${state.report}`;
     $("load-error").textContent = loadFormError || state.last_error;
   } catch (error) {
@@ -283,7 +284,7 @@ async function refreshTelemetry(force = false) {
           const row = $("operation-timings").insertRow();
           cell(row, node.name); cell(row, operation.replaceAll("_", " "));
           cell(row, `${stats.requests} / ${stats.errors}`);
-          for (const stage of ["total", "table_lookup", "partition_lookup", "replica_resolution", "replica_lookup", "replica_http"]) {
+          for (const stage of ["total", "table_lookup", "partition_lookup", "replica_resolution", "replica_lookup", "replica_grpc"]) {
             cell(row, stats.stages[stage] ? (stats.stages[stage].total_ms / stats.requests).toFixed(3) : "—");
           }
         }

@@ -1,12 +1,24 @@
 //! Data-plane calls. Pass the node's base URL, e.g. http://127.0.0.1:3000.
-//! Record responses are typed; HTTP errors remain errors.
+//! Uses cached gRPC channels exclusively; URLs still use http:// or https://.
 //! Write timestamps are caller-supplied Unix microseconds; preserve them on retries.
-use reqwest::{Client as HttpClient, Method};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use crate::grpc::{
+    MAX_MESSAGE_SIZE,
+    proto::{self, data_plane_client::DataPlaneClient},
+};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, sync::LazyLock, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{LazyLock, Mutex},
+    time::Duration,
+};
+use tonic::{
+    Response, Status,
+    transport::{Channel, Endpoint},
+};
 
-static HTTP: LazyLock<HttpClient> = LazyLock::new(HttpClient::new);
+static CHANNELS: LazyLock<Mutex<HashMap<String, Channel>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Matches the data plane's data::Model, including its caller-supplied write timestamp.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -100,7 +112,7 @@ impl Client {
         data: &Value,
         replicas: &[String],
         timestamp: i64,
-    ) -> Result<(), reqwest::Error> {
+    ) -> Result<(), Status> {
         Self::write_with_replicas(
             url,
             table_id,
@@ -123,18 +135,20 @@ impl Client {
         replicas: &[String],
         timestamp: i64,
         deleted: bool,
-    ) -> Result<(), reqwest::Error> {
-        HTTP.put(format!(
-            "{}/with-replicas",
-            record_url(url, table_id, partition_key, secondary_key)
-        ))
-        .timeout(Duration::from_secs(60))
-        .header("x-patchwork-timestamp", timestamp.to_string())
-        .header("x-patchwork-deleted", deleted.to_string())
-        .json(&serde_json::json!({ "data": data, "replicas": replicas }))
-        .send()
-        .await?
-        .error_for_status()?;
+    ) -> Result<(), Status> {
+        rpc(
+            grpc(url)?.write_with_replicas(write_request(
+                table_id,
+                partition_key,
+                secondary_key,
+                data,
+                timestamp,
+                deleted,
+                replicas,
+            )?),
+            60,
+        )
+        .await?;
         Ok(())
     }
 
@@ -149,7 +163,7 @@ impl Client {
         data: &Value,
         replicas: &[String],
         timestamp: i64,
-    ) -> Result<(), reqwest::Error> {
+    ) -> Result<(), Status> {
         Self::write_with_replicas_inconsistent(
             url,
             table_id,
@@ -172,58 +186,66 @@ impl Client {
         replicas: &[String],
         timestamp: i64,
         deleted: bool,
-    ) -> Result<(), reqwest::Error> {
-        HTTP.put(format!(
-            "{}/with-replicas-inconsistent",
-            record_url(url, table_id, partition_key, secondary_key)
-        ))
-        .timeout(Duration::from_secs(30))
-        .header("x-patchwork-timestamp", timestamp.to_string())
-        .header("x-patchwork-deleted", deleted.to_string())
-        .json(&serde_json::json!({ "data": data, "replicas": replicas }))
-        .send()
-        .await?
-        .error_for_status()?;
+    ) -> Result<(), Status> {
+        rpc(
+            grpc(url)?.write_with_replicas_inconsistent(write_request(
+                table_id,
+                partition_key,
+                secondary_key,
+                data,
+                timestamp,
+                deleted,
+                replicas,
+            )?),
+            30,
+        )
+        .await?;
         Ok(())
     }
 
     /// Delete all records for this table on one node; returns {"deleted": N}.
-    pub async fn delete_table(url: &str, table_id: i64) -> Result<Value, reqwest::Error> {
-        json(
-            Method::DELETE,
-            format!("{}/tables/{table_id}", url.trim_end_matches('/')),
+    pub async fn delete_table(url: &str, table_id: i64) -> Result<Value, Status> {
+        let result = rpc(
+            grpc(url)?.delete_table(proto::TableRequest { table_id }),
+            30,
         )
-        .await
+        .await?;
+        Ok(serde_json::json!({"deleted": result.count}))
     }
 
     /// Returns {"size_bytes": N} for the main SQLite file, excluding WAL and SHM.
-    pub async fn get_size(url: &str) -> Result<Value, reqwest::Error> {
-        json(
-            Method::GET,
-            format!("{}/shard/size", url.trim_end_matches('/')),
-        )
-        .await
+    pub async fn get_size(url: &str) -> Result<Value, Status> {
+        let result = rpc(grpc(url)?.get_size(proto::Empty {}), 30).await?;
+        Ok(serde_json::json!({"size_bytes": result.size_bytes}))
     }
 
     /// Recent local accesses, grouped by table and partition key.
-    pub async fn get_telemetry(url: &str) -> Result<Vec<Telemetry>, reqwest::Error> {
-        json(
-            Method::GET,
-            format!("{}/shard/telemetry", url.trim_end_matches('/')),
-        )
-        .await
+    pub async fn get_telemetry(url: &str) -> Result<Vec<Telemetry>, Status> {
+        rpc(grpc(url)?.get_telemetry(proto::Empty {}), 30)
+            .await?
+            .entries
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect()
     }
 
     /// Recent local accesses for one table, keyed by partition key.
     pub async fn get_telemetry_for_table(
         url: &str,
         table_id: i64,
-    ) -> Result<HashMap<i64, Telemetry>, reqwest::Error> {
-        json(
-            Method::GET,
-            format!("{}/tables/{table_id}/telemetry", url.trim_end_matches('/')),
+    ) -> Result<HashMap<i64, Telemetry>, Status> {
+        rpc(
+            grpc(url)?.get_telemetry_for_table(proto::TableRequest { table_id }),
+            30,
         )
-        .await
+        .await?
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let entry: Telemetry = entry.try_into()?;
+            Ok((entry.partition_key, entry))
+        })
+        .collect()
     }
 
     /// Returns {"count": N} records in [lower_bound, upper_bound).
@@ -232,11 +254,13 @@ impl Client {
         table_id: i64,
         upper_bound: i64,
         lower_bound: i64,
-    ) -> Result<Value, reqwest::Error> {
-        json(Method::GET, format!(
-            "{}/tables/{table_id}/range/count?lower_bound={lower_bound}&upper_bound={upper_bound}",
-            url.trim_end_matches('/')
-        )).await
+    ) -> Result<Value, Status> {
+        let result = rpc(
+            grpc(url)?.count_range(range_request(table_id, upper_bound, lower_bound, false)),
+            30,
+        )
+        .await?;
+        Ok(serde_json::json!({"count": result.count}))
     }
 
     /// Returns {"size_bytes": N} stored JSON payload bytes, excluding keys and SQLite overhead.
@@ -245,11 +269,13 @@ impl Client {
         table_id: i64,
         upper_bound: i64,
         lower_bound: i64,
-    ) -> Result<Value, reqwest::Error> {
-        json(Method::GET, format!(
-            "{}/tables/{table_id}/range/size?lower_bound={lower_bound}&upper_bound={upper_bound}",
-            url.trim_end_matches('/')
-        )).await
+    ) -> Result<Value, Status> {
+        let result = rpc(
+            grpc(url)?.get_range_size(range_request(table_id, upper_bound, lower_bound, false)),
+            30,
+        )
+        .await?;
+        Ok(serde_json::json!({"size_bytes": result.size_bytes}))
     }
 
     /// Preserve this timestamp when retrying or copying a previously written record.
@@ -260,7 +286,7 @@ impl Client {
         secondary_key: i64,
         data: &Value,
         timestamp: i64,
-    ) -> Result<(), reqwest::Error> {
+    ) -> Result<(), Status> {
         Self::write_record(
             url,
             table_id,
@@ -281,31 +307,42 @@ impl Client {
         data: &Value,
         timestamp: i64,
         deleted: bool,
-    ) -> Result<(), reqwest::Error> {
-        HTTP.put(record_url(url, table_id, partition_key, secondary_key))
-            .timeout(Duration::from_secs(30))
-            .header("x-patchwork-timestamp", timestamp.to_string())
-            .header("x-patchwork-deleted", deleted.to_string())
-            .json(data)
-            .send()
-            .await?
-            .error_for_status()?;
+    ) -> Result<(), Status> {
+        rpc(
+            grpc(url)?.write_record(write_request(
+                table_id,
+                partition_key,
+                secondary_key,
+                data,
+                timestamp,
+                deleted,
+                &[],
+            )?),
+            30,
+        )
+        .await?;
         Ok(())
     }
 
     /// Returns the full record, including its caller-supplied write timestamp.
-    /// A missing record returns an HTTP 404 error.
+    /// A missing record returns gRPC NotFound.
     pub async fn get(
         url: &str,
         table_id: i64,
         partition_key: i64,
         secondary_key: i64,
-    ) -> Result<Record, reqwest::Error> {
-        json(
-            Method::GET,
-            record_url(url, table_id, partition_key, secondary_key),
+    ) -> Result<Record, Status> {
+        rpc(
+            grpc(url)?.get_record(proto::RecordRequest {
+                table_id,
+                partition_key,
+                secondary_key,
+                include_deleted: false,
+            }),
+            30,
         )
-        .await
+        .await?
+        .try_into()
     }
 
     pub async fn delete(
@@ -314,15 +351,18 @@ impl Client {
         partition_key: i64,
         secondary_key: i64,
         timestamp: i64,
-    ) -> Result<Value, reqwest::Error> {
-        HTTP.delete(record_url(url, table_id, partition_key, secondary_key))
-            .timeout(Duration::from_secs(30))
-            .header("x-patchwork-timestamp", timestamp.to_string())
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await
+    ) -> Result<Value, Status> {
+        let result = rpc(
+            grpc(url)?.delete_record(proto::DeleteRequest {
+                table_id,
+                partition_key,
+                secondary_key,
+                timestamp: Some(timestamp),
+            }),
+            30,
+        )
+        .await?;
+        Ok(serde_json::json!({"deleted": result.count}))
     }
 
     pub async fn delete_with_replicas(
@@ -332,7 +372,7 @@ impl Client {
         secondary_key: i64,
         replicas: &[String],
         timestamp: i64,
-    ) -> Result<(), reqwest::Error> {
+    ) -> Result<(), Status> {
         Self::write_with_replicas(
             url,
             table_id,
@@ -353,7 +393,7 @@ impl Client {
         secondary_key: i64,
         replicas: &[String],
         timestamp: i64,
-    ) -> Result<(), reqwest::Error> {
+    ) -> Result<(), Status> {
         Self::write_with_replicas_inconsistent(
             url,
             table_id,
@@ -373,15 +413,18 @@ impl Client {
         table_id: i64,
         partition_key: i64,
         secondary_key: i64,
-    ) -> Result<Record, reqwest::Error> {
-        json(
-            Method::GET,
-            format!(
-                "{}?include_deleted=true",
-                record_url(url, table_id, partition_key, secondary_key)
-            ),
+    ) -> Result<Record, Status> {
+        rpc(
+            grpc(url)?.get_record(proto::RecordRequest {
+                table_id,
+                partition_key,
+                secondary_key,
+                include_deleted: true,
+            }),
+            30,
         )
-        .await
+        .await?
+        .try_into()
     }
 
     /// Copy/reconciliation reads must include deletion markers.
@@ -390,28 +433,53 @@ impl Client {
         table_id: i64,
         upper_bound: i64,
         lower_bound: i64,
-    ) -> Result<Vec<Record>, reqwest::Error> {
-        json(Method::GET, format!("{}/tables/{table_id}/range?lower_bound={lower_bound}&upper_bound={upper_bound}&include_deleted=true", url.trim_end_matches('/'))).await
+    ) -> Result<Vec<Record>, Status> {
+        rpc(
+            grpc(url)?.get_range(range_request(table_id, upper_bound, lower_bound, true)),
+            30,
+        )
+        .await?
+        .records
+        .into_iter()
+        .map(TryInto::try_into)
+        .collect()
     }
 
     pub async fn get_partition_key(
         url: &str,
         table_id: i64,
         partition_key: i64,
-    ) -> Result<Vec<Record>, reqwest::Error> {
-        json(Method::GET, partition_key_url(url, table_id, partition_key)).await
+    ) -> Result<Vec<Record>, Status> {
+        rpc(
+            grpc(url)?.get_partition_key(proto::PartitionRequest {
+                table_id,
+                partition_key,
+                include_deleted: false,
+            }),
+            30,
+        )
+        .await?
+        .records
+        .into_iter()
+        .map(TryInto::try_into)
+        .collect()
     }
 
     pub async fn delete_partition_key(
         url: &str,
         table_id: i64,
         partition_key: i64,
-    ) -> Result<Value, reqwest::Error> {
-        json(
-            Method::DELETE,
-            partition_key_url(url, table_id, partition_key),
+    ) -> Result<Value, Status> {
+        let result = rpc(
+            grpc(url)?.delete_partition_key(proto::PartitionRequest {
+                table_id,
+                partition_key,
+                include_deleted: false,
+            }),
+            30,
         )
-        .await
+        .await?;
+        Ok(serde_json::json!({"deleted": result.count}))
     }
 
     /// Bounds are [lower_bound, upper_bound); argument order matches ShardActor::get_range.
@@ -420,15 +488,16 @@ impl Client {
         table_id: i64,
         upper_bound: i64,
         lower_bound: i64,
-    ) -> Result<Vec<Record>, reqwest::Error> {
-        json(
-            Method::GET,
-            format!(
-                "{}/tables/{table_id}/range?lower_bound={lower_bound}&upper_bound={upper_bound}",
-                url.trim_end_matches('/')
-            ),
+    ) -> Result<Vec<Record>, Status> {
+        rpc(
+            grpc(url)?.get_range(range_request(table_id, upper_bound, lower_bound, false)),
+            30,
         )
-        .await
+        .await?
+        .records
+        .into_iter()
+        .map(TryInto::try_into)
+        .collect()
     }
 
     /// Deletes partition keys in [lower_bound, upper_bound); returns {"deleted": N}.
@@ -437,40 +506,82 @@ impl Client {
         table_id: i64,
         upper_bound: i64,
         lower_bound: i64,
-    ) -> Result<Value, reqwest::Error> {
-        json(
-            Method::DELETE,
-            format!(
-                "{}/tables/{table_id}/range?lower_bound={lower_bound}&upper_bound={upper_bound}",
-                url.trim_end_matches('/')
-            ),
+    ) -> Result<Value, Status> {
+        let result = rpc(
+            grpc(url)?.delete_range(range_request(table_id, upper_bound, lower_bound, false)),
+            30,
         )
-        .await
+        .await?;
+        Ok(serde_json::json!({"deleted": result.count}))
     }
 }
 
-fn partition_key_url(url: &str, table_id: i64, partition_key: i64) -> String {
-    format!(
-        "{}/tables/{table_id}/partition-keys/{partition_key}",
-        url.trim_end_matches('/')
-    )
+// Cloning a channel shares its HTTP/2 connection and allows concurrent requests.
+fn grpc(url: &str) -> Result<DataPlaneClient<Channel>, Status> {
+    let url = url.trim_end_matches('/');
+    let mut channels = CHANNELS
+        .lock()
+        .map_err(|_| Status::internal("channel cache poisoned"))?;
+    let channel = match channels.get(url) {
+        Some(channel) => channel.clone(),
+        None => {
+            let endpoint = Endpoint::new(url.to_owned())
+                .map_err(|error| Status::invalid_argument(error.to_string()))?
+                .connect_timeout(Duration::from_secs(5))
+                .tcp_nodelay(true);
+            let channel = endpoint.connect_lazy();
+            channels.insert(url.to_owned(), channel.clone());
+            channel
+        }
+    };
+    Ok(DataPlaneClient::new(channel)
+        .max_decoding_message_size(MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(MAX_MESSAGE_SIZE))
 }
 
-fn record_url(url: &str, table_id: i64, partition_key: i64, secondary_key: i64) -> String {
-    format!(
-        "{}/records/{secondary_key}",
-        partition_key_url(url, table_id, partition_key)
-    )
-}
-
-async fn json<T: DeserializeOwned>(method: Method, url: String) -> Result<T, reqwest::Error> {
-    HTTP.request(method, url)
-        .timeout(Duration::from_secs(30))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
+async fn rpc<T>(
+    call: impl std::future::Future<Output = Result<Response<T>, Status>>,
+    seconds: u64,
+) -> Result<T, Status> {
+    tokio::time::timeout(Duration::from_secs(seconds), call)
         .await
+        .map_err(|_| Status::deadline_exceeded("data-plane request timed out"))?
+        .map(Response::into_inner)
+}
+
+fn write_request(
+    table_id: i64,
+    partition_key: i64,
+    secondary_key: i64,
+    data: &Value,
+    timestamp: i64,
+    deleted: bool,
+    replicas: &[String],
+) -> Result<proto::WriteRequest, Status> {
+    Ok(proto::WriteRequest {
+        table_id,
+        partition_key,
+        secondary_key,
+        data_json: serde_json::to_vec(data)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?,
+        timestamp: Some(timestamp),
+        deleted,
+        replicas: replicas.to_vec(),
+    })
+}
+
+fn range_request(
+    table_id: i64,
+    upper_bound: i64,
+    lower_bound: i64,
+    include_deleted: bool,
+) -> proto::RangeRequest {
+    proto::RangeRequest {
+        table_id,
+        lower_bound,
+        upper_bound,
+        include_deleted,
+    }
 }
 
 #[cfg(test)]

@@ -13,7 +13,12 @@ async fn client_calls_all_shard_operations() {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
-    let app = api::router(shard.clone());
+    let app = patchwork_data_plane::grpc::router(
+        shard.clone(),
+        patchwork_data_plane::subordinate_shard_writer::SubordinateShardWriter::spawn(
+            patchwork_data_plane::subordinate_shard_writer::SubordinateShardWriter,
+        ),
+    );
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let size = Client::get_size(&url).await.unwrap();
     let actual = std::fs::metadata(dir.path().join("shard.sqlite"))
@@ -62,19 +67,16 @@ async fn client_calls_all_shard_operations() {
     assert_eq!(Client::get_range(&url, 1, 11, 9).await.unwrap().len(), 1);
     assert!(Client::get_range(&url, 1, 10, 9).await.unwrap().is_empty());
     assert_eq!(
-        Client::get_range(&url, 1, 9, 11)
-            .await
-            .unwrap_err()
-            .status(),
-        Some(reqwest::StatusCode::BAD_REQUEST)
+        Client::get_range(&url, 1, 9, 11).await.unwrap_err().code(),
+        tonic::Code::InvalidArgument
     );
     assert_eq!(
         Client::delete(&url, 1, 10, -42, 3).await.unwrap(),
         json!({"deleted": 1})
     );
     assert_eq!(
-        Client::get(&url, 1, 10, -42).await.unwrap_err().status(),
-        Some(reqwest::StatusCode::NOT_FOUND)
+        Client::get(&url, 1, 10, -42).await.unwrap_err().code(),
+        tonic::Code::NotFound
     );
     Client::upsert(&url, 1, 10, 2, &payload, 1).await.unwrap();
     assert_eq!(
@@ -112,8 +114,8 @@ async fn client_calls_all_shard_operations() {
     );
     for key in [i64::MIN, 0, i64::MAX] {
         assert_eq!(
-            Client::get(&url, 7, key, 1).await.unwrap_err().status(),
-            Some(reqwest::StatusCode::NOT_FOUND)
+            Client::get(&url, 7, key, 1).await.unwrap_err().code(),
+            tonic::Code::NotFound
         );
     }
     assert_eq!(
@@ -170,15 +172,15 @@ async fn range_totals_are_scoped_and_measure_payload_bytes() {
             Client::count_range(&url, 1, upper, lower)
                 .await
                 .unwrap_err()
-                .status(),
-            Some(reqwest::StatusCode::BAD_REQUEST)
+                .code(),
+            tonic::Code::InvalidArgument
         );
         assert_eq!(
             Client::get_range_size(&url, 1, upper, lower)
                 .await
                 .unwrap_err()
-                .status(),
-            Some(reqwest::StatusCode::BAD_REQUEST)
+                .code(),
+            tonic::Code::InvalidArgument
         );
     }
     Client::delete_range(&url, 1, 20, 10).await.unwrap();
@@ -247,10 +249,7 @@ async fn put_with_replicas_writes_all_and_reports_partial_failure() {
     let error = Client::put_with_replicas(&urls[0], 1, 10, 22, &payload, &replicas, 1)
         .await
         .unwrap_err();
-    assert_eq!(
-        error.status(),
-        Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
-    );
+    assert_eq!(error.code(), tonic::Code::Internal);
     for url in &urls {
         assert_eq!(Client::get(url, 1, 10, 22).await.unwrap().data, payload);
     }
@@ -323,28 +322,33 @@ async fn inconsistent_writes_queue_while_all_writes_wait_for_ack() {
 
     let entered = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));
-    let replica = axum::Router::new().route(
-        "/tables/{table_id}/partition-keys/{partition_key}/records/{secondary_key}",
-        axum::routing::put({
+    let dir = tempfile::tempdir().unwrap();
+    let remote = ShardActor::spawn(
+        ShardActor::new(dir.path().join("remote.sqlite").to_str().unwrap().into())
+            .await
+            .unwrap(),
+    );
+    let replica = api::router(remote.clone()).layer(axum::middleware::from_fn({
+        let entered = entered.clone();
+        let release = release.clone();
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
             let entered = entered.clone();
             let release = release.clone();
-            move |headers: axum::http::HeaderMap| {
-                let entered = entered.clone();
-                let release = release.clone();
-                async move {
-                    assert_eq!(headers["x-patchwork-timestamp"], "1");
-                    entered.add_permits(1);
-                    release.acquire().await.unwrap().forget();
-                    axum::http::StatusCode::NO_CONTENT
-                }
+            async move {
+                assert_eq!(
+                    request.uri().path(),
+                    "/patchwork.dataplane.DataPlane/WriteRecord"
+                );
+                entered.add_permits(1);
+                release.acquire().await.unwrap().forget();
+                next.run(request).await
             }
-        }),
-    );
+        }
+    }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let replica_url = format!("http://{}", listener.local_addr().unwrap());
     let replica_server = tokio::spawn(async move { axum::serve(listener, replica).await.unwrap() });
 
-    let dir = tempfile::tempdir().unwrap();
     let shard = ShardActor::spawn(
         ShardActor::new(dir.path().join("local.sqlite").to_str().unwrap().into())
             .await
@@ -392,7 +396,7 @@ async fn inconsistent_writes_queue_while_all_writes_wait_for_ack() {
     let error = Client::put_with_replicas_inconsistent(&url, 1, 10, 100, &json!(100), &[], 1)
         .await
         .unwrap_err();
-    assert_eq!(error.status(), Some(reqwest::StatusCode::BAD_REQUEST));
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
     assert!(Client::get(&url, 1, 10, 100).await.is_err());
     let error = Client::put_with_replicas_inconsistent(
         &url,
@@ -405,10 +409,7 @@ async fn inconsistent_writes_queue_while_all_writes_wait_for_ack() {
     )
     .await
     .unwrap_err();
-    assert_eq!(
-        error.status(),
-        Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
-    );
+    assert_eq!(error.code(), tonic::Code::Internal);
     assert!(Client::get(&failover_url, 1, 10, 101).await.is_err());
 
     // Both requests return after the failover saves, while later replicas remain blocked.
@@ -471,6 +472,17 @@ async fn inconsistent_writes_queue_while_all_writes_wait_for_ack() {
         .await
         .unwrap();
     assert_eq!(entered.available_permits(), 1); // Queued second write was processed.
+    let saved = remote
+        .ask(patchwork_data_plane::shard_actor::Get {
+            table_id: 1,
+            partition_key: 10,
+            secondary_key: 99,
+            include_deleted: false,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.timestamp, 1);
     failover_server.abort();
     let _ = failover_server.await;
     failover.stop_gracefully().await.unwrap();
@@ -481,4 +493,6 @@ async fn inconsistent_writes_queue_while_all_writes_wait_for_ack() {
     let _ = replica_server.await;
     shard.stop_gracefully().await.unwrap();
     shard.wait_for_shutdown().await;
+    remote.stop_gracefully().await.unwrap();
+    remote.wait_for_shutdown().await;
 }

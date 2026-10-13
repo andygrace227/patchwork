@@ -27,6 +27,7 @@ pub fn router_with_writer(
     shard: ActorRef<ShardActor>,
     writer: ActorRef<SubordinateShardWriter>,
 ) -> Router {
+    let grpc = crate::grpc::router(shard.clone(), writer.clone());
     Router::new()
         .route("/shard/size", get(get_size))
         .route("/shard/telemetry", get(get_telemetry))
@@ -56,6 +57,7 @@ pub fn router_with_writer(
         .route("/tables/{table_id}/range/size", get(get_range_size))
         .layer(Extension(writer))
         .with_state(shard)
+        .merge(grpc)
 }
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
@@ -130,31 +132,26 @@ struct PutWithReplicas {
 
 async fn put_with_replicas(
     State(shard): State<ActorRef<ShardActor>>,
+    Extension(writer): Extension<ActorRef<SubordinateShardWriter>>,
     Path((table_id, partition_key, secondary_key)): Path<(i64, i64, i64)>,
     headers: HeaderMap,
     Json(request): Json<PutWithReplicas>,
 ) -> Result<StatusCode, ApiError> {
     let timestamp = write_timestamp(&headers)?;
     let deleted = write_deleted(&headers)?;
-    shard
-        .ask(WriteRecord {
+    crate::replicas::write(
+        &shard,
+        &writer,
+        Put {
             table_id,
             partition_key,
             secondary_key,
-            data: request.data.clone(),
+            data: request.data,
+            replicas: request.replicas,
             timestamp,
             deleted,
-        })
-        .await
-        .map_err(internal_error)?;
-    crate::replicas::put(
-        table_id,
-        partition_key,
-        secondary_key,
-        request.data,
-        request.replicas,
-        timestamp,
-        deleted,
+        },
+        false,
     )
     .await
     .map_err(internal_error)?;
@@ -170,56 +167,28 @@ async fn put_with_replicas_inconsistent(
 ) -> Result<StatusCode, ApiError> {
     let timestamp = write_timestamp(&headers)?;
     let deleted = write_deleted(&headers)?;
-    let Some((first, remaining)) = request.replicas.split_first() else {
+    if request.replicas.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "at least one remote replica is required"
-            })),
+            Json(serde_json::json!({"error": "at least one remote replica is required"})),
         ));
-    };
-    shard
-        .ask(WriteRecord {
-            table_id,
-            partition_key,
-            secondary_key,
-            data: request.data.clone(),
-            timestamp,
-            deleted,
-        })
-        .await
-        .map_err(internal_error)?;
-    crate::dataplane_client::Client::write_record(
-        first,
-        table_id,
-        partition_key,
-        secondary_key,
-        &request.data,
-        timestamp,
-        deleted,
-    )
-    .await
-    .map_err(internal_error)?;
-    let replicas: Vec<_> = remaining
-        .iter()
-        .filter(|url| url.trim_end_matches('/') != first.trim_end_matches('/'))
-        .cloned()
-        .collect();
-    if replicas.is_empty() {
-        return Ok(StatusCode::NO_CONTENT);
     }
-    writer
-        .tell(Put {
+    crate::replicas::write(
+        &shard,
+        &writer,
+        Put {
             table_id,
             partition_key,
             secondary_key,
             data: request.data,
-            replicas,
+            replicas: request.replicas,
             timestamp,
             deleted,
-        })
-        .await
-        .map_err(internal_error)?;
+        },
+        true,
+    )
+    .await
+    .map_err(internal_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

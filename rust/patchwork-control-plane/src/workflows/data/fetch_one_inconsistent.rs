@@ -61,7 +61,7 @@ impl GetOneInconsistent {
             };
 
             if let Ok(record) = time(
-                "replica_http",
+                "replica_grpc",
                 Client::get_including_deleted(
                     &node.url,
                     ctx.table_id,

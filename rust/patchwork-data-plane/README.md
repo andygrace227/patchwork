@@ -14,8 +14,23 @@ directory or a parent; exported environment variables take precedence.
 - SHARD_PATH is required. Relative paths resolve from the working directory.
 
 Startup opens one SQLite shard through SeaORM, enables WAL, creates its data table
-if missing, and injects one Kameo actor into the HTTP handlers. Existing tables
-are not migrated automatically. Ctrl-C drains HTTP requests before stopping the actor.
+if missing, and injects one Kameo actor into the gRPC and HTTP handlers. Existing
+tables are not migrated automatically. Ctrl-C drains requests before stopping the actors.
+
+Control-to-data and data-to-data calls use gRPC exclusively, including replication,
+partition copying, cleanup, and telemetry. The shared client caches one HTTP/2
+channel per node; it never falls back to HTTP endpoints. gRPC and the HTTP endpoints
+below share `BIND_ADDR`, so existing node URLs and cluster tools still work.
+Restart all data nodes with this version before starting the updated control plane.
+
+The service definition is `patchwork-common/proto/dataplane.proto`. Keys, timestamps,
+deletion flags, and telemetry use protobuf fields; record payloads remain JSON bytes.
+Write timestamps must be present (including zero) and are preserved
+through replication and copying. Client errors are `tonic::Status`, including
+`NotFound` for missing records and `InvalidArgument` for invalid requests.
+Requests time out after 30 seconds, or 60 seconds for all-replica writes.
+Requests and responses, including whole range replies, are limited to 64 MiB.
+The build supplies `protoc` automatically; no separate installation is needed.
 
 Writes use `PUT /tables/{table_id}/partition-keys/{partition_key}/records/{secondary_key}`.
 The body is the JSON payload. Every write requires `x-patchwork-timestamp`: a

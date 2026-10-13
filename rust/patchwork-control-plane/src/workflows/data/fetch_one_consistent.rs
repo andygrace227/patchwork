@@ -62,7 +62,7 @@ impl GetOneConsistent {
 
             // Include deletion markers so an older live copy cannot win.
             let rep_record = match time(
-                "replica_http",
+                "replica_grpc",
                 Client::get_including_deleted(
                     &node.url,
                     ctx.table_id,
@@ -73,7 +73,7 @@ impl GetOneConsistent {
             .await
             {
                 Ok(record) => record,
-                Err(error) if error.status() == Some(reqwest::StatusCode::NOT_FOUND) => continue,
+                Err(error) if error.code() == tonic::Code::NotFound => continue,
                 Err(error) => return Err(error.into()),
             };
 

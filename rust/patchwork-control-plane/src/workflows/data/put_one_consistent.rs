@@ -106,7 +106,7 @@ impl PutOneConsistent {
         }
         let (url, replicas) = urls.split_first().context("Partition has no replicas")?;
         time(
-            "replica_http",
+            "replica_grpc",
             Client::write_with_replicas(
                 url,
                 record.table_id,

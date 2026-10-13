@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use axum::serve::ListenerExt;
 use kameo::actor::Spawn;
 use patchwork_data_plane::{
     api, shard_actor::ShardActor, subordinate_shard_writer::SubordinateShardWriter,
@@ -17,9 +18,16 @@ async fn main() -> Result<()> {
     let shard = ShardActor::spawn(ShardActor::new(shard_path).await?);
     let writer = SubordinateShardWriter::spawn(SubordinateShardWriter);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    eprintln!("Data plane listening on {}", listener.local_addr()?);
+    eprintln!(
+        "Data plane gRPC and HTTP listening on {}",
+        listener.local_addr()?
+    );
     let result = axum::serve(
-        listener,
+        listener.tap_io(|stream| {
+            if let Err(error) = stream.set_nodelay(true) {
+                eprintln!("Could not enable TCP_NODELAY: {error}");
+            }
+        }),
         api::router_with_writer(shard.clone(), writer.clone()),
     )
     .with_graceful_shutdown(async {

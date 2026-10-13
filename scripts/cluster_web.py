@@ -15,12 +15,15 @@ RECORD_PATH = re.compile(r"/tables/(-?\d+)/partition-keys/(-?\d+)/records/(-?\d+
 
 def create_app(cluster, send_request):
     app = Flask(__name__, static_folder="static")
-    app.config.update(MAX_CONTENT_LENGTH=2 * 1024 * 1024, TRUSTED_HOSTS=["127.0.0.1", "localhost"])
+    trusted_hosts = ["127.0.0.1", "localhost", *cluster.args.trusted_host]
+    if cluster.args.lan_host:
+        trusted_hosts.append(cluster.args.lan_host)
+    app.config.update(MAX_CONTENT_LENGTH=2 * 1024 * 1024, TRUSTED_HOSTS=trusted_hosts)
     node_urls = {
         **{f"control-{i + 1}": url for i, url in enumerate(cluster.control_urls)},
         **{f"data-{i + 1}": url for i, url in enumerate(cluster.data_urls)},
     }
-    load = LoadGenerator(send_request, {name: url for name, url in node_urls.items() if name.startswith("control-")}, cluster.directory)
+    load = LoadGenerator({name: url for name, url in node_urls.items() if name.startswith("control-")}, cluster.directory)
     app.extensions["load_generator"] = load
 
     def rows(query):
@@ -68,9 +71,27 @@ def create_app(cluster, send_request):
         return result
 
     @app.before_request
-    def local_requests_only():
+    def same_origin_requests():
         if request.method == "POST" and request.headers.get("Origin") not in (None, request.host_url.rstrip("/")):
-            return jsonify(error="Use the dashboard from its localhost address"), 403
+            return jsonify(error="Use the same dashboard address for the page and its requests"), 403
+
+    @app.before_request
+    def remote_dashboard_requests():
+        if not getattr(cluster, "remote_dashboard", None):
+            return None
+        # Load stays on this PC. The original dashboard owns metadata and nodes.
+        if request.path == "/api/cluster":
+            try:
+                return jsonify(cluster.metadata())
+            except (RuntimeError, OSError) as error:
+                return jsonify(error=str(error)), 502
+        if request.path in ("/api/request", "/api/telemetry", "/api/telemetry/reset"):
+            try:
+                result = send_request(cluster.remote_dashboard + request.full_path.rstrip("?"),
+                                      request.method, request.get_json(silent=True), expected=None)
+                return app.response_class(result["body"], status=result["status"], mimetype="application/json")
+            except (RuntimeError, OSError) as error:
+                return jsonify(error=str(error)), 502
 
     @app.get("/")
     def index():
@@ -189,8 +210,12 @@ def create_app(cluster, send_request):
             if not isinstance(values, dict):
                 raise ValueError("Send a JSON load configuration")
             table_id = int(str(values.get("table_id", "")))
-            ready = cluster.sql(f"SELECT is_ready FROM `table` WHERE table_id = {table_id}")
-            if ready != "1":
+            if getattr(cluster, "remote_dashboard", None):
+                ready = any(str(table["table_id"]) == str(table_id) and table["is_ready"]
+                            for table in cluster.metadata()["tables"])
+            else:
+                ready = cluster.sql(f"SELECT is_ready FROM `table` WHERE table_id = {table_id}") == "1"
+            if not ready:
                 raise ValueError("Select a ready table before starting load")
             load.start(values)
             return jsonify(load.snapshot()), 202
@@ -198,6 +223,8 @@ def create_app(cluster, send_request):
             return jsonify(error=str(error)), 400
         except RuntimeError as error:
             return jsonify(error=str(error)), 409
+        except OSError as error:
+            return jsonify(error=str(error)), 502
 
     @app.post("/api/load/stop")
     def stop_load():

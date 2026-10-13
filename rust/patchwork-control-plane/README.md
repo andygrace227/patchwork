@@ -49,3 +49,9 @@ separated by operation and consistency; `DELETE /telemetry` resets the totals.
 Replica HTTP includes acknowledged data-node/replication work and network time,
 not asynchronous background replication. The local dashboard shows stage time
 per measured request and the data nodes’ existing access telemetry.
+
+Data-node calls use gRPC exclusively through `patchwork-common::dataplane_client`,
+including reads, writes, partition maintenance, and telemetry. Existing node URLs
+and ports still apply. Update and restart every data node before restarting the
+control plane. The public control-plane API remains HTTP/JSON. Server timing for
+data-node calls is reported as `replica_grpc`.
