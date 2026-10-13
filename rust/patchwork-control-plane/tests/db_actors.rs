@@ -275,3 +275,207 @@ async fn all_models_support_crud_and_overlapping_requests() {
     tables.wait_for_shutdown().await;
     db.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
+    use std::time::Duration;
+    assert_eq!(
+        patchwork_control_plane::db::actor::CACHE_TTL,
+        Duration::from_secs(5)
+    );
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    let schema = Schema::new(db.get_database_backend());
+    db.execute(&schema.create_table_from_entity(table::Entity))
+        .await
+        .unwrap();
+    db.execute(&schema.create_table_from_entity(partition::Entity))
+        .await
+        .unwrap();
+    let tables = TableActor::spawn(TableActor::new(db.clone()));
+    let partitions = PartitionActor::spawn(PartitionActor::new(db.clone()));
+    let mut row = tables
+        .ask(Create::<table::Entity> {
+            data: table::ActiveModel {
+                table_id: Set(1),
+                table_name: Set("original".into()),
+                owner: Set(1),
+                partition_key_name: Set("pk".into()),
+                sort_key_name: Set("sk".into()),
+                is_ready: Set(true),
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        tables.ask(GetCached { id: 1 }).await.unwrap(),
+        Some(row.clone())
+    );
+    db.execute_unprepared("UPDATE `table` SET table_name = 'external' WHERE table_id = 1")
+        .await
+        .unwrap();
+    assert_eq!(
+        tables.ask(GetCached { id: 1 }).await.unwrap(),
+        Some(row.clone())
+    );
+    assert_eq!(
+        tables.ask(Get { id: 1 }).await.unwrap().unwrap().table_name,
+        "external"
+    );
+    row.table_name = "actor update".into();
+    tables
+        .ask(Update::<table::Entity> { data: row.clone() })
+        .await
+        .unwrap();
+    assert_eq!(tables.ask(GetCached { id: 1 }).await.unwrap(), Some(row));
+    tables.ask(Delete { id: 1 }).await.unwrap();
+    assert!(tables.ask(GetCached { id: 1 }).await.unwrap().is_none());
+
+    assert!(
+        partitions
+            .ask(partition::GetTablePartitions { table_id: 1 })
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let mut boundary = partitions
+        .ask(Create::<partition::Entity> {
+            data: partition::ActiveModel {
+                table_id: Set(1),
+                hash_start: Set(i64::MIN),
+                forward_to: Set(None),
+                replicas: Set(partition::ReplicaNodes(vec![1, 2])),
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        partitions
+            .ask(partition::GetTablePartitions { table_id: 1 })
+            .await
+            .unwrap(),
+        vec![boundary.clone()]
+    );
+    db.execute_unprepared("UPDATE `partition` SET forward_to = 0 WHERE table_id = 1")
+        .await
+        .unwrap();
+    assert_eq!(
+        partitions
+            .ask(partition::GetTablePartitions { table_id: 1 })
+            .await
+            .unwrap(),
+        vec![boundary.clone()]
+    );
+    assert_eq!(
+        partitions
+            .ask(partition::GetPartitionAtOrBeforeCached {
+                table_id: 1,
+                hash_start: 10
+            })
+            .await
+            .unwrap(),
+        Some(boundary.clone())
+    );
+    assert_eq!(
+        partitions
+            .ask(partition::GetTablePartitionsUncached { table_id: 1 })
+            .await
+            .unwrap()[0]
+            .forward_to,
+        Some(0)
+    );
+    boundary.replicas = partition::ReplicaNodes(vec![2, 3]);
+    partitions
+        .ask(Update::<partition::Entity> {
+            data: boundary.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        partitions
+            .ask(partition::GetTablePartitions { table_id: 1 })
+            .await
+            .unwrap(),
+        vec![boundary]
+    );
+    partitions
+        .ask(Delete {
+            id: (1i64, i64::MIN),
+        })
+        .await
+        .unwrap();
+    assert!(
+        partitions
+            .ask(partition::GetTablePartitions { table_id: 1 })
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // A short TTL exercises real expiry without making the suite wait five seconds.
+    let expiring = PartitionActor::spawn(PartitionActor::with_cache_ttl(
+        db.clone(),
+        Duration::from_millis(20),
+    ));
+    assert!(
+        expiring
+            .ask(partition::GetTablePartitions { table_id: 1 })
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    db.execute_unprepared(
+        "INSERT INTO `partition` (table_id, hash_start, replicas) VALUES (1, 0, '[1]')",
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(
+        expiring
+            .ask(partition::GetTablePartitions { table_id: 1 })
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let expiring_tables = TableActor::spawn(TableActor::with_cache_ttl(db.clone(), Duration::ZERO));
+    let created = tables
+        .ask(Create::<table::Entity> {
+            data: table::ActiveModel {
+                table_id: Set(1),
+                table_name: Set("before".into()),
+                owner: Set(1),
+                partition_key_name: Set("pk".into()),
+                sort_key_name: Set("sk".into()),
+                is_ready: Set(true),
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        expiring_tables.ask(GetCached { id: 1 }).await.unwrap(),
+        Some(created)
+    );
+    db.execute_unprepared("UPDATE `table` SET table_name = 'after' WHERE table_id = 1")
+        .await
+        .unwrap();
+    assert_eq!(
+        expiring_tables
+            .ask(GetCached { id: 1 })
+            .await
+            .unwrap()
+            .unwrap()
+            .table_name,
+        "after"
+    );
+    for actor in [partitions, expiring] {
+        actor.stop_gracefully().await.unwrap();
+        actor.wait_for_shutdown().await;
+    }
+    for actor in [tables, expiring_tables] {
+        actor.stop_gracefully().await.unwrap();
+        actor.wait_for_shutdown().await;
+    }
+    db.close().await.unwrap();
+}

@@ -1,3 +1,4 @@
+use crate::telemetry::{measure, time};
 use anyhow::{Context, Result, ensure};
 use kameo::actor::ActorRef;
 use patchwork_common::dataplane_client::Record;
@@ -5,7 +6,11 @@ use rand::seq::SliceRandom;
 
 use crate::{
     dataplane_client::Client,
-    db::{NodeActor, PartitionActor, TableActor, actor::Get, partition::GetPartitionAtOrBefore},
+    db::{
+        NodeActor, PartitionActor, TableActor,
+        actor::{Get, GetCached},
+        partition::GetPartitionAtOrBefore,
+    },
 };
 // Fetch one and take the one with the latest timestamp.
 // GetOneConsistent always hits the live partition map.
@@ -23,13 +28,16 @@ pub struct GetOneConsistentCtx {
 
 impl GetOneConsistent {
     pub async fn run(&self, ctx: GetOneConsistentCtx) -> Result<Option<Record>> {
+        let table_timing = measure("table_lookup");
         let table = self
             .table
-            .ask(Get { id: ctx.table_id })
+            .ask(GetCached { id: ctx.table_id })
             .await?
             .context("Table is not alive.")?;
         ensure!(table.is_ready, "Table is not ready.");
+        drop(table_timing);
 
+        let partition_timing = measure("partition_lookup");
         let partition = self
             .partition
             .ask(GetPartitionAtOrBefore {
@@ -38,24 +46,29 @@ impl GetOneConsistent {
             })
             .await?
             .context("Something is very wrong with partition creation")?;
+        drop(partition_timing);
 
-        let mut replicas =
-            super::replicas::resolve(&self.partition, partition, false, false).await?;
+        let mut replicas = time(
+            "replica_resolution",
+            super::replicas::resolve(&self.partition, partition, false, false),
+        )
+        .await?;
         let mut accepted_record: Option<Record> = None;
         replicas.shuffle(&mut rand::rng());
         for replica in replicas {
-            let node = self
-                .node
-                .ask(Get { id: replica })
+            let node = time("replica_lookup", self.node.ask(Get { id: replica }))
                 .await?
                 .context("Replica node no longer exists; table cleanup is incomplete")?;
 
             // Include deletion markers so an older live copy cannot win.
-            let rep_record = match Client::get_including_deleted(
-                &node.url,
-                ctx.table_id,
-                ctx.primary_key,
-                ctx.secondary_key,
+            let rep_record = match time(
+                "replica_http",
+                Client::get_including_deleted(
+                    &node.url,
+                    ctx.table_id,
+                    ctx.primary_key,
+                    ctx.secondary_key,
+                ),
             )
             .await
             {

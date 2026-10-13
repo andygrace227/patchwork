@@ -11,7 +11,9 @@ use crate::{
         NodeActor, PartitionActor,
         actor::Get,
         parition_lock::AttemptLock,
-        partition::{self, GetTablePartitions, UpdateLockedPartition},
+        partition::{
+            self, GetTablePartitionsUncached as GetTablePartitions, UpdateLockedPartition,
+        },
     },
 };
 

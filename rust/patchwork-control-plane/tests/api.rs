@@ -20,7 +20,7 @@ async fn serve(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
 }
 
 #[tokio::test]
-async fn routes_invoke_read_workflows_and_report_table_job_results() {
+async fn routes_invoke_record_workflows_and_report_table_job_results() {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     let schema = Schema::new(db.get_database_backend());
     for statement in [
@@ -182,6 +182,154 @@ async fn routes_invoke_read_workflows_and_report_table_job_results() {
             .status(),
         StatusCode::BAD_REQUEST
     );
+
+    for (query, timestamp) in [("", 4), ("?consistent=false", 5)] {
+        let data = json!({"value": timestamp});
+        assert_eq!(
+            http.put(format!("{record_url}{query}"))
+                .header("x-patchwork-timestamp", timestamp.to_string())
+                .json(&data)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        for url in &urls {
+            let record = Client::get(url, 1, 10, 42).await.unwrap();
+            assert_eq!(record.data, data);
+            assert_eq!(record.timestamp, timestamp);
+        }
+    }
+    for timestamp in [None, Some("bogus"), Some("-1"), Some("9223372036854775808")] {
+        let mut request = http.put(&record_url).json(&json!({"value": "invalid"}));
+        if let Some(timestamp) = timestamp {
+            request = request.header("x-patchwork-timestamp", timestamp);
+        }
+        assert_eq!(
+            request.send().await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    // An acknowledged stale write must not replace the newer value on any replica.
+    assert_eq!(
+        http.put(&record_url)
+            .header("x-patchwork-timestamp", "4")
+            .json(&json!({"value": "stale"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    for url in &urls {
+        let record = Client::get(url, 1, 10, 42).await.unwrap();
+        assert_eq!(record.data, json!({"value": 5}));
+        assert_eq!(record.timestamp, 5);
+    }
+
+    // Default requests do not collect timings or add a timing header.
+    let unmeasured = http.get(&record_url).send().await.unwrap();
+    assert!(unmeasured.headers().get("server-timing").is_none());
+    let before: serde_json::Value = http
+        .get(format!("{url}/telemetry"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(before, json!({}));
+    for consistent in [true, false] {
+        let measured_url = format!("{record_url}?consistent={consistent}&telemetry=true");
+        let response = http
+            .put(&measured_url)
+            .header("x-patchwork-timestamp", "6")
+            .json(&json!({"value": 6}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            response.headers()["server-timing"]
+                .to_str()
+                .unwrap()
+                .contains("partition_lookup;dur=")
+        );
+        let response = http.get(&measured_url).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers()["server-timing"]
+                .to_str()
+                .unwrap()
+                .contains("replica_http;dur=")
+        );
+    }
+    let response = http
+        .get(format!(
+            "{url}/tables/1/range?lower_bound=10&upper_bound=11&telemetry=true"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("server-timing").is_some());
+    let missing = http
+        .get(format!(
+            "{url}/tables/1/partition-keys/10/records/999?telemetry=true"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert!(missing.headers().get("server-timing").is_some());
+    let timings: serde_json::Value = http
+        .get(format!("{url}/telemetry"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for operation in [
+        "put_consistent",
+        "put_inconsistent",
+        "fetch_consistent",
+        "fetch_inconsistent",
+        "fetch_range",
+    ] {
+        let stats = &timings[operation];
+        assert!(stats["requests"].as_u64().unwrap() > 0);
+        for stage in [
+            "total",
+            "table_lookup",
+            "partition_lookup",
+            "replica_resolution",
+            "replica_lookup",
+            "replica_http",
+        ] {
+            assert!(stats["stages"][stage]["calls"].as_u64().unwrap() > 0);
+            assert!(stats["stages"][stage]["average_ms"].as_f64().unwrap() >= 0.0);
+        }
+    }
+    assert_eq!(timings["fetch_consistent"]["errors"], 1);
+    assert_eq!(
+        http.delete(format!("{url}/telemetry"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let reset: serde_json::Value = http
+        .get(format!("{url}/telemetry"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(reset, json!({}));
 
     let mut request = json!({
         "table_name": " ", "table_owner": 1,

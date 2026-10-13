@@ -10,7 +10,9 @@ use crate::{
         NodeActor, PartitionActor,
         actor::Get,
         parition_lock::AttemptLock,
-        partition::{DeleteLockedPartition, GetTablePartitions, Model},
+        partition::{
+            DeleteLockedPartition, GetTablePartitionsUncached as GetTablePartitions, Model,
+        },
     },
 };
 

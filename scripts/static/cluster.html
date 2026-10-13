@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Patchwork · Local cluster</title>
+  <link rel="stylesheet" href="/static/cluster.css">
+  <script src="/static/cluster.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/"><span class="mark" aria-hidden="true">▦</span> PATCHWORK <span class="local">LOCAL</span></a>
+    <p class="sidebar-label">CONTROL NODES</p><div id="control-nodes" class="nodes"></div>
+    <p class="sidebar-label">DATA NODES</p><div id="data-nodes" class="nodes"></div>
+    <div class="sidebar-note">One cluster. Separate processes.<br>Ctrl-C in your terminal stops the rig.</div>
+  </aside>
+  <main>
+    <header>
+      <div><p class="eyebrow">YOUR LOCAL TESTING RIG</p><h1>Cluster workbench</h1><p class="subtitle">Send requests. Inspect records. Watch the metadata.</p></div>
+      <button id="refresh" class="secondary">Refresh cluster ↻</button>
+    </header>
+    <div id="connection" role="status" class="connection">Connecting to the rig…</div>
+    <section class="stats" aria-label="Cluster summary">
+      <div><span id="node-count">—</span><small>nodes running</small></div>
+      <div><span id="table-count">—</span><small>tables</small></div>
+      <div><span id="partition-count">—</span><small>partitions</small></div>
+      <div><span id="lock-count">—</span><small>held leases</small></div>
+    </section>
+    <div class="workbench">
+      <section class="panel request-panel">
+        <div class="panel-heading"><h2>Request</h2><span id="node-kind" class="tag">Control plane</span></div>
+        <form id="request-form">
+          <label>Node<select id="node" required></select></label>
+          <label>Action<select id="action"></select></label>
+          <label id="table-field">Table<select id="table"></select></label>
+          <div id="key-fields" class="field-pair">
+            <label>Partition key<input id="partition-key" value="10" inputmode="numeric" spellcheck="false"></label>
+            <label>Record key<input id="secondary-key" value="42" inputmode="numeric" spellcheck="false"></label>
+          </div>
+          <div id="range-fields" class="field-pair" hidden>
+            <label>Lower bound<input id="lower-bound" value="0" inputmode="numeric" spellcheck="false"></label>
+            <label>Upper bound (excluded)<input id="upper-bound" value="100" inputmode="numeric" spellcheck="false"></label>
+          </div>
+          <label id="body-field">JSON body<textarea id="body" rows="7" spellcheck="false" aria-label="Request JSON body"></textarea></label>
+          <label id="replicate-field" class="check"><input type="checkbox" id="replicate" checked> Write to this table’s replicas</label>
+          <p id="replicate-note" class="hint">Uses current placement. If this node is outside the replica set, a replica handles the write.</p>
+          <label id="timestamp-field">Timestamp <span class="hint">Unix microseconds</span><input id="timestamp" placeholder="Automatic for each new write" inputmode="numeric" spellcheck="false"></label>
+          <label id="request-telemetry-field" class="check"><input id="request-telemetry" type="checkbox"> Measure control-node fetch / put timings</label>
+          <div class="request-preview"><strong id="method-preview">POST</strong><code id="path-preview">/tables</code></div>
+          <button type="submit" id="send" class="primary">Send request <span>↗</span></button>
+        </form>
+      </section>
+      <section class="panel response-panel">
+        <div class="panel-heading"><h2>Response</h2><div><span id="response-time" class="hint"></span> <span id="response-status" class="tag">Ready</span></div></div>
+        <div id="response-meta" class="response-meta">Responses appear here, including errors from the node.</div>
+        <pre id="response-body" tabindex="0" aria-live="polite">Create a table to get started, then pick a data node to write a record.</pre>
+        <div class="response-footer"><button id="retry" class="secondary" disabled>Repeat last request</button><span class="hint">Repeats reuse the original timestamp.</span></div>
+      </section>
+    </div>
+    <section class="panel metadata" id="load-generator">
+      <div class="panel-heading"><h2>Load generator</h2><span id="load-phase" class="tag">Idle</span></div>
+      <form id="load-form">
+        <fieldset id="load-settings" class="load-grid">
+          <label>Table<select id="load-table" required></select></label>
+          <label>Control nodes<select id="load-node"><option value="all">All control nodes · round robin</option></select></label>
+          <label>Target requests / second<input id="load-tps" type="number" min="1" max="100000" value="100" required></label>
+          <label>Duration (seconds)<input id="load-duration" type="number" min="1" max="3600" value="30" required></label>
+          <label>Concurrent requests<input id="load-workers" type="number" min="1" max="128" value="8" required></label>
+          <label>Reads (%) · 0 means all writes<input id="load-reads" type="number" min="0" max="100" value="0" required></label>
+          <label>Unique records<input id="load-records" type="number" min="1" max="100000" value="1000" required></label>
+          <label>Payload padding (bytes)<input id="load-payload" type="number" min="0" max="1048576" value="256" required></label>
+          <label>Key distribution<select id="load-distribution"><option value="spread">Spread across the whole ring</option><option value="hot">One hot partition key</option></select></label>
+          <label id="load-keys-field">Partition keys<input id="load-keys" type="number" min="1" max="10000" value="100" required></label>
+          <label id="load-hot-field" hidden>Hot partition key<input id="load-hot-key" value="10" inputmode="numeric" spellcheck="false"></label>
+          <label>Consistency<select id="load-consistency"><option value="true">Consistent</option><option value="false">Inconsistent</option></select></label>
+          <label class="check"><input id="load-telemetry" type="checkbox"> Measure fetch / put timings</label>
+          <label class="check"><input id="load-seed" type="checkbox" checked> Seed records before read or mixed tests</label>
+        </fieldset>
+        <p class="hint">TPS counts HTTP requests to control nodes. Seeding runs before the timed load. Generated records remain in the table.</p>
+        <div class="load-buttons"><button id="load-start" class="primary" type="submit">Start load</button><button id="load-stop" class="secondary" type="button" disabled>Stop load</button><a class="hint" href="/api/load" download="patchwork-load.json">Download results</a></div>
+      </form>
+      <div class="load-metrics" aria-live="polite">
+        <div><strong id="load-actual">0</strong><small>actual TPS / average</small></div>
+        <div><strong id="load-completed">0</strong><small>completed</small></div>
+        <div><strong id="load-errors">0</strong><small>errors</small></div>
+        <div><strong id="load-misses">0</strong><small>read misses</small></div>
+        <div><strong id="load-latency">0 ms</strong><small>p95 · last 10k requests</small></div>
+        <div><strong id="load-inflight">0</strong><small>in flight</small></div>
+      </div>
+      <div class="load-progress"><progress id="load-progress" max="30" value="0"></progress><span id="load-detail" class="hint">Choose a ready table to get started.</span><p id="load-error" role="status"></p></div>
+    </section>
+    <section class="panel metadata" id="operation-telemetry">
+      <div class="panel-heading"><h2>Fetch / put timings</h2><button id="reset-telemetry" class="secondary">Reset timings</button></div>
+      <p class="telemetry-note hint">Enable measurement on a request or load run. Averages below are milliseconds per measured request, since reset. Replica HTTP includes network and data-node work; inconsistent writes exclude queued background replication.</p>
+      <div class="table-wrap"><table><thead><tr><th>Control node</th><th>Operation</th><th>Requests / errors</th><th>Total ms</th><th>Table ms</th><th>Partition ms</th><th>Replica resolution ms</th><th>Replica lookup ms</th><th>Replica HTTP ms</th></tr></thead><tbody id="operation-timings"></tbody></table></div>
+    </section>
+    <section class="panel metadata" id="data-telemetry">
+      <div class="panel-heading"><h2>Data-node telemetry</h2><label class="check"><input id="telemetry-live" type="checkbox" checked> Refresh every 5 seconds</label></div>
+      <p class="telemetry-note hint">Top 100 active partition keys per node. Rates and counts use each node’s bounded sample, including replica traffic. Window shows the actual observation period.</p>
+      <div class="table-wrap"><table><thead><tr><th>Data node</th><th>Table</th><th>Partition key</th><th>Reads / s</th><th>Writes / s</th><th>Read / write samples</th><th>Window (s)</th><th>Average write key</th><th>Median write key</th></tr></thead><tbody id="data-telemetry-rows"></tbody></table></div>
+      <p id="telemetry-error" class="telemetry-note" role="status"></p>
+    </section>
+    <section class="panel metadata">
+      <div class="panel-heading"><h2>Tables</h2><span class="hint">Select a row to use that table · refreshes every 5 seconds</span></div>
+      <div class="table-wrap"><table><thead><tr><th>ID</th><th>Name</th><th>Status</th><th></th></tr></thead><tbody id="tables"></tbody></table></div>
+    </section>
+    <section class="panel metadata">
+      <div class="panel-heading"><h2>Partition placement</h2><span class="hint">Signed 64-bit boundaries</span></div>
+      <div class="table-wrap"><table><thead><tr><th>Table</th><th>Starts at</th><th>Data node replicas</th><th>Forwards to</th></tr></thead><tbody id="partitions"></tbody></table></div>
+    </section>
+    <details class="panel leases"><summary>Partition leases <span id="lease-summary" class="hint">No locks held</span></summary><pre id="locks">[]</pre></details>
+    <footer>Patchwork / local development <span id="updated"></span></footer>
+  </main>
+</body>
+</html>

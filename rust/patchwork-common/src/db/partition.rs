@@ -51,6 +51,46 @@ impl Message<GetTablePartitions> for PartitionActor {
         msg: GetTablePartitions,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        let generation = {
+            let cache = self.cache.lock().unwrap();
+            if let Some(partitions) = cache.partitions.get(&msg.table_id) {
+                return ctx.reply(Ok(partitions.clone()));
+            }
+            cache.generation
+        };
+        let db = self.db.clone();
+        let cache = self.cache.clone();
+        let ttl = self.cache_ttl;
+        ctx.spawn(async move {
+            let partitions = Entity::find()
+                .filter(Column::TableId.eq(msg.table_id))
+                .order_by_asc(Column::HashStart)
+                .all(&db)
+                .await?;
+            let mut cache = cache.lock().unwrap();
+            if cache.generation == generation {
+                cache
+                    .partitions
+                    .insert(msg.table_id, partitions.clone(), ttl);
+            }
+            Ok(partitions)
+        })
+    }
+}
+
+/// Fresh metadata for topology changes and table deletion.
+pub struct GetTablePartitionsUncached {
+    pub table_id: i64,
+}
+
+impl Message<GetTablePartitionsUncached> for PartitionActor {
+    type Reply = DelegatedReply<Result<Vec<Model>, DbErr>>;
+
+    async fn handle(
+        &mut self,
+        msg: GetTablePartitionsUncached,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
         let db = self.db.clone();
         ctx.spawn(async move {
             Entity::find()
@@ -105,6 +145,7 @@ impl Message<CreateLockedPartition> for PartitionActor {
     ) -> Self::Reply {
         use sea_orm::{DbBackend, Statement, TransactionTrait};
         let db = self.db.clone();
+        let cache = self.cache.clone();
         ctx.spawn(async move {
             if msg.locks.is_empty() {
                 return Err(DbErr::Custom("Partition leases are required".into()));
@@ -124,6 +165,7 @@ impl Message<CreateLockedPartition> for PartitionActor {
             }
             let partition = msg.data.insert(&txn).await?;
             txn.commit().await?;
+            cache.lock().unwrap().clear();
             Ok(partition)
         })
     }
@@ -145,6 +187,7 @@ impl Message<UpdateLockedPartition> for PartitionActor {
     ) -> Self::Reply {
         use sea_orm::{DbBackend, Statement, TransactionTrait};
         let db = self.db.clone();
+        let cache = self.cache.clone();
         ctx.spawn(async move {
             if msg.locks.is_empty() {
                 return Err(DbErr::Custom("Partition leases are required".into()));
@@ -164,6 +207,7 @@ impl Message<UpdateLockedPartition> for PartitionActor {
             }
             let partition = msg.data.update(&txn).await?;
             txn.commit().await?;
+            cache.lock().unwrap().clear();
             Ok(partition)
         })
     }
@@ -186,6 +230,7 @@ impl Message<DeleteLockedPartition> for PartitionActor {
     ) -> Self::Reply {
         use sea_orm::{DbBackend, Statement, TransactionTrait};
         let db = self.db.clone();
+        let cache = self.cache.clone();
         ctx.spawn(async move {
             if msg.locks.is_empty() {
                 return Err(DbErr::Custom("Partition leases are required".into()));
@@ -208,12 +253,13 @@ impl Message<DeleteLockedPartition> for PartitionActor {
                 return Err(DbErr::Custom("Partition no longer exists".into()));
             }
             txn.commit().await?;
+            cache.lock().unwrap().clear();
             Ok(deleted.rows_affected)
         })
     }
 }
 
-/// Cache hook. Reads through to the database until caching is implemented.
+/// Use the cached, ordered table ring for inconsistent ownership lookups.
 pub struct GetPartitionAtOrBeforeCached {
     pub table_id: i64,
     pub hash_start: i64,
@@ -227,14 +273,35 @@ impl Message<GetPartitionAtOrBeforeCached> for PartitionActor {
         msg: GetPartitionAtOrBeforeCached,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        <Self as Message<GetPartitionAtOrBefore>>::handle(
-            self,
-            GetPartitionAtOrBefore {
-                table_id: msg.table_id,
-                hash_start: msg.hash_start,
-            },
-            ctx,
-        )
-        .await
+        // Ask through the same handler so ownership and range reads share one cache.
+        let ring = self
+            .cache
+            .lock()
+            .unwrap()
+            .partitions
+            .get(&msg.table_id)
+            .cloned();
+        if let Some(ring) = ring {
+            let next = ring.partition_point(|p| p.hash_start <= msg.hash_start);
+            return ctx.reply(Ok(next.checked_sub(1).map(|i| ring[i].clone())));
+        }
+        let db = self.db.clone();
+        let cache = self.cache.clone();
+        let ttl = self.cache_ttl;
+        let generation = cache.lock().unwrap().generation;
+        ctx.spawn(async move {
+            let ring = Entity::find()
+                .filter(Column::TableId.eq(msg.table_id))
+                .order_by_asc(Column::HashStart)
+                .all(&db)
+                .await?;
+            let next = ring.partition_point(|p| p.hash_start <= msg.hash_start);
+            let partition = next.checked_sub(1).map(|i| ring[i].clone());
+            let mut cache = cache.lock().unwrap();
+            if cache.generation == generation {
+                cache.partitions.insert(msg.table_id, ring, ttl);
+            }
+            Ok(partition)
+        })
     }
 }

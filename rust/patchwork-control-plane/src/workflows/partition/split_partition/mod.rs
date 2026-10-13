@@ -7,7 +7,10 @@ use crate::{
         NodeActor, PartitionActor, TableActor,
         node::GetNodeExcluding,
         parition_lock::AttemptLock,
-        partition::{self, CreateLockedPartition, GetTablePartitions, UpdateLockedPartition},
+        partition::{
+            self, CreateLockedPartition, GetTablePartitionsUncached as GetTablePartitions,
+            UpdateLockedPartition,
+        },
     },
     workflows::partition::circular_get,
 };

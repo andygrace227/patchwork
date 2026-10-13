@@ -1,3 +1,4 @@
+use crate::telemetry::{measure, time};
 use anyhow::{Context, Result, ensure};
 use kameo::actor::ActorRef;
 use patchwork_common::dataplane_client::Record;
@@ -5,7 +6,11 @@ use rand::seq::IndexedRandom;
 
 use crate::{
     dataplane_client::Client,
-    db::{NodeActor, PartitionActor, TableActor, actor::Get, partition::GetTablePartitions},
+    db::{
+        NodeActor, PartitionActor, TableActor,
+        actor::{Get, GetCached},
+        partition::GetTablePartitions,
+    },
 };
 
 pub struct FetchRange {
@@ -28,15 +33,18 @@ impl FetchRange {
             ctx.lower_bound <= ctx.upper_bound,
             "Range bounds are reversed"
         );
+        let table_timing = measure("table_lookup");
         let table = self
             .table
-            .ask(Get { id: ctx.table_id })
+            .ask(GetCached { id: ctx.table_id })
             .await?
             .context("Table is not alive.")?;
         ensure!(table.is_ready, "Table is not ready.");
+        drop(table_timing);
         if ctx.lower_bound == ctx.upper_bound {
             return Ok(Vec::new());
         }
+        let partition_timing = measure("partition_lookup");
         let partitions = self
             .partition
             .ask(GetTablePartitions {
@@ -44,6 +52,7 @@ impl FetchRange {
             })
             .await?;
         ensure!(!partitions.is_empty(), "Table has no partitions");
+        drop(partition_timing);
 
         let mut records = Vec::new();
         let mut lower_bound = ctx.lower_bound;
@@ -58,18 +67,23 @@ impl FetchRange {
             let upper_bound = partitions.get(next).map_or(ctx.upper_bound, |partition| {
                 partition.hash_start.min(ctx.upper_bound)
             });
-            let replicas =
-                super::replicas::resolve(&self.partition, partition.clone(), false, false).await?;
+            let replicas = time(
+                "replica_resolution",
+                super::replicas::resolve(&self.partition, partition.clone(), false, false),
+            )
+            .await?;
             let replica = *replicas
                 .choose(&mut rand::rng())
                 .context("Partition has no replicas")?;
-            let node = self
-                .node
-                .ask(Get { id: replica })
+            let node = time("replica_lookup", self.node.ask(Get { id: replica }))
                 .await?
                 .context("Replica node no longer exists")?;
             records.extend(
-                Client::get_range(&node.url, ctx.table_id, upper_bound, lower_bound).await?,
+                time(
+                    "replica_http",
+                    Client::get_range(&node.url, ctx.table_id, upper_bound, lower_bound),
+                )
+                .await?,
             );
             lower_bound = upper_bound;
         }
@@ -93,8 +107,7 @@ impl FetchRange {
         replicas.dedup();
         let mut records = Vec::new();
         for replica in replicas {
-            let node = node_actor
-                .ask(Get { id: replica })
+            let node = time("replica_lookup", node_actor.ask(Get { id: replica }))
                 .await?
                 .context("Source replica no longer exists")?;
             records.extend(

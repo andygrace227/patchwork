@@ -8,7 +8,7 @@ use crate::{
         NodeActor, PartitionActor, TableActor,
         actor::{Delete, Get, Update},
         parition_lock::AttemptLock,
-        partition::{DeleteLockedPartition, GetTablePartitions},
+        partition::{DeleteLockedPartition, GetTablePartitionsUncached as GetTablePartitions},
         table,
     },
 };

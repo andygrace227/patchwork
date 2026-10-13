@@ -24,6 +24,12 @@ completion. Ctrl-C drains HTTP requests before stopping the executor.
 - `GET /tables/{table_id}/partition-keys/{partition_key}/records/{secondary_key}`
   invokes `GetOneConsistent` by default. Add `?consistent=false` to invoke
   `GetOneInconsistent`. Returns the full record or `404` when absent or deleted.
+- `PUT` on the same record path invokes `PutOneConsistent` by default; add
+  `?consistent=false` to invoke `PutOneInconsistent`. Send the record's JSON payload
+  directly and supply `x-patchwork-timestamp` as nonnegative Unix microseconds.
+  Returns `204`; missing, invalid, negative, or overflowing timestamps return `400`.
+  Reuse the original timestamp for retries. Consistent writes wait for every replica;
+  inconsistent writes wait for two nodes and queue the rest in memory without retries.
 - `GET /tables/{table_id}/range?lower_bound=0&upper_bound=100` invokes `FetchRange`
   and returns an array for `[0, 100)`. Equal bounds return an empty array;
   reversed bounds return `400`. This workflow reads one replica per partition.
@@ -32,3 +38,14 @@ Consistent reads return the newest observed timestamp across replicas. Range
 reads do not provide a consistent snapshot. Blank table/key names return `400`.
 Duplicate queued/running table operations return `409`; an unavailable or full
 executor returns `503`. Workflow failures return `500` and log details on the server.
+
+### Optional operation timings
+
+Add `telemetry=true` to record GET/PUT or range query options to collect timings.
+Responses include `Server-Timing` for table/partition lookup, replica resolution,
+replica URL lookup, replica HTTP, and total time. Measurement is off by default.
+`GET /telemetry` returns cumulative counts and average milliseconds per stage call,
+separated by operation and consistency; `DELETE /telemetry` resets the totals.
+Replica HTTP includes acknowledged data-node/replication work and network time,
+not asynchronous background replication. The local dashboard shows stage time
+per measured request and the data nodes’ existing access telemetry.

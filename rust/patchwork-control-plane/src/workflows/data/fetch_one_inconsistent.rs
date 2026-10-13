@@ -1,3 +1,4 @@
+use crate::telemetry::{measure, time};
 use anyhow::{Context, Result, ensure};
 use kameo::actor::ActorRef;
 use patchwork_common::dataplane_client::Record;
@@ -5,10 +6,14 @@ use rand::seq::SliceRandom;
 
 use crate::{
     dataplane_client::Client,
-    db::{NodeActor, PartitionActor, TableActor, actor::Get, partition::GetPartitionAtOrBefore},
+    db::{
+        NodeActor, PartitionActor, TableActor,
+        actor::{Get, GetCached},
+        partition::GetPartitionAtOrBeforeCached as GetPartitionAtOrBefore,
+    },
 };
 // Fetch the first record found, trying replicas in a random order.
-// GetOneInconsistent always hits the live partition map.
+// Inconsistent reads reuse the five-second partition cache.
 pub struct GetOneInconsistent {
     pub partition: ActorRef<PartitionActor>,
     pub node: ActorRef<NodeActor>,
@@ -23,13 +28,16 @@ pub struct GetOneInconsistentCtx {
 
 impl GetOneInconsistent {
     pub async fn run(&self, ctx: GetOneInconsistentCtx) -> Result<Option<Record>> {
+        let table_timing = measure("table_lookup");
         let table = self
             .table
-            .ask(Get { id: ctx.table_id })
+            .ask(GetCached { id: ctx.table_id })
             .await?
             .context("Table is not alive.")?;
         ensure!(table.is_ready, "Table is not ready.");
+        drop(table_timing);
 
+        let partition_timing = measure("partition_lookup");
         let partition = self
             .partition
             .ask(GetPartitionAtOrBefore {
@@ -38,20 +46,28 @@ impl GetOneInconsistent {
             })
             .await?
             .context("Something is very wrong with partition creation")?;
+        drop(partition_timing);
 
-        let mut replicas =
-            super::replicas::resolve(&self.partition, partition, false, false).await?;
+        let mut replicas = time(
+            "replica_resolution",
+            super::replicas::resolve(&self.partition, partition, false, true),
+        )
+        .await?;
         replicas.shuffle(&mut rand::rng());
         for replica in replicas {
-            let Ok(Some(node)) = self.node.ask(Get { id: replica }).await else {
+            let Ok(Some(node)) = time("replica_lookup", self.node.ask(Get { id: replica })).await
+            else {
                 continue;
             };
 
-            if let Ok(record) = Client::get_including_deleted(
-                &node.url,
-                ctx.table_id,
-                ctx.primary_key,
-                ctx.secondary_key,
+            if let Ok(record) = time(
+                "replica_http",
+                Client::get_including_deleted(
+                    &node.url,
+                    ctx.table_id,
+                    ctx.primary_key,
+                    ctx.secondary_key,
+                ),
             )
             .await
             {

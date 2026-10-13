@@ -1,3 +1,4 @@
+use crate::telemetry::{measure, time};
 use anyhow::{Context, Result, ensure};
 use kameo::actor::ActorRef;
 use patchwork_common::dataplane_client::Record;
@@ -6,7 +7,11 @@ use serde_json::Value;
 
 use crate::{
     dataplane_client::Client,
-    db::{NodeActor, PartitionActor, TableActor, actor::Get, partition::GetPartitionAtOrBefore},
+    db::{
+        NodeActor, PartitionActor, TableActor,
+        actor::{Get, GetCached},
+        partition::GetPartitionAtOrBefore,
+    },
 };
 
 pub struct PutOneConsistent {
@@ -27,13 +32,16 @@ pub struct PutOneConsistentCtx {
 impl PutOneConsistent {
     pub async fn run(&self, ctx: PutOneConsistentCtx) -> Result<()> {
         ensure!(ctx.timestamp >= 0, "Timestamp must be nonnegative");
+        let table_timing = measure("table_lookup");
         let table = self
             .table
-            .ask(Get { id: ctx.table_id })
+            .ask(GetCached { id: ctx.table_id })
             .await?
             .context("Table is not alive.")?;
         ensure!(table.is_ready, "Table is not ready.");
+        drop(table_timing);
 
+        let partition_timing = measure("partition_lookup");
         let mut partition = self
             .partition
             .ask(GetPartitionAtOrBefore {
@@ -52,8 +60,13 @@ impl PutOneConsistent {
                 .await?;
         }
         let partition = partition.context("Table has no partitions")?;
+        drop(partition_timing);
 
-        let replicas = super::replicas::resolve(&self.partition, partition, true, false).await?;
+        let replicas = time(
+            "replica_resolution",
+            super::replicas::resolve(&self.partition, partition, true, false),
+        )
+        .await?;
         Self::to_replicas(
             &self.node,
             &Record {
@@ -83,8 +96,7 @@ impl PutOneConsistent {
 
         let mut urls = Vec::new();
         for replica in replicas {
-            let node = node_actor
-                .ask(Get { id: replica })
+            let node = time("replica_lookup", node_actor.ask(Get { id: replica }))
                 .await?
                 .context("Replica node no longer exists")?;
             let url = node.url.trim_end_matches('/').to_owned();
@@ -93,15 +105,18 @@ impl PutOneConsistent {
             }
         }
         let (url, replicas) = urls.split_first().context("Partition has no replicas")?;
-        Client::write_with_replicas(
-            url,
-            record.table_id,
-            record.partition_key,
-            record.secondary_key,
-            &record.data,
-            replicas,
-            record.timestamp,
-            record.deleted,
+        time(
+            "replica_http",
+            Client::write_with_replicas(
+                url,
+                record.table_id,
+                record.partition_key,
+                record.secondary_key,
+                &record.data,
+                replicas,
+                record.timestamp,
+                record.deleted,
+            ),
         )
         .await?;
         Ok(())

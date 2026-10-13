@@ -3,3 +3,5 @@
 .env
 ./rust/data/
 ./rust/*/target
+.venv/
+__pycache__/

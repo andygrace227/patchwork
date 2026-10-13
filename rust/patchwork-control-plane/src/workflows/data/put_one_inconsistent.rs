@@ -1,3 +1,4 @@
+use crate::telemetry::{measure, time};
 use anyhow::{Context, Result, ensure};
 use kameo::actor::ActorRef;
 use rand::seq::SliceRandom;
@@ -29,13 +30,16 @@ pub struct PutOneInconsistentCtx {
 impl PutOneInconsistent {
     pub async fn run(&self, ctx: PutOneInconsistentCtx) -> Result<()> {
         ensure!(ctx.timestamp >= 0, "Timestamp must be nonnegative");
+        let table_timing = measure("table_lookup");
         let table = self
             .table
             .ask(Get { id: ctx.table_id })
             .await?
             .context("Table is not alive.")?;
         ensure!(table.is_ready, "Table is not ready.");
+        drop(table_timing);
 
+        let partition_timing = measure("partition_lookup");
         let mut partition = self
             .partition
             .ask(GetPartitionAtOrBefore {
@@ -54,16 +58,19 @@ impl PutOneInconsistent {
                 .await?;
         }
         let partition = partition.context("Table has no partitions")?;
+        drop(partition_timing);
 
-        let mut replicas = super::replicas::resolve(&self.partition, partition, true, true).await?;
+        let mut replicas = time(
+            "replica_resolution",
+            super::replicas::resolve(&self.partition, partition, true, true),
+        )
+        .await?;
         replicas.shuffle(&mut rand::rng());
 
         // Resolve every destination before starting the write.
         let mut urls = Vec::new();
         for replica in replicas {
-            let node = self
-                .node
-                .ask(Get { id: replica })
+            let node = time("replica_lookup", self.node.ask(Get { id: replica }))
                 .await?
                 .context("Replica node no longer exists")?;
             let url = node.url.trim_end_matches('/').to_owned();
@@ -76,14 +83,17 @@ impl PutOneInconsistent {
             !replicas.is_empty(),
             "Inconsistent writes require at least two nodes"
         );
-        Client::put_with_replicas_inconsistent(
-            url,
-            ctx.table_id,
-            ctx.primary_key,
-            ctx.secondary_key,
-            &ctx.data,
-            replicas,
-            ctx.timestamp,
+        time(
+            "replica_http",
+            Client::put_with_replicas_inconsistent(
+                url,
+                ctx.table_id,
+                ctx.primary_key,
+                ctx.secondary_key,
+                &ctx.data,
+                replicas,
+                ctx.timestamp,
+            ),
         )
         .await?;
         Ok(())

@@ -9,7 +9,7 @@ use crate::db::{
     NodeActor, PartitionActor,
     node::GetNodeExcluding,
     parition_lock::AttemptLock,
-    partition::{self, GetTablePartitions, UpdateLockedPartition},
+    partition::{self, GetTablePartitionsUncached as GetTablePartitions, UpdateLockedPartition},
 };
 
 #[derive(Clone)]
