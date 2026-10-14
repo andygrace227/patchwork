@@ -13,6 +13,7 @@ use crate::{
 };
 
 pub struct PutOneInconsistent {
+    pub client: Client,
     pub partition: ActorRef<PartitionActor>,
     pub node: ActorRef<NodeActor>,
     pub table: ActorRef<TableActor>,
@@ -85,7 +86,7 @@ impl PutOneInconsistent {
         );
         time(
             "replica_grpc",
-            Client::put_with_replicas_inconsistent(
+            self.client.put_with_replicas_inconsistent(
                 url,
                 ctx.table_id,
                 ctx.primary_key,

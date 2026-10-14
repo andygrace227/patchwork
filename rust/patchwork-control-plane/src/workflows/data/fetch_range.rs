@@ -14,6 +14,7 @@ use crate::{
 };
 
 pub struct FetchRange {
+    pub client: Client,
     pub partition: ActorRef<PartitionActor>,
     pub node: ActorRef<NodeActor>,
     pub table: ActorRef<TableActor>,
@@ -81,7 +82,8 @@ impl FetchRange {
             records.extend(
                 time(
                     "replica_grpc",
-                    Client::get_range(&node.url, ctx.table_id, upper_bound, lower_bound),
+                    self.client
+                        .get_range(&node.url, ctx.table_id, upper_bound, lower_bound),
                 )
                 .await?,
             );
@@ -93,6 +95,7 @@ impl FetchRange {
     // Copy scans visit every source replica, including tombstones. Duplicate
     // versions are intentional: consistent writes apply timestamp/tie ordering.
     pub(crate) async fn from_replicas(
+        client: &Client,
         node_actor: &ActorRef<NodeActor>,
         ctx: &FetchRangeCtx,
         replicas: &[i64],
@@ -111,13 +114,14 @@ impl FetchRange {
                 .await?
                 .context("Source replica no longer exists")?;
             records.extend(
-                Client::get_range_including_deleted(
-                    &node.url,
-                    ctx.table_id,
-                    ctx.upper_bound,
-                    ctx.lower_bound,
-                )
-                .await?,
+                client
+                    .get_range_including_deleted(
+                        &node.url,
+                        ctx.table_id,
+                        ctx.upper_bound,
+                        ctx.lower_bound,
+                    )
+                    .await?,
             );
         }
         Ok(records)

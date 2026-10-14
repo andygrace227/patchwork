@@ -26,6 +26,7 @@ pub struct DecreaseReplicationContext {
 
 #[derive(Clone)]
 pub struct DecreaseReplication {
+    pub client: Client,
     pub node: ActorRef<NodeActor>,
     pub partition: ActorRef<PartitionActor>,
 }

@@ -15,6 +15,7 @@ use crate::{
 // Fetch one and take the one with the latest timestamp.
 // GetOneConsistent always hits the live partition map.
 pub struct GetOneConsistent {
+    pub client: Client,
     pub partition: ActorRef<PartitionActor>,
     pub node: ActorRef<NodeActor>,
     pub table: ActorRef<TableActor>,
@@ -63,7 +64,7 @@ impl GetOneConsistent {
             // Include deletion markers so an older live copy cannot win.
             let rep_record = match time(
                 "replica_grpc",
-                Client::get_including_deleted(
+                self.client.get_including_deleted(
                     &node.url,
                     ctx.table_id,
                     ctx.primary_key,

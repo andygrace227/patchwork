@@ -20,6 +20,7 @@ pub struct DeleteTableContext {
 
 #[derive(Clone)]
 pub struct DeleteTable {
+    pub client: Client,
     pub node: ActorRef<NodeActor>,
     pub partition: ActorRef<PartitionActor>,
     pub table: ActorRef<TableActor>,

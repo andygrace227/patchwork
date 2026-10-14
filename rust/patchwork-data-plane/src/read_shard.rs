@@ -21,6 +21,7 @@ use std::path::PathBuf;
 pub type ReadShardPool = ActorRef<ActorPool<ReadShard>>;
 
 pub struct ReadShard {
+    // SeaORM uses SQLx's per-connection prepared statement cache for data queries.
     db: DatabaseConnection,
     access_stats: ActorRef<AccessStatsActor>,
 }

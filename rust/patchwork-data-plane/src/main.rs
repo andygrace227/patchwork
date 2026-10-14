@@ -3,12 +3,13 @@ use axum::serve::ListenerExt;
 use kameo::actor::Spawn;
 use patchwork_data_plane::{
     api,
-    shard_actor::ShardActor,
     subordinate_shard_writer::SubordinateShardWriter,
     telemetry::{
         AccessStatsActor,
         access_stats_actor::{FLUSH_INTERVAL, Flush, RETENTION},
     },
+    write_handler::WriteHandler,
+    write_shard::WriteShard,
 };
 
 #[tokio::main(flavor = "multi_thread")]
@@ -43,10 +44,11 @@ async fn main() -> Result<()> {
         )
         .await?,
     );
-    let shard = ShardActor::with_access_stats(shard_path, access_stats.clone()).await?;
+    let shard = WriteShard::with_access_stats(shard_path, access_stats.clone()).await?;
     let readers = shard.read_pool(pool_size)?;
-    let shard = ShardActor::spawn(shard);
-    let writer = SubordinateShardWriter::spawn(SubordinateShardWriter);
+    let shard = WriteShard::spawn(shard);
+    let writer = SubordinateShardWriter::spawn(SubordinateShardWriter::default());
+    let handler = WriteHandler::spawn(WriteHandler::new(shard.clone(), writer.clone()));
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     eprintln!(
         "Data plane gRPC and HTTP listening on {} with {} Tokio worker threads and {} read actors",
@@ -60,12 +62,14 @@ async fn main() -> Result<()> {
                 eprintln!("Could not enable TCP_NODELAY: {error}");
             }
         }),
-        api::router_with_writer(shard.clone(), readers.clone(), writer.clone()),
+        api::router_with_handler(shard.clone(), readers.clone(), handler.clone()),
     )
     .with_graceful_shutdown(async {
         let _ = tokio::signal::ctrl_c().await;
     })
     .await;
+    handler.stop_gracefully().await?;
+    handler.wait_for_shutdown().await;
     writer.stop_gracefully().await?;
     writer.wait_for_shutdown().await;
     readers.stop_gracefully().await?;

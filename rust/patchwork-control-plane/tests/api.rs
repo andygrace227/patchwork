@@ -8,7 +8,7 @@ use patchwork_control_plane::{
     dataplane_client::{Client, Record},
     workflows::executor::{ExecutorConfig, GetExecutorStatus, LongRunningWorkflowExecutor},
 };
-use patchwork_data_plane::shard_actor::ShardActor;
+use patchwork_data_plane::write_shard::WriteShard;
 use reqwest::StatusCode;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, Database, Schema};
 use serde_json::json;
@@ -22,6 +22,7 @@ async fn serve(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn routes_invoke_record_workflows_and_report_table_job_results() {
+    let client = Client::new();
     let db = Database::connect("sqlite::memory:").await.unwrap();
     let schema = Schema::new(db.get_database_backend());
     for statement in [
@@ -40,7 +41,7 @@ async fn routes_invoke_record_workflows_and_report_table_job_results() {
     let mut replicas = Vec::new();
     let mut urls = Vec::new();
     for timestamp in [1, 2] {
-        let shard = ShardActor::new(
+        let shard = WriteShard::new(
             dir.path()
                 .join(format!("{timestamp}.sqlite"))
                 .to_str()
@@ -50,13 +51,14 @@ async fn routes_invoke_record_workflows_and_report_table_job_results() {
         .await
         .unwrap();
         let shard_readers = shard.read_pool(2).unwrap();
-        let shard = ShardActor::spawn(shard);
+        let shard = WriteShard::spawn(shard);
         let (url, server) = serve(patchwork_data_plane::api::router(
             shard.clone(),
             shard_readers.clone(),
         ))
         .await;
-        Client::upsert(&url, 1, 10, 42, &json!({"value": timestamp}), timestamp)
+        client
+            .upsert(&url, 1, 10, 42, &json!({"value": timestamp}), timestamp)
             .await
             .unwrap();
         let replica = node
@@ -174,7 +176,7 @@ async fn routes_invoke_record_workflows_and_report_table_job_results() {
         .await
         .unwrap();
     assert!(empty.is_empty());
-    Client::delete(&urls[1], 1, 10, 42, 3).await.unwrap();
+    client.delete(&urls[1], 1, 10, 42, 3).await.unwrap();
     assert_eq!(
         http.get(&record_url).send().await.unwrap().status(),
         StatusCode::NOT_FOUND
@@ -201,7 +203,7 @@ async fn routes_invoke_record_workflows_and_report_table_job_results() {
             StatusCode::NO_CONTENT
         );
         for url in &urls {
-            let record = Client::get(url, 1, 10, 42).await.unwrap();
+            let record = client.get(url, 1, 10, 42).await.unwrap();
             assert_eq!(record.data, data);
             assert_eq!(record.timestamp, timestamp);
         }
@@ -228,7 +230,7 @@ async fn routes_invoke_record_workflows_and_report_table_job_results() {
         StatusCode::NO_CONTENT
     );
     for url in &urls {
-        let record = Client::get(url, 1, 10, 42).await.unwrap();
+        let record = client.get(url, 1, 10, 42).await.unwrap();
         assert_eq!(record.data, json!({"value": 5}));
         assert_eq!(record.timestamp, 5);
     }

@@ -26,13 +26,14 @@ use crate::{
 
 /// Owns the single write connection for one shard.
 #[derive(Actor)]
-pub struct ShardActor {
+pub struct WriteShard {
+    // SeaORM uses SQLx's per-connection prepared statement cache for data queries.
     db: DatabaseConnection,
     path: std::path::PathBuf,
     access_stats: ActorRef<AccessStatsActor>,
 }
 
-impl ShardActor {
+impl WriteShard {
     pub async fn new(path: String) -> Result<Self> {
         let stats = AccessStatsActor::spawn(
             AccessStatsActor::new(format!("{path}.access-stats.sqlite")).await?,
@@ -53,6 +54,7 @@ impl ShardActor {
         let mut options = ConnectOptions::new(format!("sqlite://{path}?mode=rwc"));
         options.max_connections(1).sqlx_logging(false);
         let db = Database::connect(options).await?;
+        // These one-time setup commands do not need cached prepared statements.
         db.execute_unprepared("PRAGMA auto_vacuum = FULL").await?;
         // Existing databases without auto-vacuum need a one-time rebuild.
         let mode = db
@@ -89,7 +91,12 @@ impl ShardActor {
 }
 
 #[messages]
-impl ShardActor {
+impl WriteShard {
+    #[message]
+    pub async fn get_path(&self) -> std::path::PathBuf {
+        self.path.clone()
+    }
+
     /// Current unflushed host accesses, grouped by table and partition key.
     #[message]
     pub async fn get_telemetry(&mut self) -> Result<Vec<telemetry::Model>> {

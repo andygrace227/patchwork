@@ -13,6 +13,7 @@ use serde::Deserialize;
 use crate::{
     actors::{NodeActor, PartitionActor, TableActor},
     datamodels::table,
+    dataplane_client::Client,
     workflows::{
         Workflow,
         data::{
@@ -32,6 +33,7 @@ use crate::{
 
 #[derive(Clone)]
 struct AppState {
+    client: Client,
     node: ActorRef<NodeActor>,
     partition: ActorRef<PartitionActor>,
     table: ActorRef<TableActor>,
@@ -58,6 +60,7 @@ pub fn router(
         )
         .route("/tables/{table_id}/range", get(get_range))
         .with_state(AppState {
+            client: Client::new(),
             node,
             partition,
             table,
@@ -160,6 +163,7 @@ async fn delete_table(
     submit(
         &state,
         DeleteTable {
+            client: state.client.clone(),
             node: state.node.clone(),
             partition: state.partition.clone(),
             table: state.table.clone(),
@@ -199,6 +203,7 @@ async fn get_record(
             async move {
                 let record = if options.consistent {
                     GetOneConsistent {
+                        client: state.client.clone(),
                         node: state.node,
                         partition: state.partition,
                         table: state.table,
@@ -211,6 +216,7 @@ async fn get_record(
                     .await
                 } else {
                     GetOneInconsistent {
+                        client: state.client.clone(),
                         node: state.node,
                         partition: state.partition,
                         table: state.table,
@@ -261,6 +267,7 @@ async fn put_record(
         })?;
                 if options.consistent {
                     PutOneConsistent {
+                        client: state.client.clone(),
                         node: state.node,
                         partition: state.partition,
                         table: state.table,
@@ -275,6 +282,7 @@ async fn put_record(
                     .await
                 } else {
                     PutOneInconsistent {
+                        client: state.client.clone(),
                         node: state.node,
                         partition: state.partition,
                         table: state.table,
@@ -318,6 +326,7 @@ async fn get_range(
                 ));
             }
             FetchRange {
+                client: state.client.clone(),
                 node: state.node,
                 partition: state.partition,
                 table: state.table,

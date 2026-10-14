@@ -52,6 +52,7 @@ fn check(
 ) -> SubmitWorkflow<CheckTableScale> {
     SubmitWorkflow::new(
         CheckTableScale {
+            client: patchwork_common::dataplane_client::Client::new(),
             node: node.clone(),
             partition: partition.clone(),
             table: table.clone(),
@@ -68,13 +69,13 @@ async fn executor_limits_jobs_keeps_tables_separate_and_recovers_after_failure()
     let handler_gates = gates.clone();
     let (started, mut requests) = mpsc::unbounded_channel();
     let dir = tempfile::tempdir().unwrap();
-    let shard = patchwork_data_plane::shard_actor::ShardActor::new(
+    let shard = patchwork_data_plane::write_shard::WriteShard::new(
         dir.path().join("shard.sqlite").to_str().unwrap().into(),
     )
     .await
     .unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
-    let shard = patchwork_data_plane::shard_actor::ShardActor::spawn(shard);
+    let shard = patchwork_data_plane::write_shard::WriteShard::spawn(shard);
     let app = patchwork_data_plane::api::router(shard.clone(), shard_readers.clone()).layer(
         middleware::from_fn(move |request: Request, next: Next| {
             let handler_gates = handler_gates.clone();
@@ -164,6 +165,7 @@ async fn executor_limits_jobs_keeps_tables_separate_and_recovers_after_failure()
         .ask(SubmitWorkflow::new(
             // Existing boundary fails before acquiring any MySQL locks.
             SplitPartition {
+                client: patchwork_common::dataplane_client::Client::new(),
                 node: node.clone(),
                 partition: partition.clone(),
                 table: table.clone(),

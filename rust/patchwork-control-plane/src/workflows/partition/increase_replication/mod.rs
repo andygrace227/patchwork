@@ -1,4 +1,5 @@
 use super::copy_range::copy_range;
+use crate::dataplane_client::Client;
 use crate::workflows::data::fetch_range::FetchRangeCtx;
 use crate::workflows::stages::{unlock, workflow_steps};
 use anyhow::{Context, Result, ensure};
@@ -25,6 +26,7 @@ pub struct IncreaseReplicationContext {
 
 #[derive(Clone)]
 pub struct IncreaseReplication {
+    pub client: Client,
     pub node: ActorRef<NodeActor>,
     pub partition: ActorRef<PartitionActor>,
 }

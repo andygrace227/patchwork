@@ -1,5 +1,5 @@
 use super::*;
-use crate::shard_actor::{ShardActor, Upsert};
+use crate::write_shard::{Upsert, WriteShard};
 use kameo::{
     actor::Spawn,
     message::{Context, Message},
@@ -38,12 +38,12 @@ impl Message<TryWrite> for ReadShard {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kameo_pool_uses_another_reader_while_one_is_busy() {
     let dir = tempfile::tempdir().unwrap();
-    let shard = ShardActor::new(dir.path().join("shard.sqlite").to_str().unwrap().into())
+    let shard = WriteShard::new(dir.path().join("shard.sqlite").to_str().unwrap().into())
         .await
         .unwrap();
     assert!(shard.read_pool(0).is_err());
     let readers = shard.read_pool(2).unwrap();
-    let shard = ShardActor::spawn(shard);
+    let shard = WriteShard::spawn(shard);
 
     let (entered, ready) = oneshot::channel();
     let (release, wait) = oneshot::channel();

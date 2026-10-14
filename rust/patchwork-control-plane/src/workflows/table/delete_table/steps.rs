@@ -97,7 +97,10 @@ impl Run {
                 now()? < lease_end,
                 "Table deletion lease expired during cleanup"
             );
-            Client::delete_table(&node.url, ctx.table_id).await?;
+            self.workflow
+                .client
+                .delete_table(&node.url, ctx.table_id)
+                .await?;
         }
         Ok(State::Metadata)
     }

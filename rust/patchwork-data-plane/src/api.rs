@@ -1,12 +1,10 @@
+use crate::write_handler::{self, WriteHandler};
 use crate::{
     data,
     read_shard::{CountRange, Get, GetPartitionKey, GetRange, GetRangeSize, ReadShardPool},
-    shard_actor::{
-        Delete, DeletePartitionKey, DeleteRange, DeleteTable, GetSize, GetTelemetry,
-        GetTelemetryForTable, ShardActor, WriteRecord,
-    },
-    subordinate_shard_writer::{Put, SubordinateShardWriter},
+    subordinate_shard_writer::SubordinateShardWriter,
     telemetry,
+    write_shard::{GetSize, GetTelemetry, GetTelemetryForTable, WriteShard},
 };
 use axum::{
     Extension, Json, Router,
@@ -16,24 +14,34 @@ use axum::{
 };
 use kameo::actor::{ActorRef, Spawn};
 use kameo_actors::pool::Dispatch;
+use patchwork_common::dataplane_client::Record;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Inject the writer and Kameo read pool into every handler.
-pub fn router(shard: ActorRef<ShardActor>, readers: ReadShardPool) -> Router {
+pub fn router(shard: ActorRef<WriteShard>, readers: ReadShardPool) -> Router {
     router_with_writer(
         shard,
         readers,
-        SubordinateShardWriter::spawn(SubordinateShardWriter),
+        SubordinateShardWriter::spawn(SubordinateShardWriter::default()),
     )
 }
 
 pub fn router_with_writer(
-    shard: ActorRef<ShardActor>,
+    shard: ActorRef<WriteShard>,
     readers: ReadShardPool,
     writer: ActorRef<SubordinateShardWriter>,
 ) -> Router {
-    let grpc = crate::grpc::router(shard.clone(), readers.clone(), writer.clone());
+    let handler = WriteHandler::spawn(WriteHandler::new(shard.clone(), writer));
+    router_with_handler(shard, readers, handler)
+}
+
+pub fn router_with_handler(
+    shard: ActorRef<WriteShard>,
+    readers: ReadShardPool,
+    handler: ActorRef<WriteHandler>,
+) -> Router {
+    let grpc = crate::grpc::router_with_handler(shard.clone(), readers.clone(), handler.clone());
     Router::new()
         .route("/shard/size", get(get_size))
         .route("/shard/telemetry", get(get_telemetry))
@@ -62,7 +70,7 @@ pub fn router_with_writer(
         .route("/tables/{table_id}/range/count", get(count_range))
         .route("/tables/{table_id}/range/size", get(get_range_size))
         .layer(Extension(readers))
-        .layer(Extension(writer))
+        .layer(Extension(handler))
         .with_state(shard)
         .merge(grpc)
 }
@@ -110,21 +118,25 @@ struct ReadOptions {
 }
 
 async fn upsert(
-    State(shard): State<ActorRef<ShardActor>>,
+    Extension(handler): Extension<ActorRef<WriteHandler>>,
     Path((table_id, partition_key, secondary_key)): Path<(i64, i64, i64)>,
     headers: HeaderMap,
     Json(data): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
     let timestamp = write_timestamp(&headers)?;
     let deleted = write_deleted(&headers)?;
-    shard
-        .ask(WriteRecord {
-            table_id: table_id,
-            partition_key: partition_key,
-            secondary_key: secondary_key,
-            data: data,
-            timestamp,
-            deleted,
+    handler
+        .ask(write_handler::WriteRecord {
+            record: Record {
+                table_id,
+                partition_key,
+                secondary_key,
+                data,
+                timestamp,
+                deleted,
+            },
+            replicas: Vec::new(),
+            consistent: false,
         })
         .await
         .map_err(internal_error)?;
@@ -138,36 +150,33 @@ struct PutWithReplicas {
 }
 
 async fn put_with_replicas(
-    State(shard): State<ActorRef<ShardActor>>,
-    Extension(writer): Extension<ActorRef<SubordinateShardWriter>>,
+    Extension(handler): Extension<ActorRef<WriteHandler>>,
     Path((table_id, partition_key, secondary_key)): Path<(i64, i64, i64)>,
     headers: HeaderMap,
     Json(request): Json<PutWithReplicas>,
 ) -> Result<StatusCode, ApiError> {
     let timestamp = write_timestamp(&headers)?;
     let deleted = write_deleted(&headers)?;
-    crate::subordinate_shard_writer::write(
-        &shard,
-        &writer,
-        Put {
-            table_id,
-            partition_key,
-            secondary_key,
-            data: request.data,
+    handler
+        .ask(write_handler::WriteRecord {
+            record: Record {
+                table_id,
+                partition_key,
+                secondary_key,
+                data: request.data,
+                timestamp,
+                deleted,
+            },
             replicas: request.replicas,
-            timestamp,
-            deleted,
-        },
-        false,
-    )
-    .await
-    .map_err(internal_error)?;
+            consistent: true,
+        })
+        .await
+        .map_err(internal_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn put_with_replicas_inconsistent(
-    State(shard): State<ActorRef<ShardActor>>,
-    Extension(writer): Extension<ActorRef<SubordinateShardWriter>>,
+    Extension(handler): Extension<ActorRef<WriteHandler>>,
     Path((table_id, partition_key, secondary_key)): Path<(i64, i64, i64)>,
     headers: HeaderMap,
     Json(request): Json<PutWithReplicas>,
@@ -180,22 +189,21 @@ async fn put_with_replicas_inconsistent(
             Json(serde_json::json!({"error": "at least one remote replica is required"})),
         ));
     }
-    crate::subordinate_shard_writer::write(
-        &shard,
-        &writer,
-        Put {
-            table_id,
-            partition_key,
-            secondary_key,
-            data: request.data,
+    handler
+        .ask(write_handler::WriteRecord {
+            record: Record {
+                table_id,
+                partition_key,
+                secondary_key,
+                data: request.data,
+                timestamp,
+                deleted,
+            },
             replicas: request.replicas,
-            timestamp,
-            deleted,
-        },
-        true,
-    )
-    .await
-    .map_err(internal_error)?;
+            consistent: false,
+        })
+        .await
+        .map_err(internal_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -228,13 +236,13 @@ struct Deleted {
 }
 
 async fn delete_record(
-    State(shard): State<ActorRef<ShardActor>>,
+    Extension(handler): Extension<ActorRef<WriteHandler>>,
     Path((table_id, partition_key, secondary_key)): Path<(i64, i64, i64)>,
     headers: HeaderMap,
 ) -> Result<Json<Deleted>, ApiError> {
     let timestamp = write_timestamp(&headers)?;
-    let deleted = shard
-        .ask(Delete {
+    let deleted = handler
+        .ask(write_handler::Delete {
             table_id,
             partition_key,
             secondary_key,
@@ -263,11 +271,11 @@ async fn get_partition_key(
 }
 
 async fn delete_partition_key(
-    State(shard): State<ActorRef<ShardActor>>,
+    Extension(handler): Extension<ActorRef<WriteHandler>>,
     Path((table_id, partition_key)): Path<(i64, i64)>,
 ) -> Result<Json<Deleted>, ApiError> {
-    let deleted = shard
-        .ask(DeletePartitionKey {
+    let deleted = handler
+        .ask(write_handler::DeletePartitionKey {
             table_id,
             partition_key,
         })
@@ -309,7 +317,7 @@ async fn get_range(
 }
 
 async fn delete_range(
-    State(shard): State<ActorRef<ShardActor>>,
+    Extension(handler): Extension<ActorRef<WriteHandler>>,
     Path(table_id): Path<i64>,
     Query(range): Query<Range>,
 ) -> Result<Json<Deleted>, ApiError> {
@@ -319,8 +327,8 @@ async fn delete_range(
             Json(serde_json::json!({"error": "lower_bound must be less than upper_bound"})),
         ));
     }
-    let deleted = shard
-        .ask(DeleteRange {
+    let deleted = handler
+        .ask(write_handler::DeleteRange {
             table_id,
             lower_bound: range.lower_bound,
             upper_bound: range.upper_bound,
@@ -331,14 +339,14 @@ async fn delete_range(
 }
 
 async fn get_size(
-    State(shard): State<ActorRef<ShardActor>>,
+    State(shard): State<ActorRef<WriteShard>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let size_bytes = shard.ask(GetSize {}).await.map_err(internal_error)?;
     Ok(Json(serde_json::json!({ "size_bytes": size_bytes })))
 }
 
 async fn get_telemetry(
-    State(shard): State<ActorRef<ShardActor>>,
+    State(shard): State<ActorRef<WriteShard>>,
 ) -> Result<Json<Vec<telemetry::Model>>, ApiError> {
     Ok(Json(
         shard.ask(GetTelemetry {}).await.map_err(internal_error)?,
@@ -346,7 +354,7 @@ async fn get_telemetry(
 }
 
 async fn get_telemetry_for_table(
-    State(shard): State<ActorRef<ShardActor>>,
+    State(shard): State<ActorRef<WriteShard>>,
     Path(table_id): Path<i64>,
 ) -> Result<Json<HashMap<i64, telemetry::Model>>, ApiError> {
     Ok(Json(
@@ -402,11 +410,11 @@ async fn get_range_size(
 }
 
 async fn delete_table(
-    State(shard): State<ActorRef<ShardActor>>,
+    Extension(handler): Extension<ActorRef<WriteHandler>>,
     Path(table_id): Path<i64>,
 ) -> Result<Json<Deleted>, ApiError> {
-    let deleted = shard
-        .ask(DeleteTable { table_id })
+    let deleted = handler
+        .ask(write_handler::DeleteTable { table_id })
         .await
         .map_err(internal_error)?;
     Ok(Json(Deleted { deleted }))

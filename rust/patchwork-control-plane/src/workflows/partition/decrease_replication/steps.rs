@@ -118,6 +118,7 @@ impl Run {
         let (source, next) = self.boundaries.as_ref().expect("Prepare must run first");
         // Copy every source version to the retained nodes before dropping copies.
         copy_range(
+            &self.workflow.client,
             &workflow.node,
             FetchRangeCtx {
                 table_id: ctx.table_id,
@@ -161,7 +162,9 @@ impl Run {
         for node in &self.obsolete {
             check_lease(lease_end)
                 .context("Replication decreased, but old replica cleanup is incomplete")?;
-            Client::delete_range(&node.url, ctx.table_id, next.hash_start, source.hash_start)
+            self.workflow
+                .client
+                .delete_range(&node.url, ctx.table_id, next.hash_start, source.hash_start)
                 .await
                 .context("Replication decreased, but old replica cleanup failed")?;
         }

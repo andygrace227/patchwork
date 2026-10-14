@@ -118,6 +118,7 @@ impl Run {
         let (source, next) = self.boundaries.as_ref().expect("Prepare must run first");
         // Stage 2: Copy all source versions before publishing the new replicas.
         copy_range(
+            &self.workflow.client,
             &workflow.node,
             FetchRangeCtx {
                 table_id: ctx.table_id,

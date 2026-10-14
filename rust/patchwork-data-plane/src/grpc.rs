@@ -1,12 +1,14 @@
 //! gRPC handlers use the same shard actor and replica writer as the HTTP API.
+use crate::write_handler::{self, WriteHandler};
 use crate::{
     data,
     read_shard::{CountRange, Get, GetPartitionKey, GetRange, GetRangeSize, ReadShardPool},
-    shard_actor::*,
-    subordinate_shard_writer::{Put, SubordinateShardWriter},
+    subordinate_shard_writer::SubordinateShardWriter,
+    write_shard::*,
 };
-use kameo::actor::ActorRef;
+use kameo::actor::{ActorRef, Spawn};
 use kameo_actors::pool::Dispatch;
+use patchwork_common::dataplane_client::Record;
 use patchwork_common::grpc::{
     MAX_MESSAGE_SIZE,
     proto::{
@@ -17,15 +19,24 @@ use patchwork_common::grpc::{
 use tonic::{Request, Response, Status};
 
 pub fn router(
-    shard: ActorRef<ShardActor>,
+    shard: ActorRef<WriteShard>,
     readers: ReadShardPool,
     writer: ActorRef<SubordinateShardWriter>,
+) -> axum::Router {
+    let handler = WriteHandler::spawn(WriteHandler::new(shard.clone(), writer));
+    router_with_handler(shard, readers, handler)
+}
+
+pub fn router_with_handler(
+    shard: ActorRef<WriteShard>,
+    readers: ReadShardPool,
+    handler: ActorRef<WriteHandler>,
 ) -> axum::Router {
     tonic::service::Routes::new(
         DataPlaneServer::new(Service {
             shard,
             readers,
-            writer,
+            handler,
         })
         .max_decoding_message_size(MAX_MESSAGE_SIZE)
         .max_encoding_message_size(MAX_MESSAGE_SIZE),
@@ -34,9 +45,9 @@ pub fn router(
 }
 
 struct Service {
-    shard: ActorRef<ShardActor>,
+    shard: ActorRef<WriteShard>,
     readers: ReadShardPool,
-    writer: ActorRef<SubordinateShardWriter>,
+    handler: ActorRef<WriteHandler>,
 }
 
 fn internal_error(error: impl std::fmt::Display) -> Status {
@@ -91,36 +102,25 @@ impl Service {
         }
         let data = serde_json::from_slice(&request.data_json)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        if replicated {
-            crate::subordinate_shard_writer::write(
-                &self.shard,
-                &self.writer,
-                Put {
+        self.handler
+            .ask(write_handler::WriteRecord {
+                record: Record {
                     table_id: request.table_id,
                     partition_key: request.partition_key,
                     secondary_key: request.secondary_key,
                     data,
-                    replicas: request.replicas,
                     timestamp,
                     deleted: request.deleted,
                 },
-                inconsistent,
-            )
+                replicas: if replicated {
+                    request.replicas
+                } else {
+                    Vec::new()
+                },
+                consistent: !inconsistent,
+            })
             .await
             .map_err(internal_error)?;
-        } else {
-            self.shard
-                .ask(WriteRecord {
-                    table_id: request.table_id,
-                    partition_key: request.partition_key,
-                    secondary_key: request.secondary_key,
-                    data,
-                    timestamp,
-                    deleted: request.deleted,
-                })
-                .await
-                .map_err(internal_error)?;
-        }
         Ok(Response::new(proto::Empty {}))
     }
 }
@@ -173,8 +173,8 @@ impl DataPlane for Service {
     ) -> Result<Response<proto::Count>, Status> {
         let request = request.into_inner();
         let count = self
-            .shard
-            .ask(Delete {
+            .handler
+            .ask(write_handler::Delete {
                 table_id: request.table_id,
                 partition_key: request.partition_key,
                 secondary_key: request.secondary_key,
@@ -208,8 +208,8 @@ impl DataPlane for Service {
     ) -> Result<Response<proto::Count>, Status> {
         let request = request.into_inner();
         let count = self
-            .shard
-            .ask(DeletePartitionKey {
+            .handler
+            .ask(write_handler::DeletePartitionKey {
                 table_id: request.table_id,
                 partition_key: request.partition_key,
             })
@@ -244,8 +244,8 @@ impl DataPlane for Service {
         let request = request.into_inner();
         validate_range(&request)?;
         let count = self
-            .shard
-            .ask(DeleteRange {
+            .handler
+            .ask(write_handler::DeleteRange {
                 table_id: request.table_id,
                 lower_bound: request.lower_bound,
                 upper_bound: request.upper_bound,
@@ -296,8 +296,8 @@ impl DataPlane for Service {
         request: Request<proto::TableRequest>,
     ) -> Result<Response<proto::Count>, Status> {
         let count = self
-            .shard
-            .ask(DeleteTable {
+            .handler
+            .ask(write_handler::DeleteTable {
                 table_id: request.into_inner().table_id,
             })
             .await

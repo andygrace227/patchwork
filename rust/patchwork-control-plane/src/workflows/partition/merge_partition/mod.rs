@@ -24,6 +24,7 @@ pub struct MergePartitionContext {
 
 #[derive(Clone)]
 pub struct MergePartition {
+    pub client: Client,
     pub node: ActorRef<NodeActor>,
     pub partition: ActorRef<PartitionActor>,
 }

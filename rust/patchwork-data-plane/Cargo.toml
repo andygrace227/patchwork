@@ -16,6 +16,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
 tonic = "0.14"
 ringbuffer = "0.16.0"
+wal-db = "1.0.0"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

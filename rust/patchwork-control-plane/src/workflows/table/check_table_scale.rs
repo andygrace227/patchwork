@@ -6,7 +6,7 @@ use kameo::actor::ActorRef;
 
 use crate::{
     actors::{NodeActor, PartitionActor, TableActor, crud::Get, partition::GetTablePartitions},
-    dataplane_client::{self, AccessStatistics},
+    dataplane_client::{AccessStatistics, Client},
     workflows::executor::LongRunningWorkflowExecutor,
 };
 
@@ -22,6 +22,7 @@ pub struct CheckTableScaleContext {
 
 #[derive(Clone)]
 pub struct CheckTableScale {
+    pub client: Client,
     pub node: ActorRef<NodeActor>,
     pub partition: ActorRef<PartitionActor>,
     pub table: ActorRef<TableActor>,
@@ -91,9 +92,11 @@ impl ScaleCheck {
                 .ask(Get { id: node })
                 .await?
                 .context("Replica node no longer exists; table cleanup is incomplete")?;
-            let telemetry =
-                dataplane_client::Client::get_telemetry_for_table(&node.url, self.ctx.table_id)
-                    .await?;
+            let telemetry = self
+                .workflow
+                .client
+                .get_telemetry_for_table(&node.url, self.ctx.table_id)
+                .await?;
             for (p, t) in telemetry {
                 let entry = global_telemetry.entry(p).or_default();
                 entry.merge(&t.statistics);

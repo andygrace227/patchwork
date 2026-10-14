@@ -18,23 +18,36 @@ directory or a parent; exported environment variables take precedence.
 - ACCESS_STATS_RETENTION_SECONDS defaults to 2592000 (30 days) and must be positive.
 
 Startup opens one SQLite shard through SeaORM, enables WAL, creates its data table
-if missing, and keeps the single write connection in `ShardActor`. Reads use
+if missing, and keeps the single write connection in `WriteShard`. Reads use
 `kameo_actors::pool::ActorPool<ReadShard>` through `Dispatch` messages. Each reader
 opens one read-only connection to the same WAL database. Point reads, partition-key
 reads, range scans, counts, and payload-size queries use the pool in both APIs.
-Kameo selects a worker with the least queued work.
-Existing tables are not migrated automatically. Ctrl-C drains requests and queued
-replica writes before stopping the read pool and write actor, then flushes access
-statistics before stopping their actor.
+Kameo selects a worker with the least queued work. Data queries use bound parameters
+and SQLx's prepared statement cache on each connection; startup PRAGMA and VACUUM
+commands run unprepared.
+`WriteHandler` appends requests to `<SHARD_PATH>.write-wal` and queues individual
+messages to `WriteShard` and `SubordinateShardWriter`. Kameo owns the queues and
+replies. Local SQLite and neighbor requests run independently; consistent writes
+wait for both, while inconsistent writes wait only for local SQLite. Reads use
+the read pool directly.
+
+WAL appends do not force a disk sync. Automatic replay, retries, and checkpointing
+are not implemented; inconsistent neighbor requests are best effort.
+
+Existing tables are not migrated automatically. Ctrl-C drains requests and
+`WriteHandler` before stopping its network writer, the read pool, and `WriteShard`,
+then flushes access statistics before stopping their actor.
 
 Set `READ_SHARD_POOL_SIZE=8` in `.env` or the environment to change the reader
 count, then restart the data nodes. This is separate from Tokio's thread count.
 Await a write acknowledgement before issuing a dependent read.
 
 Control-to-data and data-to-data calls use gRPC exclusively, including replication,
-partition copying, cleanup, and telemetry. The shared client caches one HTTP/2
-channel per node; it never falls back to HTTP endpoints. gRPC and the HTTP endpoints
-below share `BIND_ADDR`, so existing node URLs and cluster tools still work.
+partition copying, cleanup, and telemetry. Each `Client` caches one HTTP/2
+channel per node; clones share its cache, and separately constructed clients own
+separate caches. Retain a client across requests. It never falls back to HTTP
+endpoints. gRPC and the HTTP endpoints below share `BIND_ADDR`, so existing node
+URLs and cluster tools still work.
 Restart all data nodes with this version before starting the updated control plane.
 
 The service definition is `patchwork-common/proto/dataplane.proto`. Keys, timestamps,
@@ -69,18 +82,20 @@ The shared client requires a timestamp argument:
 ```rust,ignore
 use patchwork_common::dataplane_client::Client;
 
-Client::upsert(url, table_id, partition_key, secondary_key, &data, timestamp).await?;
-Client::put_with_replicas(url, table_id, partition_key, secondary_key, &data, &replicas, timestamp).await?;
-Client::put_with_replicas_inconsistent(url, table_id, partition_key, secondary_key, &data, &replicas, timestamp).await?;
+let client = Client::new();
+client.upsert(url, table_id, partition_key, secondary_key, &data, timestamp).await?;
+client.put_with_replicas(url, table_id, partition_key, secondary_key, &data, &replicas, timestamp).await?;
+client.put_with_replicas_inconsistent(url, table_id, partition_key, secondary_key, &data, &replicas, timestamp).await?;
 ```
 
 The replica endpoints append `/with-replicas` or `/with-replicas-inconsistent`
 to the record path and accept `{"data": ..., "replicas": ["http://..."]}`.
 They use the same required timestamp header and pass it unchanged to every copy.
-The first waits for local storage and all supplied replicas. The second waits
-for local storage and the first supplied replica, then queues the others in
-`SubordinateShardWriter`. Its queue is in memory, without retries. Replica URLs
-must exclude the receiving node; the inconsistent call requires at least one.
+The first waits for local SQLite and all supplied neighbors. The second waits
+for local SQLite and queues neighbor requests independently. Replica URLs must
+exclude the receiving node; the inconsistent call requires at least one.
+Neighbors receive individual local-only `WriteRecord` RPCs, without forwarding
+writes again.
 A failed request can leave some copies saved.
 
 GET on the record path returns the record including `timestamp` (replacing the
@@ -134,10 +149,10 @@ calculate the average. Combining two nonempty write samples clears the median,
 since individual medians cannot determine the combined median. The merged
 `window_seconds` is the shortest contributing window; rates remain sums of the
 individual nodes' rates, measured over their own windows.
-`Client::get_telemetry(url)` returns these entries as `Vec<Telemetry>` from
+`client.get_telemetry(url)` returns these entries as `Vec<Telemetry>` from
 `patchwork_common::dataplane_client`.
 GET `/tables/{table_id}/telemetry` returns only that table's entries as an object
-keyed by partition key. `Client::get_telemetry_for_table(url, table_id)` returns
+keyed by partition key. `client.get_telemetry_for_table(url, table_id)` returns
 `HashMap<i64, Telemetry>`; no recent accesses returns an empty map.
 
 `AccessStatsActor` owns the host's in-memory `TelemetryCache` and its separate
@@ -160,7 +175,7 @@ immediately after a flush or restart. Stored history survives restart and is
 available through `AccessStatsActor`'s `GetHistory` message, filtered by table,
 partition key, and an overlapping time range. Stored sums use decimal text to
 preserve `i128` precision. To share statistics across multiple shards in one
-process, pass the same actor to `ShardActor::with_access_stats`.
+process, pass the same actor to `WriteShard::with_access_stats`.
 
 Shards use auto_vacuum=FULL to reclaim completely free pages on commit.
 Existing shards with auto-vacuum disabled are rebuilt once during startup; this

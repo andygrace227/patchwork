@@ -15,6 +15,7 @@ use crate::{
 };
 
 pub struct PutOneConsistent {
+    pub client: Client,
     pub partition: ActorRef<PartitionActor>,
     pub node: ActorRef<NodeActor>,
     pub table: ActorRef<TableActor>,
@@ -68,6 +69,7 @@ impl PutOneConsistent {
         )
         .await?;
         Self::to_replicas(
+            &self.client,
             &self.node,
             &Record {
                 table_id: ctx.table_id,
@@ -85,6 +87,7 @@ impl PutOneConsistent {
     // Copying supplies destinations explicitly: they may not be published yet.
     // Preserve the source timestamp and deletion marker on every replica.
     pub(crate) async fn to_replicas(
+        client: &Client,
         node_actor: &ActorRef<NodeActor>,
         record: &Record,
         replicas: &[i64],
@@ -107,7 +110,7 @@ impl PutOneConsistent {
         let (url, replicas) = urls.split_first().context("Partition has no replicas")?;
         time(
             "replica_grpc",
-            Client::write_with_replicas(
+            client.write_with_replicas(
                 url,
                 record.table_id,
                 record.partition_key,

@@ -15,6 +15,7 @@ use crate::{
 // Fetch the first record found, trying replicas in a random order.
 // Inconsistent reads reuse the five-second partition cache.
 pub struct GetOneInconsistent {
+    pub client: Client,
     pub partition: ActorRef<PartitionActor>,
     pub node: ActorRef<NodeActor>,
     pub table: ActorRef<TableActor>,
@@ -62,7 +63,7 @@ impl GetOneInconsistent {
 
             if let Ok(record) = time(
                 "replica_grpc",
-                Client::get_including_deleted(
+                self.client.get_including_deleted(
                     &node.url,
                     ctx.table_id,
                     ctx.primary_key,

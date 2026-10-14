@@ -194,6 +194,7 @@ impl Run {
         // Stage 3: Scan all old replicas and consistently write every version.
         // Timestamp ordering on the destinations also preserves tombstones.
         copy_range(
+            &self.workflow.client,
             &workflow.node,
             FetchRangeCtx {
                 table_id: ctx.table_id,
@@ -250,13 +251,10 @@ impl Run {
                 .ask(Get { id: *replica })
                 .await?
                 .context("Old replica node no longer exists")?;
-            dataplane_client::Client::delete_range(
-                &node.url,
-                ctx.table_id,
-                end_hash_range,
-                ctx.new_partition,
-            )
-            .await?;
+            self.workflow
+                .client
+                .delete_range(&node.url, ctx.table_id, end_hash_range, ctx.new_partition)
+                .await?;
         }
         Ok(State::Unlock)
     }

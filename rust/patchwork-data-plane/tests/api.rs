@@ -6,11 +6,11 @@ use axum::{
 use kameo::actor::Spawn;
 use patchwork_data_plane::{
     api,
-    shard_actor::ShardActor,
     telemetry::{
         AccessStatsActor,
         access_stats_actor::{Flush, GetHistory},
     },
+    write_shard::WriteShard,
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -70,11 +70,11 @@ async fn telemetry_tracks_local_accesses_and_preserves_history_when_data_is_dele
     let path = dir.path().join("shard.sqlite").to_str().unwrap().to_owned();
     let stats_path = dir.path().join("access-stats.sqlite");
     let access_stats = AccessStatsActor::spawn(AccessStatsActor::new(&stats_path).await.unwrap());
-    let shard = ShardActor::with_access_stats(path.clone(), access_stats.clone())
+    let shard = WriteShard::with_access_stats(path.clone(), access_stats.clone())
         .await
         .unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
-    let shard = ShardActor::spawn(shard);
+    let shard = WriteShard::spawn(shard);
     let app = api::router(shard.clone(), shard_readers.clone());
     assert_eq!(
         request(&app, "GET", "/shard/telemetry", None).await,
@@ -192,11 +192,11 @@ async fn telemetry_tracks_local_accesses_and_preserves_history_when_data_is_dele
             .len(),
         1
     );
-    let reopened = ShardActor::with_access_stats(path, access_stats.clone())
+    let reopened = WriteShard::with_access_stats(path, access_stats.clone())
         .await
         .unwrap();
     let reopened_readers = reopened.read_pool(2).unwrap();
-    let reopened = ShardActor::spawn(reopened);
+    let reopened = WriteShard::spawn(reopened);
     let app = api::router(reopened.clone(), reopened_readers.clone());
     assert_eq!(
         request(&app, "GET", "/shard/telemetry", None).await.1,
@@ -234,9 +234,9 @@ async fn operations_are_scoped_and_persist_after_reopening() {
         .to_str()
         .unwrap()
         .to_owned();
-    let shard = ShardActor::new(path.clone()).await.unwrap();
+    let shard = WriteShard::new(path.clone()).await.unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
-    let shard = ShardActor::spawn(shard);
+    let shard = WriteShard::spawn(shard);
     let app = api::router(shard.clone(), shard_readers.clone());
     for (table_id, partition_key, secondary_key) in
         [(1, 10, -1), (1, 10, 2), (1, 20, 3), (2, 10, -1)]
@@ -371,9 +371,9 @@ async fn operations_are_scoped_and_persist_after_reopening() {
     shard.stop_gracefully().await.unwrap();
     shard.wait_for_shutdown().await;
 
-    let shard = ShardActor::new(path).await.unwrap();
+    let shard = WriteShard::new(path).await.unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
-    let shard = ShardActor::spawn(shard);
+    let shard = WriteShard::spawn(shard);
     let app = api::router(shard.clone(), shard_readers.clone());
     assert_eq!(
         request(&app, "GET", "/tables/2/partition-keys/10/records/-1", None)
@@ -416,7 +416,7 @@ async fn operations_are_scoped_and_persist_after_reopening() {
 #[tokio::test]
 async fn timestamp_wins_regardless_of_arrival_order() {
     let dir = tempfile::tempdir().unwrap();
-    let shard = ShardActor::new(
+    let shard = WriteShard::new(
         dir.path()
             .join("timestamps.sqlite")
             .to_str()
@@ -426,7 +426,7 @@ async fn timestamp_wins_regardless_of_arrival_order() {
     .await
     .unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
-    let shard = ShardActor::spawn(shard);
+    let shard = WriteShard::spawn(shard);
     let app = api::router(shard.clone(), shard_readers.clone());
     for (key, writes) in [
         (1, vec![(20, "new"), (10, "old"), (20, "new")]),
@@ -482,9 +482,9 @@ async fn tombstones_win_ties_and_survive_reopening() {
         .to_str()
         .unwrap()
         .to_owned();
-    let shard = ShardActor::new(path.clone()).await.unwrap();
+    let shard = WriteShard::new(path.clone()).await.unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
-    let shard = ShardActor::spawn(shard);
+    let shard = WriteShard::spawn(shard);
     let app = api::router(shard.clone(), shard_readers.clone());
     let record = "/tables/1/partition-keys/10/records/1";
     // Delete before the original write arrives, including an exact timestamp tie.
@@ -577,9 +577,9 @@ async fn tombstones_win_ties_and_survive_reopening() {
     shard_readers.wait_for_shutdown().await;
     shard.stop_gracefully().await.unwrap();
     shard.wait_for_shutdown().await;
-    let shard = ShardActor::new(path).await.unwrap();
+    let shard = WriteShard::new(path).await.unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
-    let shard = ShardActor::spawn(shard);
+    let shard = WriteShard::spawn(shard);
     let app = api::router(shard.clone(), shard_readers.clone());
     request_at(&app, "PUT", record, Some(json!("late")), 30).await;
     assert_eq!(

@@ -116,6 +116,7 @@ impl Run {
         // Stage 2: Copy every source replica into the previous partition's replicas.
         // Keep the source boundary until every destination acknowledges the copy.
         copy_range(
+            &self.workflow.client,
             &workflow.node,
             FetchRangeCtx {
                 table_id: ctx.table_id,
@@ -155,7 +156,9 @@ impl Run {
         // Shared replicas are excluded from obsolete: they must keep their copies.
         for node in &self.obsolete {
             check_lease(lease_end)?;
-            Client::delete_range(&node.url, ctx.table_id, next.hash_start, source.hash_start)
+            self.workflow
+                .client
+                .delete_range(&node.url, ctx.table_id, next.hash_start, source.hash_start)
                 .await
                 .context("Merge completed, but old replica cleanup failed")?;
         }

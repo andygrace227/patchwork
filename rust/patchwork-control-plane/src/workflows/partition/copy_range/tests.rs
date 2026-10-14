@@ -1,12 +1,13 @@
 use super::*;
 use crate::{actors::crud::Create, datamodels::node, dataplane_client::Client};
 use kameo::actor::Spawn;
-use patchwork_data_plane::{api, shard_actor::ShardActor};
+use patchwork_data_plane::{api, write_shard::WriteShard};
 use sea_orm::{ActiveValue::Set, ConnectionTrait, Database, Schema};
 use serde_json::json;
 
 #[tokio::test]
 async fn copy_reads_all_sources_preserves_deletes_and_newer_destination_writes() {
+    let client = Client::new();
     let dir = tempfile::tempdir().unwrap();
     let db = Database::connect("sqlite::memory:").await.unwrap();
     let schema = Schema::new(db.get_database_backend());
@@ -19,7 +20,7 @@ async fn copy_reads_all_sources_preserves_deletes_and_newer_destination_writes()
     let mut urls = Vec::new();
     let mut ids = Vec::new();
     for i in 0..4 {
-        let shard = ShardActor::new(
+        let shard = WriteShard::new(
             dir.path()
                 .join(format!("{i}.sqlite"))
                 .to_str()
@@ -29,7 +30,7 @@ async fn copy_reads_all_sources_preserves_deletes_and_newer_destination_writes()
         .await
         .unwrap();
         let shard_readers = shard.read_pool(2).unwrap();
-        let shard = ShardActor::spawn(shard);
+        let shard = WriteShard::spawn(shard);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let app = api::router(shard.clone(), shard_readers.clone());
@@ -51,26 +52,33 @@ async fn copy_reads_all_sources_preserves_deletes_and_newer_destination_writes()
         );
         urls.push(url);
     }
-    Client::upsert(&urls[0], 1, 10, 1, &json!("old"), 1)
+    client
+        .upsert(&urls[0], 1, 10, 1, &json!("old"), 1)
         .await
         .unwrap();
-    Client::upsert(&urls[1], 1, 10, 1, &json!("new"), 2)
+    client
+        .upsert(&urls[1], 1, 10, 1, &json!("new"), 2)
         .await
         .unwrap();
-    Client::upsert(&urls[0], 1, 10, 2, &json!("live"), 3)
+    client
+        .upsert(&urls[0], 1, 10, 2, &json!("live"), 3)
         .await
         .unwrap();
-    Client::delete(&urls[1], 1, 10, 2, 3).await.unwrap();
-    Client::upsert(&urls[1], 1, 10, 3, &json!("only second source"), 4)
+    client.delete(&urls[1], 1, 10, 2, 3).await.unwrap();
+    client
+        .upsert(&urls[1], 1, 10, 3, &json!("only second source"), 4)
         .await
         .unwrap();
-    Client::upsert(&urls[2], 1, 10, 1, &json!("newer destination"), 10)
+    client
+        .upsert(&urls[2], 1, 10, 1, &json!("newer destination"), 10)
         .await
         .unwrap();
-    Client::upsert(&urls[1], 2, 10, 1, &json!("other table"), 5)
+    client
+        .upsert(&urls[1], 2, 10, 1, &json!("other table"), 5)
         .await
         .unwrap();
-    Client::upsert(&urls[1], 1, 20, 1, &json!("outside range"), 5)
+    client
+        .upsert(&urls[1], 1, 20, 1, &json!("outside range"), 5)
         .await
         .unwrap();
     let lease_end = std::time::SystemTime::now()
@@ -79,6 +87,7 @@ async fn copy_reads_all_sources_preserves_deletes_and_newer_destination_writes()
         .as_secs() as i64
         + 60;
     copy_range(
+        &client,
         &nodes,
         FetchRangeCtx {
             table_id: 1,
@@ -91,21 +100,22 @@ async fn copy_reads_all_sources_preserves_deletes_and_newer_destination_writes()
     )
     .await
     .unwrap();
-    assert_eq!(Client::get(&urls[2], 1, 10, 1).await.unwrap().timestamp, 10);
-    assert_eq!(Client::get(&urls[3], 1, 10, 1).await.unwrap().timestamp, 2);
+    assert_eq!(client.get(&urls[2], 1, 10, 1).await.unwrap().timestamp, 10);
+    assert_eq!(client.get(&urls[3], 1, 10, 1).await.unwrap().timestamp, 2);
     for url in &urls[2..] {
-        let deleted = Client::get_including_deleted(url, 1, 10, 2).await.unwrap();
+        let deleted = client.get_including_deleted(url, 1, 10, 2).await.unwrap();
         assert!(deleted.deleted);
         assert_eq!(deleted.timestamp, 3);
-        assert_eq!(Client::get(url, 1, 10, 3).await.unwrap().timestamp, 4);
+        assert_eq!(client.get(url, 1, 10, 3).await.unwrap().timestamp, 4);
         assert_eq!(
-            Client::get_range_including_deleted(url, 1, 21, 10)
+            client
+                .get_range_including_deleted(url, 1, 21, 10)
                 .await
                 .unwrap()
                 .len(),
             3
         );
-        assert!(Client::get_range(url, 2, 20, 10).await.unwrap().is_empty());
+        assert!(client.get_range(url, 2, 20, 10).await.unwrap().is_empty());
     }
     for server in servers {
         server.abort();

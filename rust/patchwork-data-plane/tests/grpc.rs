@@ -4,20 +4,21 @@ use patchwork_common::{
     grpc::proto::{self, data_plane_client::DataPlaneClient},
 };
 use patchwork_data_plane::{
-    grpc, shard_actor::ShardActor, subordinate_shard_writer::SubordinateShardWriter,
+    grpc, subordinate_shard_writer::SubordinateShardWriter, write_shard::WriteShard,
 };
 use serde_json::json;
 use tonic::Code;
 
 #[tokio::test]
 async fn grpc_validates_writes_and_carries_large_payloads_and_exact_telemetry() {
+    let client = Client::new();
     let dir = tempfile::tempdir().unwrap();
-    let shard = ShardActor::new(dir.path().join("shard.sqlite").to_str().unwrap().into())
+    let shard = WriteShard::new(dir.path().join("shard.sqlite").to_str().unwrap().into())
         .await
         .unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
-    let shard = ShardActor::spawn(shard);
-    let writer = SubordinateShardWriter::spawn(SubordinateShardWriter);
+    let shard = WriteShard::spawn(shard);
+    let writer = SubordinateShardWriter::spawn(SubordinateShardWriter::default());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     // This listener has no HTTP/JSON routes: every shared-client call must be gRPC.
@@ -45,12 +46,12 @@ async fn grpc_validates_writes_and_carries_large_payloads_and_exact_telemetry() 
         Code::InvalidArgument
     );
     assert_eq!(
-        Client::get(&url, 1, 10, 42).await.unwrap_err().code(),
+        client.get(&url, 1, 10, 42).await.unwrap_err().code(),
         Code::NotFound
     );
     request.data_json = b"null".to_vec();
     raw.write_record(request).await.unwrap();
-    assert_eq!(Client::get(&url, 1, 10, 42).await.unwrap().timestamp, 0);
+    assert_eq!(client.get(&url, 1, 10, 42).await.unwrap().timestamp, 0);
     assert_eq!(
         raw.delete_record(proto::DeleteRequest {
             table_id: 1,
@@ -63,26 +64,28 @@ async fn grpc_validates_writes_and_carries_large_payloads_and_exact_telemetry() 
         .code(),
         Code::InvalidArgument
     );
-    assert_eq!(Client::get(&url, 1, 10, 42).await.unwrap().timestamp, 0);
+    assert_eq!(client.get(&url, 1, 10, 42).await.unwrap().timestamp, 0);
 
     // Exceed tonic's default 4 MiB decoding limit in both directions.
     let payload = json!("x".repeat(5 * 1024 * 1024));
-    Client::upsert(&url, 2, 10, 1, &payload, i64::MAX)
+    client
+        .upsert(&url, 2, 10, 1, &payload, i64::MAX)
         .await
         .unwrap();
-    let record = Client::get(&url, 2, 10, 1).await.unwrap();
+    let record = client.get(&url, 2, 10, 1).await.unwrap();
     assert_eq!(record.data, payload);
     assert_eq!(record.timestamp, i64::MAX);
     assert_eq!(
-        Client::get_range(&url, 2, 11, 10).await.unwrap(),
+        client.get_range(&url, 2, 11, 10).await.unwrap(),
         vec![record]
     );
     for key in [i64::MAX - 2, i64::MAX - 1, i64::MAX] {
-        Client::upsert(&url, 3, i64::MIN, key, &json!(true), 1)
+        client
+            .upsert(&url, 3, i64::MIN, key, &json!(true), 1)
             .await
             .unwrap();
     }
-    let telemetry = Client::get_telemetry_for_table(&url, 3).await.unwrap();
+    let telemetry = client.get_telemetry_for_table(&url, 3).await.unwrap();
     let stats = &telemetry[&i64::MIN].statistics;
     assert_eq!(stats.write_position_sum, i64::MAX as i128 * 3 - 3);
     assert_eq!(stats.average_write_position, Some(i64::MAX - 1));

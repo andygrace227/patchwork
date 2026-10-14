@@ -9,16 +9,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::HashMap,
-    sync::{LazyLock, Mutex},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tonic::{
     Response, Status,
     transport::{Channel, Endpoint},
 };
-
-static CHANNELS: LazyLock<Mutex<HashMap<String, Channel>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Matches the data plane's data::Model, including its caller-supplied write timestamp.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -99,12 +96,21 @@ pub struct Telemetry {
     pub statistics: AccessStatistics,
 }
 
-pub struct Client;
+/// A reusable data-plane client. Clones share cached connections by node URL.
+#[derive(Clone, Default)]
+pub struct Client {
+    channels: Arc<Mutex<HashMap<String, Channel>>>,
+}
 
 impl Client {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// Save on this node and all supplied replica URLs (excluding this node).
     /// An error may leave some copies written. An empty list writes locally only.
     pub async fn put_with_replicas(
+        &self,
         url: &str,
         table_id: i64,
         partition_key: i64,
@@ -113,7 +119,7 @@ impl Client {
         replicas: &[String],
         timestamp: i64,
     ) -> Result<(), Status> {
-        Self::write_with_replicas(
+        self.write_with_replicas(
             url,
             table_id,
             partition_key,
@@ -127,6 +133,7 @@ impl Client {
     }
 
     pub async fn write_with_replicas(
+        &self,
         url: &str,
         table_id: i64,
         partition_key: i64,
@@ -137,7 +144,7 @@ impl Client {
         deleted: bool,
     ) -> Result<(), Status> {
         rpc(
-            grpc(url)?.write_with_replicas(write_request(
+            self.grpc(url)?.write_with_replicas(write_request(
                 table_id,
                 partition_key,
                 secondary_key,
@@ -152,10 +159,11 @@ impl Client {
         Ok(())
     }
 
-    /// Wait for local storage and the first replica, then queue the remaining writes.
-    /// Requires at least one remote URL, excluding this node. Order selects failover.
-    /// Remaining writes are best effort; the queue is not durable.
+    /// Wait for local storage, then let the neighbor actor send remote writes.
+    /// Requires at least one remote URL, excluding this node.
+    /// Neighbor requests are queued independently; their failures are logged.
     pub async fn put_with_replicas_inconsistent(
+        &self,
         url: &str,
         table_id: i64,
         partition_key: i64,
@@ -164,7 +172,7 @@ impl Client {
         replicas: &[String],
         timestamp: i64,
     ) -> Result<(), Status> {
-        Self::write_with_replicas_inconsistent(
+        self.write_with_replicas_inconsistent(
             url,
             table_id,
             partition_key,
@@ -178,6 +186,7 @@ impl Client {
     }
 
     pub async fn write_with_replicas_inconsistent(
+        &self,
         url: &str,
         table_id: i64,
         partition_key: i64,
@@ -188,15 +197,16 @@ impl Client {
         deleted: bool,
     ) -> Result<(), Status> {
         rpc(
-            grpc(url)?.write_with_replicas_inconsistent(write_request(
-                table_id,
-                partition_key,
-                secondary_key,
-                data,
-                timestamp,
-                deleted,
-                replicas,
-            )?),
+            self.grpc(url)?
+                .write_with_replicas_inconsistent(write_request(
+                    table_id,
+                    partition_key,
+                    secondary_key,
+                    data,
+                    timestamp,
+                    deleted,
+                    replicas,
+                )?),
             30,
         )
         .await?;
@@ -204,9 +214,10 @@ impl Client {
     }
 
     /// Delete all records for this table on one node; returns {"deleted": N}.
-    pub async fn delete_table(url: &str, table_id: i64) -> Result<Value, Status> {
+    pub async fn delete_table(&self, url: &str, table_id: i64) -> Result<Value, Status> {
         let result = rpc(
-            grpc(url)?.delete_table(proto::TableRequest { table_id }),
+            self.grpc(url)?
+                .delete_table(proto::TableRequest { table_id }),
             30,
         )
         .await?;
@@ -214,14 +225,14 @@ impl Client {
     }
 
     /// Returns {"size_bytes": N} for the main SQLite file, excluding WAL and SHM.
-    pub async fn get_size(url: &str) -> Result<Value, Status> {
-        let result = rpc(grpc(url)?.get_size(proto::Empty {}), 30).await?;
+    pub async fn get_size(&self, url: &str) -> Result<Value, Status> {
+        let result = rpc(self.grpc(url)?.get_size(proto::Empty {}), 30).await?;
         Ok(serde_json::json!({"size_bytes": result.size_bytes}))
     }
 
     /// Recent local accesses, grouped by table and partition key.
-    pub async fn get_telemetry(url: &str) -> Result<Vec<Telemetry>, Status> {
-        rpc(grpc(url)?.get_telemetry(proto::Empty {}), 30)
+    pub async fn get_telemetry(&self, url: &str) -> Result<Vec<Telemetry>, Status> {
+        rpc(self.grpc(url)?.get_telemetry(proto::Empty {}), 30)
             .await?
             .entries
             .into_iter()
@@ -231,11 +242,13 @@ impl Client {
 
     /// Recent local accesses for one table, keyed by partition key.
     pub async fn get_telemetry_for_table(
+        &self,
         url: &str,
         table_id: i64,
     ) -> Result<HashMap<i64, Telemetry>, Status> {
         rpc(
-            grpc(url)?.get_telemetry_for_table(proto::TableRequest { table_id }),
+            self.grpc(url)?
+                .get_telemetry_for_table(proto::TableRequest { table_id }),
             30,
         )
         .await?
@@ -250,13 +263,15 @@ impl Client {
 
     /// Returns {"count": N} records in [lower_bound, upper_bound).
     pub async fn count_range(
+        &self,
         url: &str,
         table_id: i64,
         upper_bound: i64,
         lower_bound: i64,
     ) -> Result<Value, Status> {
         let result = rpc(
-            grpc(url)?.count_range(range_request(table_id, upper_bound, lower_bound, false)),
+            self.grpc(url)?
+                .count_range(range_request(table_id, upper_bound, lower_bound, false)),
             30,
         )
         .await?;
@@ -265,13 +280,19 @@ impl Client {
 
     /// Returns {"size_bytes": N} stored JSON payload bytes, excluding keys and SQLite overhead.
     pub async fn get_range_size(
+        &self,
         url: &str,
         table_id: i64,
         upper_bound: i64,
         lower_bound: i64,
     ) -> Result<Value, Status> {
         let result = rpc(
-            grpc(url)?.get_range_size(range_request(table_id, upper_bound, lower_bound, false)),
+            self.grpc(url)?.get_range_size(range_request(
+                table_id,
+                upper_bound,
+                lower_bound,
+                false,
+            )),
             30,
         )
         .await?;
@@ -280,6 +301,7 @@ impl Client {
 
     /// Preserve this timestamp when retrying or copying a previously written record.
     pub async fn upsert(
+        &self,
         url: &str,
         table_id: i64,
         partition_key: i64,
@@ -287,7 +309,7 @@ impl Client {
         data: &Value,
         timestamp: i64,
     ) -> Result<(), Status> {
-        Self::write_record(
+        self.write_record(
             url,
             table_id,
             partition_key,
@@ -300,6 +322,7 @@ impl Client {
     }
 
     pub async fn write_record(
+        &self,
         url: &str,
         table_id: i64,
         partition_key: i64,
@@ -309,7 +332,7 @@ impl Client {
         deleted: bool,
     ) -> Result<(), Status> {
         rpc(
-            grpc(url)?.write_record(write_request(
+            self.grpc(url)?.write_record(write_request(
                 table_id,
                 partition_key,
                 secondary_key,
@@ -327,13 +350,14 @@ impl Client {
     /// Returns the full record, including its caller-supplied write timestamp.
     /// A missing record returns gRPC NotFound.
     pub async fn get(
+        &self,
         url: &str,
         table_id: i64,
         partition_key: i64,
         secondary_key: i64,
     ) -> Result<Record, Status> {
         rpc(
-            grpc(url)?.get_record(proto::RecordRequest {
+            self.grpc(url)?.get_record(proto::RecordRequest {
                 table_id,
                 partition_key,
                 secondary_key,
@@ -346,6 +370,7 @@ impl Client {
     }
 
     pub async fn delete(
+        &self,
         url: &str,
         table_id: i64,
         partition_key: i64,
@@ -353,7 +378,7 @@ impl Client {
         timestamp: i64,
     ) -> Result<Value, Status> {
         let result = rpc(
-            grpc(url)?.delete_record(proto::DeleteRequest {
+            self.grpc(url)?.delete_record(proto::DeleteRequest {
                 table_id,
                 partition_key,
                 secondary_key,
@@ -366,6 +391,7 @@ impl Client {
     }
 
     pub async fn delete_with_replicas(
+        &self,
         url: &str,
         table_id: i64,
         partition_key: i64,
@@ -373,7 +399,7 @@ impl Client {
         replicas: &[String],
         timestamp: i64,
     ) -> Result<(), Status> {
-        Self::write_with_replicas(
+        self.write_with_replicas(
             url,
             table_id,
             partition_key,
@@ -387,6 +413,7 @@ impl Client {
     }
 
     pub async fn delete_with_replicas_inconsistent(
+        &self,
         url: &str,
         table_id: i64,
         partition_key: i64,
@@ -394,7 +421,7 @@ impl Client {
         replicas: &[String],
         timestamp: i64,
     ) -> Result<(), Status> {
-        Self::write_with_replicas_inconsistent(
+        self.write_with_replicas_inconsistent(
             url,
             table_id,
             partition_key,
@@ -409,13 +436,14 @@ impl Client {
 
     /// Read the stored record, including a tombstone, for reconciliation.
     pub async fn get_including_deleted(
+        &self,
         url: &str,
         table_id: i64,
         partition_key: i64,
         secondary_key: i64,
     ) -> Result<Record, Status> {
         rpc(
-            grpc(url)?.get_record(proto::RecordRequest {
+            self.grpc(url)?.get_record(proto::RecordRequest {
                 table_id,
                 partition_key,
                 secondary_key,
@@ -429,13 +457,15 @@ impl Client {
 
     /// Copy/reconciliation reads must include deletion markers.
     pub async fn get_range_including_deleted(
+        &self,
         url: &str,
         table_id: i64,
         upper_bound: i64,
         lower_bound: i64,
     ) -> Result<Vec<Record>, Status> {
         rpc(
-            grpc(url)?.get_range(range_request(table_id, upper_bound, lower_bound, true)),
+            self.grpc(url)?
+                .get_range(range_request(table_id, upper_bound, lower_bound, true)),
             30,
         )
         .await?
@@ -446,12 +476,13 @@ impl Client {
     }
 
     pub async fn get_partition_key(
+        &self,
         url: &str,
         table_id: i64,
         partition_key: i64,
     ) -> Result<Vec<Record>, Status> {
         rpc(
-            grpc(url)?.get_partition_key(proto::PartitionRequest {
+            self.grpc(url)?.get_partition_key(proto::PartitionRequest {
                 table_id,
                 partition_key,
                 include_deleted: false,
@@ -466,31 +497,35 @@ impl Client {
     }
 
     pub async fn delete_partition_key(
+        &self,
         url: &str,
         table_id: i64,
         partition_key: i64,
     ) -> Result<Value, Status> {
         let result = rpc(
-            grpc(url)?.delete_partition_key(proto::PartitionRequest {
-                table_id,
-                partition_key,
-                include_deleted: false,
-            }),
+            self.grpc(url)?
+                .delete_partition_key(proto::PartitionRequest {
+                    table_id,
+                    partition_key,
+                    include_deleted: false,
+                }),
             30,
         )
         .await?;
         Ok(serde_json::json!({"deleted": result.count}))
     }
 
-    /// Bounds are [lower_bound, upper_bound); argument order matches ShardActor::get_range.
+    /// Bounds are [lower_bound, upper_bound); argument order matches ReadShard::get_range.
     pub async fn get_range(
+        &self,
         url: &str,
         table_id: i64,
         upper_bound: i64,
         lower_bound: i64,
     ) -> Result<Vec<Record>, Status> {
         rpc(
-            grpc(url)?.get_range(range_request(table_id, upper_bound, lower_bound, false)),
+            self.grpc(url)?
+                .get_range(range_request(table_id, upper_bound, lower_bound, false)),
             30,
         )
         .await?
@@ -502,41 +537,44 @@ impl Client {
 
     /// Deletes partition keys in [lower_bound, upper_bound); returns {"deleted": N}.
     pub async fn delete_range(
+        &self,
         url: &str,
         table_id: i64,
         upper_bound: i64,
         lower_bound: i64,
     ) -> Result<Value, Status> {
         let result = rpc(
-            grpc(url)?.delete_range(range_request(table_id, upper_bound, lower_bound, false)),
+            self.grpc(url)?
+                .delete_range(range_request(table_id, upper_bound, lower_bound, false)),
             30,
         )
         .await?;
         Ok(serde_json::json!({"deleted": result.count}))
     }
-}
 
-// Cloning a channel shares its HTTP/2 connection and allows concurrent requests.
-fn grpc(url: &str) -> Result<DataPlaneClient<Channel>, Status> {
-    let url = url.trim_end_matches('/');
-    let mut channels = CHANNELS
-        .lock()
-        .map_err(|_| Status::internal("channel cache poisoned"))?;
-    let channel = match channels.get(url) {
-        Some(channel) => channel.clone(),
-        None => {
-            let endpoint = Endpoint::new(url.to_owned())
-                .map_err(|error| Status::invalid_argument(error.to_string()))?
-                .connect_timeout(Duration::from_secs(5))
-                .tcp_nodelay(true);
-            let channel = endpoint.connect_lazy();
-            channels.insert(url.to_owned(), channel.clone());
-            channel
-        }
-    };
-    Ok(DataPlaneClient::new(channel)
-        .max_decoding_message_size(MAX_MESSAGE_SIZE)
-        .max_encoding_message_size(MAX_MESSAGE_SIZE))
+    // Cloning a channel shares its HTTP/2 connection and allows concurrent requests.
+    fn grpc(&self, url: &str) -> Result<DataPlaneClient<Channel>, Status> {
+        let url = url.trim_end_matches('/');
+        let mut channels = self
+            .channels
+            .lock()
+            .map_err(|_| Status::internal("channel cache poisoned"))?;
+        let channel = match channels.get(url) {
+            Some(channel) => channel.clone(),
+            None => {
+                let endpoint = Endpoint::new(url.to_owned())
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?
+                    .connect_timeout(Duration::from_secs(5))
+                    .tcp_nodelay(true);
+                let channel = endpoint.connect_lazy();
+                channels.insert(url.to_owned(), channel.clone());
+                channel
+            }
+        };
+        Ok(DataPlaneClient::new(channel)
+            .max_decoding_message_size(MAX_MESSAGE_SIZE)
+            .max_encoding_message_size(MAX_MESSAGE_SIZE))
+    }
 }
 
 async fn rpc<T>(

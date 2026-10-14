@@ -7,6 +7,7 @@ use kameo::actor::{ActorRef, WeakActorRef};
 
 use crate::{
     actors::{NodeActor, PartitionActor, TableActor, table::GetRandomReadyTable},
+    dataplane_client::Client,
     workflows::{
         executor::{LongRunningWorkflowExecutor, SubmitWorkflow},
         table::check_table_scale::{CheckTableScale, CheckTableScaleContext},
@@ -33,6 +34,7 @@ pub(crate) async fn run_random_scale_checks(
         .register(
             State::Submit,
             SubmitRandomCheck {
+                client: Client::new(),
                 node,
                 partition,
                 table,
@@ -76,6 +78,7 @@ impl RandomDelay {
 }
 
 struct SubmitRandomCheck {
+    client: Client,
     node: ActorRef<NodeActor>,
     partition: ActorRef<PartitionActor>,
     table: ActorRef<TableActor>,
@@ -97,6 +100,7 @@ impl SubmitRandomCheck {
                 if let Err(error) = executor
                     .ask(SubmitWorkflow::new(
                         CheckTableScale {
+                            client: self.client.clone(),
                             node: self.node.clone(),
                             partition: self.partition.clone(),
                             table: self.table.clone(),

@@ -1,7 +1,7 @@
 use super::copy_range::copy_range;
 use crate::workflows::data::fetch_range::FetchRangeCtx;
 use crate::workflows::stages::{unlock, workflow_steps};
-use crate::{actors::crud::Get, dataplane_client};
+use crate::{actors::crud::Get, dataplane_client::Client};
 use crate::{
     actors::{
         NodeActor, PartitionActor, TableActor,
@@ -28,6 +28,7 @@ pub struct SplitPartitionContext {
 
 #[derive(Clone)]
 pub struct SplitPartition {
+    pub client: Client,
     pub node: ActorRef<NodeActor>,
     pub partition: ActorRef<PartitionActor>,
     pub table: ActorRef<TableActor>,
