@@ -1,8 +1,12 @@
 use kameo::actor::Spawn;
-use patchwork_control_plane::db::{
-    NodeActor, PartitionActor, TableActor,
-    actor::{Create, Delete, Get, GetCached, Update},
-    node, partition, table,
+use patchwork_common::{
+    actors::{
+        NodeActor, PartitionActor, TableActor,
+        crud::{Create, Delete, Get, GetCached, Update},
+        node::GetRandomNodes,
+        partition::{GetPartitionAtOrBeforeCached, GetTablePartitions, GetTablePartitionsUncached},
+    },
+    datamodels::{node, partition, table},
 };
 use sea_orm::{ActiveValue::Set, ConnectOptions, ConnectionTrait, Database, Schema};
 
@@ -165,7 +169,7 @@ async fn all_models_support_crud_and_overlapping_requests() {
             .unwrap();
     }
     let ring = partitions
-        .ask(partition::GetTablePartitions { table_id: 1 })
+        .ask(GetTablePartitions { table_id: 1 })
         .await
         .unwrap();
     assert_eq!(
@@ -175,7 +179,7 @@ async fn all_models_support_crud_and_overlapping_requests() {
     assert!(ring.iter().all(|p| p.table_id == 1));
     assert!(
         partitions
-            .ask(partition::GetTablePartitions { table_id: 99 })
+            .ask(GetTablePartitions { table_id: 99 })
             .await
             .unwrap()
             .is_empty()
@@ -223,11 +227,7 @@ async fn all_models_support_crud_and_overlapping_requests() {
     assert_eq!(d.unwrap(), Some(table.clone()));
 
     assert_eq!(
-        nodes
-            .ask(node::GetRandomNodes { count: 3 })
-            .await
-            .unwrap()
-            .len(),
+        nodes.ask(GetRandomNodes { count: 3 }).await.unwrap().len(),
         1
     );
     for idx in 0..4 {
@@ -241,7 +241,7 @@ async fn all_models_support_crud_and_overlapping_requests() {
             .await
             .unwrap();
     }
-    let selected = nodes.ask(node::GetRandomNodes { count: 3 }).await.unwrap();
+    let selected = nodes.ask(GetRandomNodes { count: 3 }).await.unwrap();
     assert_eq!(selected.len(), 3);
     let unique: std::collections::HashSet<_> = selected.iter().map(|node| node.node_id).collect();
     assert_eq!(unique.len(), 3);
@@ -280,7 +280,7 @@ async fn all_models_support_crud_and_overlapping_requests() {
 async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
     use std::time::Duration;
     assert_eq!(
-        patchwork_control_plane::db::actor::CACHE_TTL,
+        patchwork_common::actors::crud::CACHE_TTL,
         Duration::from_secs(5)
     );
     let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -333,7 +333,7 @@ async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
 
     assert!(
         partitions
-            .ask(partition::GetTablePartitions { table_id: 1 })
+            .ask(GetTablePartitions { table_id: 1 })
             .await
             .unwrap()
             .is_empty()
@@ -351,7 +351,7 @@ async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
         .unwrap();
     assert_eq!(
         partitions
-            .ask(partition::GetTablePartitions { table_id: 1 })
+            .ask(GetTablePartitions { table_id: 1 })
             .await
             .unwrap(),
         vec![boundary.clone()]
@@ -361,14 +361,14 @@ async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
         .unwrap();
     assert_eq!(
         partitions
-            .ask(partition::GetTablePartitions { table_id: 1 })
+            .ask(GetTablePartitions { table_id: 1 })
             .await
             .unwrap(),
         vec![boundary.clone()]
     );
     assert_eq!(
         partitions
-            .ask(partition::GetPartitionAtOrBeforeCached {
+            .ask(GetPartitionAtOrBeforeCached {
                 table_id: 1,
                 hash_start: 10
             })
@@ -378,7 +378,7 @@ async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
     );
     assert_eq!(
         partitions
-            .ask(partition::GetTablePartitionsUncached { table_id: 1 })
+            .ask(GetTablePartitionsUncached { table_id: 1 })
             .await
             .unwrap()[0]
             .forward_to,
@@ -393,7 +393,7 @@ async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
         .unwrap();
     assert_eq!(
         partitions
-            .ask(partition::GetTablePartitions { table_id: 1 })
+            .ask(GetTablePartitions { table_id: 1 })
             .await
             .unwrap(),
         vec![boundary]
@@ -406,7 +406,7 @@ async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
         .unwrap();
     assert!(
         partitions
-            .ask(partition::GetTablePartitions { table_id: 1 })
+            .ask(GetTablePartitions { table_id: 1 })
             .await
             .unwrap()
             .is_empty()
@@ -419,7 +419,7 @@ async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
     ));
     assert!(
         expiring
-            .ask(partition::GetTablePartitions { table_id: 1 })
+            .ask(GetTablePartitions { table_id: 1 })
             .await
             .unwrap()
             .is_empty()
@@ -432,7 +432,7 @@ async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
     tokio::time::sleep(Duration::from_millis(40)).await;
     assert_eq!(
         expiring
-            .ask(partition::GetTablePartitions { table_id: 1 })
+            .ask(GetTablePartitions { table_id: 1 })
             .await
             .unwrap()
             .len(),

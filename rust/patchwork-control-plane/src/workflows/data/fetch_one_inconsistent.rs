@@ -5,12 +5,12 @@ use patchwork_common::dataplane_client::Record;
 use rand::seq::SliceRandom;
 
 use crate::{
-    dataplane_client::Client,
-    db::{
+    actors::{
         NodeActor, PartitionActor, TableActor,
-        actor::{Get, GetCached},
+        crud::{Get, GetCached},
         partition::GetPartitionAtOrBeforeCached as GetPartitionAtOrBefore,
     },
+    dataplane_client::Client,
 };
 // Fetch the first record found, trying replicas in a random order.
 // Inconsistent reads reuse the five-second partition cache.

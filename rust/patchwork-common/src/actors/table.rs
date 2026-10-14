@@ -1,33 +1,12 @@
+use crate::datamodels::table::{Column, Entity, Model};
 use kameo::{
     message::{Context, Message},
     reply::DelegatedReply,
 };
 use sea_orm::entity::prelude::*;
 use sea_orm::{DbBackend, Order, QueryFilter, QueryOrder};
-use serde::{Deserialize, Serialize};
 
 use super::TableActor;
-
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
-#[sea_orm(table_name = "table")]
-pub struct Model {
-    #[sea_orm(primary_key, auto_increment = true)]
-    pub table_id: i64,
-    pub table_name: String,
-    pub owner: i64,
-    #[sea_orm(default_value = 0)]
-    pub owner_control_node: i64,
-    #[sea_orm(default_value = 0)]
-    pub backup_control_node: i64,
-    pub partition_key_name: String,
-    pub sort_key_name: String,
-    pub is_ready: bool,
-}
-
-#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {}
-
-impl ActiveModelBehavior for ActiveModel {}
 
 /// Pick a ready table for a background scaling check.
 pub struct GetRandomReadyTable;

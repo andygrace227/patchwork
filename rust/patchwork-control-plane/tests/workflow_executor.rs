@@ -7,12 +7,8 @@ use axum::{
 };
 use kameo::actor::{ActorRef, Spawn};
 use patchwork_control_plane::{
-    db::{
-        NodeActor, PartitionActor, TableActor,
-        actor::Create,
-        node, partition,
-        table::{self, GetRandomReadyTable},
-    },
+    actors::{NodeActor, PartitionActor, TableActor, crud::Create, table::GetRandomReadyTable},
+    datamodels::{node, partition, table},
     workflows::{
         executor::{
             ExecutorConfig, GetExecutorStatus, JobStatus, LongRunningWorkflowExecutor,

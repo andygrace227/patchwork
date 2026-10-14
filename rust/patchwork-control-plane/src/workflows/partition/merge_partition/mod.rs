@@ -5,15 +5,14 @@ use anyhow::{Context, Result, ensure};
 use kameo::actor::ActorRef;
 
 use crate::{
-    dataplane_client::Client,
-    db::{
+    actors::{
         NodeActor, PartitionActor,
-        actor::Get,
+        crud::Get,
         parition_lock::AttemptLock,
-        partition::{
-            DeleteLockedPartition, GetTablePartitionsUncached as GetTablePartitions, Model,
-        },
+        partition::{DeleteLockedPartition, GetTablePartitionsUncached as GetTablePartitions},
     },
+    datamodels::partition::Model,
+    dataplane_client::Client,
 };
 
 /// Remove this boundary, extending the previous partition through its range.
@@ -34,11 +33,11 @@ mod steps;
 struct Run {
     workflow: MergePartition,
     ctx: MergePartitionContext,
-    locks: Vec<crate::db::parition_lock::Model>,
+    locks: Vec<crate::datamodels::parition_lock::Model>,
     boundaries: Option<(Model, Model, Model)>,
     keys: Vec<i64>,
     lease_end: i64,
-    obsolete: Vec<crate::db::node::Model>,
+    obsolete: Vec<crate::datamodels::node::Model>,
 }
 
 workflow_steps! {
@@ -97,32 +96,7 @@ fn now() -> Result<i64> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db::partition::ReplicaNodes;
-
-    #[test]
-    fn merge_selects_previous_and_next_and_keeps_last_partition() {
-        let ring: Vec<_> = [10, 20, 30]
-            .into_iter()
-            .map(|hash_start| Model {
-                table_id: 1,
-                hash_start,
-
-                forward_to: None,
-                replicas: ReplicaNodes(vec![1]),
-            })
-            .collect();
-        let (previous, source, next) = neighbors(&ring, 10).unwrap();
-        assert_eq!(
-            (previous.hash_start, source.hash_start, next.hash_start),
-            (30, 10, 20)
-        );
-        assert!(neighbors(&ring[..1], 10).is_err());
-        assert!(neighbors(&[], 10).is_err());
-        assert!(neighbors(&ring, 15).is_err());
-    }
-}
+mod tests;
 
 impl crate::workflows::Workflow for MergePartition {
     type Context = MergePartitionContext;

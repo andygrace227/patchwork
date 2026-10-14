@@ -5,12 +5,12 @@ use patchwork_common::dataplane_client::Record;
 use rand::seq::IndexedRandom;
 
 use crate::{
-    dataplane_client::Client,
-    db::{
+    actors::{
         NodeActor, PartitionActor, TableActor,
-        actor::{Get, GetCached},
+        crud::{Get, GetCached},
         partition::GetTablePartitions,
     },
+    dataplane_client::Client,
 };
 
 pub struct FetchRange {

@@ -34,7 +34,7 @@ pub use super::{
     job::{JobHandle, JobStatus},
 };
 use crate::{
-    db::{NodeActor, PartitionActor, TableActor},
+    actors::{NodeActor, PartitionActor, TableActor},
     scale,
 };
 

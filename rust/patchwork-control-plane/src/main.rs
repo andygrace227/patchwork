@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use kameo::actor::Spawn;
 use patchwork_control_plane::{
+    actors::{NodeActor, PartitionActor, TableActor},
     api,
-    db::{NodeActor, PartitionActor, TableActor},
     workflows::executor::LongRunningWorkflowExecutor,
 };
 use sea_orm::Database;

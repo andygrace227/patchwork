@@ -18,3 +18,8 @@ ttl_cache = "0.5"
 [build-dependencies]
 tonic-prost-build = "0.14"
 protoc-bin-vendored = "3"
+
+[dev-dependencies]
+sea-orm = { version = "2", features = ["sqlx-sqlite"], default-features = false }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -6,7 +6,7 @@ use cano::{
 use kameo::actor::{ActorRef, WeakActorRef};
 
 use crate::{
-    db::{NodeActor, PartitionActor, TableActor, table::GetRandomReadyTable},
+    actors::{NodeActor, PartitionActor, TableActor, table::GetRandomReadyTable},
     workflows::{
         executor::{LongRunningWorkflowExecutor, SubmitWorkflow},
         table::check_table_scale::{CheckTableScale, CheckTableScaleContext},

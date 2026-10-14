@@ -1,4 +1,5 @@
-use super::actor::{Create, Delete, Get, GetCached, Update};
+use super::crud::{Create, Delete, Get, GetCached, Update};
+use crate::datamodels::node::{Column, Entity, Model};
 use kameo::{
     Actor,
     message::{Context, Message},
@@ -6,7 +7,6 @@ use kameo::{
 };
 use sea_orm::entity::prelude::*;
 use sea_orm::{QueryFilter, QueryOrder};
-use serde::{Deserialize, Serialize};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -52,19 +52,6 @@ impl NodeActor {
         }
     }
 }
-
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
-#[sea_orm(table_name = "node")]
-pub struct Model {
-    #[sea_orm(primary_key, auto_increment = true)]
-    pub node_id: i64,
-    pub url: String,
-}
-
-#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {}
-
-impl ActiveModelBehavior for ActiveModel {}
 
 impl Message<Get> for NodeActor {
     type Reply = DelegatedReply<Result<Option<Model>, DbErr>>;

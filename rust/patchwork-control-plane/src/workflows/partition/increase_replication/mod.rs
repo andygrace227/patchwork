@@ -5,11 +5,14 @@ use anyhow::{Context, Result, ensure};
 use kameo::actor::ActorRef;
 use sea_orm::ActiveValue::Set;
 
-use crate::db::{
-    NodeActor, PartitionActor,
-    node::GetNodeExcluding,
-    parition_lock::AttemptLock,
-    partition::{self, GetTablePartitionsUncached as GetTablePartitions, UpdateLockedPartition},
+use crate::{
+    actors::{
+        NodeActor, PartitionActor,
+        node::GetNodeExcluding,
+        parition_lock::AttemptLock,
+        partition::{GetTablePartitionsUncached as GetTablePartitions, UpdateLockedPartition},
+    },
+    datamodels::partition,
 };
 
 #[derive(Clone)]
@@ -31,7 +34,7 @@ mod steps;
 struct Run {
     workflow: IncreaseReplication,
     ctx: IncreaseReplicationContext,
-    locks: Vec<crate::db::parition_lock::Model>,
+    locks: Vec<crate::datamodels::parition_lock::Model>,
     boundaries: Option<(partition::Model, partition::Model)>,
     keys: Vec<i64>,
     lease_end: i64,

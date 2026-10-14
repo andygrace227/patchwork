@@ -6,12 +6,12 @@ use rand::seq::SliceRandom;
 use serde_json::Value;
 
 use crate::{
-    dataplane_client::Client,
-    db::{
+    actors::{
         NodeActor, PartitionActor, TableActor,
-        actor::{Get, GetCached},
+        crud::{Get, GetCached},
         partition::GetPartitionAtOrBefore,
     },
+    dataplane_client::Client,
 };
 
 pub struct PutOneConsistent {

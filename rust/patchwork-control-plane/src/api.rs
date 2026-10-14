@@ -11,7 +11,8 @@ use kameo::actor::ActorRef;
 use serde::Deserialize;
 
 use crate::{
-    db::{NodeActor, PartitionActor, TableActor, table},
+    actors::{NodeActor, PartitionActor, TableActor},
+    datamodels::table,
     workflows::{
         Workflow,
         data::{

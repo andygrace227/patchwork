@@ -6,15 +6,14 @@ use kameo::actor::ActorRef;
 use sea_orm::ActiveValue::Set;
 
 use crate::{
-    dataplane_client::Client,
-    db::{
+    actors::{
         NodeActor, PartitionActor,
-        actor::Get,
+        crud::Get,
         parition_lock::AttemptLock,
-        partition::{
-            self, GetTablePartitionsUncached as GetTablePartitions, UpdateLockedPartition,
-        },
+        partition::{GetTablePartitionsUncached as GetTablePartitions, UpdateLockedPartition},
     },
+    datamodels::partition,
+    dataplane_client::Client,
 };
 
 #[derive(Clone)]
@@ -36,12 +35,12 @@ mod steps;
 struct Run {
     workflow: DecreaseReplication,
     ctx: DecreaseReplicationContext,
-    locks: Vec<crate::db::parition_lock::Model>,
+    locks: Vec<crate::datamodels::parition_lock::Model>,
     boundaries: Option<(partition::Model, partition::Model)>,
     keys: Vec<i64>,
     lease_end: i64,
     replicas: Vec<i64>,
-    obsolete: Vec<crate::db::node::Model>,
+    obsolete: Vec<crate::datamodels::node::Model>,
 }
 
 workflow_steps! {
@@ -104,24 +103,7 @@ fn retained_replicas(source: &partition::Model, count: usize) -> Vec<i64> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decrease_keeps_requested_number_of_replicas() {
-        let source = partition::Model {
-            table_id: 1,
-            hash_start: 10,
-
-            forward_to: None,
-            replicas: partition::ReplicaNodes(vec![1, 2, 3]),
-        };
-        assert_eq!(retained_replicas(&source, 1), vec![1]);
-        assert_eq!(retained_replicas(&source, 2), vec![1, 2]);
-        assert_eq!(retained_replicas(&source, 3), vec![1, 2, 3]);
-        assert!(boundaries(&[], 10).is_err());
-    }
-}
+mod tests;
 
 impl crate::workflows::Workflow for DecreaseReplication {
     type Context = DecreaseReplicationContext;

@@ -1,6 +1,6 @@
 //! Prepare a fresh local test database using the same models as the servers.
 use anyhow::Result;
-use patchwork_control_plane::db::{node, parition_lock, partition, table};
+use patchwork_control_plane::datamodels::{node, parition_lock, partition, table};
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectionTrait, Database, Schema};
 
 #[tokio::main]

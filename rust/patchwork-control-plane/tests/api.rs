@@ -2,9 +2,10 @@ use std::time::Duration;
 
 use kameo::actor::Spawn;
 use patchwork_control_plane::{
+    actors::{NodeActor, PartitionActor, TableActor, crud::Create},
     api,
+    datamodels::{node, partition, table},
     dataplane_client::{Client, Record},
-    db::{NodeActor, PartitionActor, TableActor, actor::Create, node, partition, table},
     workflows::executor::{ExecutorConfig, GetExecutorStatus, LongRunningWorkflowExecutor},
 };
 use patchwork_data_plane::shard_actor::ShardActor;

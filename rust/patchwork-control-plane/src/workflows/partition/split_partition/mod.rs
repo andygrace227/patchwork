@@ -1,17 +1,18 @@
 use super::copy_range::copy_range;
 use crate::workflows::data::fetch_range::FetchRangeCtx;
 use crate::workflows::stages::{unlock, workflow_steps};
-use crate::{dataplane_client, db::actor::Get};
+use crate::{actors::crud::Get, dataplane_client};
 use crate::{
-    db::{
+    actors::{
         NodeActor, PartitionActor, TableActor,
         node::GetNodeExcluding,
         parition_lock::AttemptLock,
         partition::{
-            self, CreateLockedPartition, GetTablePartitionsUncached as GetTablePartitions,
+            CreateLockedPartition, GetTablePartitionsUncached as GetTablePartitions,
             UpdateLockedPartition,
         },
     },
+    datamodels::partition,
     workflows::partition::circular_get,
 };
 use anyhow::{Context, Result};
@@ -37,7 +38,7 @@ mod steps;
 struct Run {
     workflow: SplitPartition,
     ctx: SplitPartitionContext,
-    locks: Vec<crate::db::parition_lock::Model>,
+    locks: Vec<crate::datamodels::parition_lock::Model>,
     boundaries: Option<(partition::Model, partition::Model)>,
     keys: Vec<i64>,
     lease_end: i64,

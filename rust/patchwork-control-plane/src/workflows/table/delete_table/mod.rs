@@ -3,14 +3,14 @@ use anyhow::{Context, Result, ensure};
 use kameo::actor::ActorRef;
 
 use crate::{
-    dataplane_client::Client,
-    db::{
+    actors::{
         NodeActor, PartitionActor, TableActor,
-        actor::{Delete, Get, Update},
+        crud::{Delete, Get, Update},
         parition_lock::AttemptLock,
         partition::{DeleteLockedPartition, GetTablePartitionsUncached as GetTablePartitions},
-        table,
     },
+    datamodels::table,
+    dataplane_client::Client,
 };
 
 #[derive(Clone)]
@@ -30,9 +30,9 @@ mod steps;
 struct Run {
     workflow: DeleteTable,
     ctx: DeleteTableContext,
-    locks: Vec<crate::db::parition_lock::Model>,
-    partitions: Vec<crate::db::partition::Model>,
-    nodes: Vec<crate::db::node::Model>,
+    locks: Vec<crate::datamodels::parition_lock::Model>,
+    partitions: Vec<crate::datamodels::partition::Model>,
+    nodes: Vec<crate::datamodels::node::Model>,
     lease_end: i64,
 }
 

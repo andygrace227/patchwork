@@ -5,11 +5,11 @@ use rand::seq::SliceRandom;
 use serde_json::Value;
 
 use crate::{
-    dataplane_client::Client,
-    db::{
-        NodeActor, PartitionActor, TableActor, actor::GetCached as Get,
+    actors::{
+        NodeActor, PartitionActor, TableActor, crud::GetCached as Get,
         partition::GetPartitionAtOrBeforeCached as GetPartitionAtOrBefore,
     },
+    dataplane_client::Client,
 };
 
 pub struct PutOneInconsistent {

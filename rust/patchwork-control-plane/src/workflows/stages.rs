@@ -4,9 +4,9 @@ use kameo::actor::ActorRef;
 use std::{fmt::Debug, future::Future, hash::Hash};
 use tokio::sync::Mutex;
 
-use crate::db::{
-    PartitionActor,
-    parition_lock::{FreeLock, Model},
+use crate::{
+    actors::{PartitionActor, parition_lock::FreeLock},
+    datamodels::parition_lock::Model,
 };
 
 /// Every execution gets its own state. Only that workflow's steps share it.

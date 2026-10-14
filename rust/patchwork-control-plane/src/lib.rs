@@ -1,4 +1,4 @@
-pub use patchwork_common::{dataplane_client, db};
+pub use patchwork_common::{actors, datamodels, dataplane_client};
 pub mod api;
 pub mod scale;
 pub mod telemetry;

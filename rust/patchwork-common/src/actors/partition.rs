@@ -1,42 +1,11 @@
 use super::PartitionActor;
+use crate::datamodels::partition::{ActiveModel, Column, Entity, Model};
 use kameo::{
     message::{Context, Message},
     reply::DelegatedReply,
 };
 use sea_orm::entity::prelude::*;
-use sea_orm::{FromJsonQueryResult, QueryFilter, QueryOrder, QuerySelect};
-use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
-#[sea_orm(table_name = "partition")]
-pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub table_id: i64,
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub hash_start: i64,
-
-    /// Another partition's hash_start in this table. Reads use its replicas;
-    /// writes use both replica lists until copying finishes.
-    pub forward_to: Option<i64>,
-
-    #[sea_orm(column_type = "Json")]
-    pub replicas: ReplicaNodes,
-}
-
-/// All nodes holding this partition, with no designated primary.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, FromJsonQueryResult)]
-pub struct ReplicaNodes(pub Vec<i64>);
-
-impl Model {
-    pub fn replication_factor(&self) -> usize {
-        self.replicas.0.len()
-    }
-}
-
-#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {}
-
-impl ActiveModelBehavior for ActiveModel {}
+use sea_orm::{QueryFilter, QueryOrder, QuerySelect};
 
 /// Returns the table's partitions ordered by hash start.
 pub struct GetTablePartitions {
@@ -132,7 +101,7 @@ impl Message<GetPartitionAtOrBefore> for PartitionActor {
 /// Publish a bootstrapping partition only while all supplied leases are still ours.
 pub struct CreateLockedPartition {
     pub data: ActiveModel,
-    pub locks: Vec<super::parition_lock::Model>,
+    pub locks: Vec<crate::datamodels::parition_lock::Model>,
 }
 
 impl Message<CreateLockedPartition> for PartitionActor {
@@ -174,7 +143,7 @@ impl Message<CreateLockedPartition> for PartitionActor {
 /// Update a partition only while all supplied leases are still ours.
 pub struct UpdateLockedPartition {
     pub data: ActiveModel,
-    pub locks: Vec<super::parition_lock::Model>,
+    pub locks: Vec<crate::datamodels::parition_lock::Model>,
 }
 
 impl Message<UpdateLockedPartition> for PartitionActor {
@@ -217,7 +186,7 @@ impl Message<UpdateLockedPartition> for PartitionActor {
 pub struct DeleteLockedPartition {
     pub table_id: i64,
     pub hash_start: i64,
-    pub locks: Vec<super::parition_lock::Model>,
+    pub locks: Vec<crate::datamodels::parition_lock::Model>,
 }
 
 impl Message<DeleteLockedPartition> for PartitionActor {

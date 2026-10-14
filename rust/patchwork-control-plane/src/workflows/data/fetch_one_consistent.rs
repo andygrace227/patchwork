@@ -5,12 +5,12 @@ use patchwork_common::dataplane_client::Record;
 use rand::seq::SliceRandom;
 
 use crate::{
-    dataplane_client::Client,
-    db::{
+    actors::{
         NodeActor, PartitionActor, TableActor,
-        actor::{Get, GetCached},
+        crud::{Get, GetCached},
         partition::GetPartitionAtOrBefore,
     },
+    dataplane_client::Client,
 };
 // Fetch one and take the one with the latest timestamp.
 // GetOneConsistent always hits the live partition map.

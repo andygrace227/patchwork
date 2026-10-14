@@ -5,8 +5,8 @@ use anyhow::{Context, Result};
 use kameo::actor::ActorRef;
 
 use crate::{
+    actors::{NodeActor, PartitionActor, TableActor, crud::Get, partition::GetTablePartitions},
     dataplane_client::{self, AccessStatistics},
-    db::{NodeActor, PartitionActor, TableActor, actor::Get, partition::GetTablePartitions},
     workflows::executor::LongRunningWorkflowExecutor,
 };
 
@@ -31,7 +31,7 @@ pub struct CheckTableScale {
 struct ScaleCheck {
     workflow: CheckTableScale,
     ctx: CheckTableScaleContext,
-    partitions: Vec<crate::db::partition::Model>,
+    partitions: Vec<crate::datamodels::partition::Model>,
     global_telemetry: HashMap<i64, AccessStatistics>,
 }
 
