@@ -12,10 +12,20 @@ directory or a parent; exported environment variables take precedence.
 
 - BIND_ADDR defaults to 127.0.0.1:3000.
 - SHARD_PATH is required. Relative paths resolve from the working directory.
+- READ_SHARD_POOL_SIZE defaults to 4 and must be a positive integer.
 
 Startup opens one SQLite shard through SeaORM, enables WAL, creates its data table
-if missing, and injects one Kameo actor into the gRPC and HTTP handlers. Existing
-tables are not migrated automatically. Ctrl-C drains requests before stopping the actors.
+if missing, and keeps the single write connection in `ShardActor`. Reads use
+`kameo_actors::pool::ActorPool<ReadShard>` through `Dispatch` messages. Each reader
+opens one read-only connection to the same WAL database. Point reads, partition-key
+reads, range scans, counts, and payload-size queries use the pool in both APIs.
+Kameo selects a worker with the least queued work.
+Existing tables are not migrated automatically. Ctrl-C drains requests and queued
+replica writes before stopping the read pool and write actor.
+
+Set `READ_SHARD_POOL_SIZE=8` in `.env` or the environment to change the reader
+count, then restart the data nodes. This is separate from Tokio's thread count.
+Await a write acknowledgement before issuing a dependent read.
 
 Control-to-data and data-to-data calls use gRPC exclusively, including replication,
 partition copying, cleanup, and telemetry. The shared client caches one HTTP/2
@@ -126,12 +136,12 @@ GET `/tables/{table_id}/telemetry` returns only that table's entries as an objec
 keyed by partition key. `Client::get_telemetry_for_table(url, table_id)` returns
 `HashMap<i64, Telemetry>`; no recent accesses returns an empty map.
 
-Telemetry lives in the shard actor's memory and resets on restart. Each tracker
+Telemetry currently lives in the write actor's local `BTreeMap` and resets on restart.
+Read-pool accesses are not recorded while telemetry is being reworked. Each tracker
 retains at most 1024 accesses from the last ten seconds. During startup or buffer
 overflow, both rates use the shorter retained window reported in `window_seconds`.
 Inactive trackers are discarded when telemetry is requested or during periodic
-cleanup on access. Successful point reads count misses too; bulk reads count
-returned records. Writes include tombstones, replicas, and acknowledged stale
+cleanup on access. Writes include tombstones, replicas, and acknowledged stale
 writes or retries. Physical cleanup deletes clear affected trackers; count, size,
 and telemetry requests do not count as record accesses.
 

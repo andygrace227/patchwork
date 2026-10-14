@@ -1,9 +1,9 @@
 use crate::{
     data,
+    read_shard::{CountRange, Get, GetPartitionKey, GetRange, GetRangeSize, ReadShardPool},
     shard_actor::{
-        CountRange, Delete, DeletePartitionKey, DeleteRange, DeleteTable, Get, GetPartitionKey,
-        GetRange, GetRangeSize, GetSize, GetTelemetry, GetTelemetryForTable, ShardActor,
-        WriteRecord,
+        Delete, DeletePartitionKey, DeleteRange, DeleteTable, GetSize, GetTelemetry,
+        GetTelemetryForTable, ShardActor, WriteRecord,
     },
     subordinate_shard_writer::{Put, SubordinateShardWriter},
     telemetry,
@@ -15,19 +15,25 @@ use axum::{
     routing::get,
 };
 use kameo::actor::{ActorRef, Spawn};
+use kameo_actors::pool::Dispatch;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Inject the same actor into every handler.
-pub fn router(shard: ActorRef<ShardActor>) -> Router {
-    router_with_writer(shard, SubordinateShardWriter::spawn(SubordinateShardWriter))
+/// Inject the writer and Kameo read pool into every handler.
+pub fn router(shard: ActorRef<ShardActor>, readers: ReadShardPool) -> Router {
+    router_with_writer(
+        shard,
+        readers,
+        SubordinateShardWriter::spawn(SubordinateShardWriter),
+    )
 }
 
 pub fn router_with_writer(
     shard: ActorRef<ShardActor>,
+    readers: ReadShardPool,
     writer: ActorRef<SubordinateShardWriter>,
 ) -> Router {
-    let grpc = crate::grpc::router(shard.clone(), writer.clone());
+    let grpc = crate::grpc::router(shard.clone(), readers.clone(), writer.clone());
     Router::new()
         .route("/shard/size", get(get_size))
         .route("/shard/telemetry", get(get_telemetry))
@@ -55,6 +61,7 @@ pub fn router_with_writer(
         )
         .route("/tables/{table_id}/range/count", get(count_range))
         .route("/tables/{table_id}/range/size", get(get_range_size))
+        .layer(Extension(readers))
         .layer(Extension(writer))
         .with_state(shard)
         .merge(grpc)
@@ -193,17 +200,17 @@ async fn put_with_replicas_inconsistent(
 }
 
 async fn get_record(
-    State(shard): State<ActorRef<ShardActor>>,
+    Extension(readers): Extension<ReadShardPool>,
     Path((table_id, partition_key, secondary_key)): Path<(i64, i64, i64)>,
     Query(options): Query<ReadOptions>,
 ) -> Result<Json<data::Model>, ApiError> {
-    shard
-        .ask(Get {
+    readers
+        .ask(Dispatch(Get {
             table_id,
             partition_key,
             secondary_key,
             include_deleted: options.include_deleted,
-        })
+        }))
         .await
         .map_err(internal_error)?
         .map(Json)
@@ -239,17 +246,17 @@ async fn delete_record(
 }
 
 async fn get_partition_key(
-    State(shard): State<ActorRef<ShardActor>>,
+    Extension(readers): Extension<ReadShardPool>,
     Path((table_id, partition_key)): Path<(i64, i64)>,
     Query(options): Query<ReadOptions>,
 ) -> Result<Json<Vec<data::Model>>, ApiError> {
     Ok(Json(
-        shard
-            .ask(GetPartitionKey {
+        readers
+            .ask(Dispatch(GetPartitionKey {
                 table_id,
                 partition_key,
                 include_deleted: options.include_deleted,
-            })
+            }))
             .await
             .map_err(internal_error)?,
     ))
@@ -278,7 +285,7 @@ struct Range {
 }
 
 async fn get_range(
-    State(shard): State<ActorRef<ShardActor>>,
+    Extension(readers): Extension<ReadShardPool>,
     Path(table_id): Path<i64>,
     Query(range): Query<Range>,
 ) -> Result<Json<Vec<data::Model>>, ApiError> {
@@ -289,13 +296,13 @@ async fn get_range(
         ));
     }
     Ok(Json(
-        shard
-            .ask(GetRange {
+        readers
+            .ask(Dispatch(GetRange {
                 table_id,
                 include_deleted: range.include_deleted,
                 lower_bound: range.lower_bound,
                 upper_bound: range.upper_bound,
-            })
+            }))
             .await
             .map_err(internal_error)?,
     ))
@@ -351,7 +358,7 @@ async fn get_telemetry_for_table(
 }
 
 async fn count_range(
-    State(shard): State<ActorRef<ShardActor>>,
+    Extension(readers): Extension<ReadShardPool>,
     Path(table_id): Path<i64>,
     Query(range): Query<Range>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -361,19 +368,19 @@ async fn count_range(
             Json(serde_json::json!({"error": "lower_bound must be less than upper_bound"})),
         ));
     }
-    let total = shard
-        .ask(CountRange {
+    let total = readers
+        .ask(Dispatch(CountRange {
             table_id,
             lower_bound: range.lower_bound,
             upper_bound: range.upper_bound,
-        })
+        }))
         .await
         .map_err(internal_error)?;
     Ok(Json(serde_json::json!({"count": total})))
 }
 
 async fn get_range_size(
-    State(shard): State<ActorRef<ShardActor>>,
+    Extension(readers): Extension<ReadShardPool>,
     Path(table_id): Path<i64>,
     Query(range): Query<Range>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -383,12 +390,12 @@ async fn get_range_size(
             Json(serde_json::json!({"error": "lower_bound must be less than upper_bound"})),
         ));
     }
-    let total = shard
-        .ask(GetRangeSize {
+    let total = readers
+        .ask(Dispatch(GetRangeSize {
             table_id,
             lower_bound: range.lower_bound,
             upper_bound: range.upper_bound,
-        })
+        }))
         .await
         .map_err(internal_error)?;
     Ok(Json(serde_json::json!({"size_bytes": total})))

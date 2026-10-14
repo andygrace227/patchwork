@@ -7,7 +7,7 @@ use patchwork_control_plane::{
 };
 use sea_orm::Database;
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     match dotenvy::dotenv() {
         Ok(_) => {}
@@ -27,7 +27,11 @@ async fn main() -> Result<()> {
         partition.clone(),
         table.clone(),
     ));
-    eprintln!("Control plane listening on {}", listener.local_addr()?);
+    eprintln!(
+        "Control plane listening on {} with {} Tokio worker threads",
+        listener.local_addr()?,
+        tokio::runtime::Handle::current().metrics().num_workers(),
+    );
     let result = axum::serve(
         listener,
         api::router(node, partition, table, executor.clone()),

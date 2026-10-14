@@ -62,24 +62,24 @@ mod tests {
         let mut urls = Vec::new();
         let mut ids = Vec::new();
         for i in 0..4 {
-            let shard = ShardActor::spawn(
-                ShardActor::new(
-                    dir.path()
-                        .join(format!("{i}.sqlite"))
-                        .to_str()
-                        .unwrap()
-                        .into(),
-                )
-                .await
-                .unwrap(),
-            );
+            let shard = ShardActor::new(
+                dir.path()
+                    .join(format!("{i}.sqlite"))
+                    .to_str()
+                    .unwrap()
+                    .into(),
+            )
+            .await
+            .unwrap();
+            let shard_readers = shard.read_pool(2).unwrap();
+            let shard = ShardActor::spawn(shard);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
-            let app = api::router(shard.clone());
+            let app = api::router(shard.clone(), shard_readers.clone());
             servers.push(tokio::spawn(async move {
                 axum::serve(listener, app).await.unwrap()
             }));
-            shards.push(shard);
+            shards.push((shard, shard_readers));
             ids.push(
                 nodes
                     .ask(Create::<node::Entity> {
@@ -154,7 +154,9 @@ mod tests {
             server.abort();
             let _ = server.await;
         }
-        for shard in shards {
+        for (shard, shard_readers) in shards {
+            shard_readers.stop_gracefully().await.unwrap();
+            shard_readers.wait_for_shutdown().await;
             shard.stop_gracefully().await.unwrap();
             shard.wait_for_shutdown().await;
         }

@@ -1,0 +1,275 @@
+//! Read workers for Kameo's actor pool, each with one read-only SQLite connection.
+use crate::data;
+use anyhow::Result;
+use kameo::{
+    Actor,
+    actor::{ActorRef, WeakActorRef},
+    error::ActorStopReason,
+    messages,
+};
+use kameo_actors::pool::ActorPool;
+pub use kameo_actors::pool::Dispatch;
+use sea_orm::{
+    ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection, EntityTrait,
+    QueryFilter, QueryOrder,
+};
+use std::path::PathBuf;
+
+pub type ReadShardPool = ActorRef<ActorPool<ReadShard>>;
+
+pub struct ReadShard {
+    db: DatabaseConnection,
+}
+
+impl Actor for ReadShard {
+    type Args = PathBuf;
+    type Error = sea_orm::DbErr;
+
+    async fn on_start(path: Self::Args, _: ActorRef<Self>) -> Result<Self, Self::Error> {
+        let mut options = ConnectOptions::new(format!("sqlite://{}?mode=ro", path.display()));
+        options
+            .min_connections(1)
+            .max_connections(1)
+            .sqlx_logging(false);
+        Ok(Self {
+            db: Database::connect(options).await?,
+        })
+    }
+
+    async fn on_stop(
+        &mut self,
+        _: WeakActorRef<Self>,
+        _: ActorStopReason,
+    ) -> Result<(), Self::Error> {
+        self.db.clone().close().await
+    }
+}
+
+impl ReadShard {
+    async fn range_total(
+        &self,
+        table_id: i64,
+        upper_bound: i64,
+        lower_bound: i64,
+        aggregate: &str,
+    ) -> Result<u64> {
+        anyhow::ensure!(
+            lower_bound < upper_bound,
+            "lower_bound must be less than upper_bound"
+        );
+        let row = self.db.query_one_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            format!("SELECT {aggregate} AS total FROM data WHERE table_id = ? AND partition_key >= ? AND partition_key < ? AND deleted = 0"),
+            [table_id.into(), lower_bound.into(), upper_bound.into()],
+        )).await?.ok_or_else(|| anyhow::anyhow!("Missing range total"))?;
+        Ok(u64::try_from(row.try_get::<i64>("", "total")?)?)
+    }
+}
+
+#[messages]
+impl ReadShard {
+    /// Number of live records in one table's [lower_bound, upper_bound) range.
+    #[message]
+    pub async fn count_range(
+        &mut self,
+        table_id: i64,
+        upper_bound: i64,
+        lower_bound: i64,
+    ) -> Result<u64> {
+        self.range_total(table_id, upper_bound, lower_bound, "COUNT(*)")
+            .await
+    }
+
+    /// Stored JSON payload bytes, excluding keys, indexes and SQLite overhead.
+    #[message]
+    pub async fn get_range_size(
+        &mut self,
+        table_id: i64,
+        upper_bound: i64,
+        lower_bound: i64,
+    ) -> Result<u64> {
+        self.range_total(
+            table_id,
+            upper_bound,
+            lower_bound,
+            "COALESCE(SUM(LENGTH(CAST(data AS BLOB))), 0)",
+        )
+        .await
+    }
+
+    #[message]
+    pub async fn get(
+        &mut self,
+        table_id: i64,
+        partition_key: i64,
+        secondary_key: i64,
+        include_deleted: bool,
+    ) -> Result<Option<data::Model>> {
+        let record = data::Entity::find_by_id((table_id, partition_key, secondary_key))
+            .filter(if include_deleted {
+                sea_orm::Condition::all()
+            } else {
+                sea_orm::Condition::all().add(data::Column::Deleted.eq(false))
+            })
+            .one(&self.db)
+            .await?;
+        Ok(record)
+    }
+
+    #[message]
+    pub async fn get_partition_key(
+        &mut self,
+        table_id: i64,
+        partition_key: i64,
+        include_deleted: bool,
+    ) -> Result<Vec<data::Model>> {
+        let records = data::Entity::find()
+            .filter(data::Column::TableId.eq(table_id))
+            .filter(data::Column::PartitionKey.eq(partition_key))
+            .order_by_asc(data::Column::SecondaryKey)
+            .filter(if include_deleted {
+                sea_orm::Condition::all()
+            } else {
+                sea_orm::Condition::all().add(data::Column::Deleted.eq(false))
+            })
+            .all(&self.db)
+            .await?;
+        Ok(records)
+    }
+
+    /// Reads partition keys in [lower_bound, upper_bound).
+    #[message]
+    pub async fn get_range(
+        &mut self,
+        table_id: i64,
+        upper_bound: i64,
+        lower_bound: i64,
+        include_deleted: bool,
+    ) -> Result<Vec<data::Model>> {
+        let records = data::Entity::find()
+            .filter(data::Column::TableId.eq(table_id))
+            .filter(data::Column::PartitionKey.gte(lower_bound))
+            .filter(data::Column::PartitionKey.lt(upper_bound))
+            .order_by_asc(data::Column::PartitionKey)
+            .order_by_asc(data::Column::SecondaryKey)
+            .filter(if include_deleted {
+                sea_orm::Condition::all()
+            } else {
+                sea_orm::Condition::all().add(data::Column::Deleted.eq(false))
+            })
+            .all(&self.db)
+            .await?;
+        Ok(records)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shard_actor::{ShardActor, Upsert};
+    use kameo::{
+        actor::Spawn,
+        message::{Context, Message},
+    };
+    use serde_json::json;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    struct Pause {
+        entered: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    }
+
+    impl Message<Pause> for ReadShard {
+        type Reply = ();
+
+        async fn handle(&mut self, pause: Pause, _: &mut Context<Self, ()>) {
+            pause.entered.send(()).unwrap();
+            pause.release.await.unwrap();
+        }
+    }
+
+    struct TryWrite;
+
+    impl Message<TryWrite> for ReadShard {
+        type Reply = Result<(), sea_orm::DbErr>;
+
+        async fn handle(&mut self, _: TryWrite, _: &mut Context<Self, Self::Reply>) -> Self::Reply {
+            self.db
+                .execute_unprepared("DELETE FROM data")
+                .await
+                .map(|_| ())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kameo_pool_uses_another_reader_while_one_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard = ShardActor::new(dir.path().join("shard.sqlite").to_str().unwrap().into())
+            .await
+            .unwrap();
+        assert!(shard.read_pool(0).is_err());
+        let readers = shard.read_pool(2).unwrap();
+        let shard = ShardActor::spawn(shard);
+
+        let (entered, ready) = oneshot::channel();
+        let (release, wait) = oneshot::channel();
+        let busy = tokio::spawn({
+            let readers = readers.clone();
+            async move {
+                readers
+                    .ask(Dispatch(Pause {
+                        entered,
+                        release: wait,
+                    }))
+                    .await
+                    .unwrap()
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            shard.ask(Upsert {
+                table_id: 1,
+                partition_key: 10,
+                secondary_key: 42,
+                data: json!("new"),
+                timestamp: 2,
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let record = tokio::time::timeout(
+            Duration::from_secs(2),
+            readers.ask(Dispatch(Get {
+                table_id: 1,
+                partition_key: 10,
+                secondary_key: 42,
+                include_deleted: false,
+            })),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(record.timestamp, 2);
+        assert!(
+            readers
+                .ask(Dispatch(TryWrite))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("readonly")
+        );
+        release.send(()).unwrap();
+        busy.await.unwrap();
+        readers.stop_gracefully().await.unwrap();
+        readers.wait_for_shutdown().await;
+        shard.stop_gracefully().await.unwrap();
+        shard.wait_for_shutdown().await;
+    }
+}

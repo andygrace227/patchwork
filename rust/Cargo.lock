@@ -767,6 +767,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glob"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
+
+[[package]]
 name = "h2"
 version = "0.4.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1152,6 +1158,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kameo_actors"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "069ef0ae25f4da6f817ce7d81f7990b3d12c3ae398b59e6e16e37b5fcc92a443"
+dependencies = [
+ "futures",
+ "glob",
+ "kameo",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "kameo_macros"
 version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1436,6 +1455,7 @@ dependencies = [
  "axum",
  "dotenvy",
  "kameo",
+ "kameo_actors",
  "patchwork-common",
  "ringbuffer",
  "sea-orm",

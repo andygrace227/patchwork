@@ -6,15 +6,16 @@ use serde_json::json;
 #[tokio::test]
 async fn client_calls_all_shard_operations() {
     let dir = tempfile::tempdir().unwrap();
-    let shard = ShardActor::spawn(
-        ShardActor::new(dir.path().join("shard.sqlite").to_str().unwrap().into())
-            .await
-            .unwrap(),
-    );
+    let shard = ShardActor::new(dir.path().join("shard.sqlite").to_str().unwrap().into())
+        .await
+        .unwrap();
+    let shard_readers = shard.read_pool(2).unwrap();
+    let shard = ShardActor::spawn(shard);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     let app = patchwork_data_plane::grpc::router(
         shard.clone(),
+        shard_readers.clone(),
         patchwork_data_plane::subordinate_shard_writer::SubordinateShardWriter::spawn(
             patchwork_data_plane::subordinate_shard_writer::SubordinateShardWriter,
         ),
@@ -124,6 +125,8 @@ async fn client_calls_all_shard_operations() {
     );
     server.abort();
     let _ = server.await;
+    shard_readers.stop_gracefully().await.unwrap();
+    shard_readers.wait_for_shutdown().await;
     shard.stop_gracefully().await.unwrap();
     shard.wait_for_shutdown().await;
 }
@@ -131,14 +134,14 @@ async fn client_calls_all_shard_operations() {
 #[tokio::test]
 async fn range_totals_are_scoped_and_measure_payload_bytes() {
     let dir = tempfile::tempdir().unwrap();
-    let shard = ShardActor::spawn(
-        ShardActor::new(dir.path().join("totals.sqlite").to_str().unwrap().into())
-            .await
-            .unwrap(),
-    );
+    let shard = ShardActor::new(dir.path().join("totals.sqlite").to_str().unwrap().into())
+        .await
+        .unwrap();
+    let shard_readers = shard.read_pool(2).unwrap();
+    let shard = ShardActor::spawn(shard);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let app = api::router(shard.clone());
+    let app = api::router(shard.clone(), shard_readers.clone());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let payload = json!({"text": "café"});
     for (table, key, secondary) in [(1, 10, 1), (1, 10, 2), (1, 20, 1), (2, 10, 1)] {
@@ -194,6 +197,8 @@ async fn range_totals_are_scoped_and_measure_payload_bytes() {
     );
     server.abort();
     let _ = server.await;
+    shard_readers.stop_gracefully().await.unwrap();
+    shard_readers.wait_for_shutdown().await;
     shard.stop_gracefully().await.unwrap();
     shard.wait_for_shutdown().await;
 }
@@ -205,24 +210,24 @@ async fn put_with_replicas_writes_all_and_reports_partial_failure() {
     let mut servers = Vec::new();
     let mut urls = Vec::new();
     for index in 0..3 {
-        let shard = ShardActor::spawn(
-            ShardActor::new(
-                dir.path()
-                    .join(format!("{index}.sqlite"))
-                    .to_str()
-                    .unwrap()
-                    .into(),
-            )
-            .await
-            .unwrap(),
-        );
+        let shard = ShardActor::new(
+            dir.path()
+                .join(format!("{index}.sqlite"))
+                .to_str()
+                .unwrap()
+                .into(),
+        )
+        .await
+        .unwrap();
+        let shard_readers = shard.read_pool(2).unwrap();
+        let shard = ShardActor::spawn(shard);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         urls.push(format!("http://{}", listener.local_addr().unwrap()));
-        let app = api::router(shard.clone());
+        let app = api::router(shard.clone(), shard_readers.clone());
         servers.push(tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap()
         }));
-        shards.push(shard);
+        shards.push((shard, shard_readers));
     }
     let payload = json!({"data": "payload", "replicas": "also payload"});
     let replicas = vec![urls[1].clone(), format!("{}/", urls[1]), urls[2].clone()];
@@ -308,7 +313,9 @@ async fn put_with_replicas_writes_all_and_reports_partial_failure() {
         server.abort();
         let _ = server.await;
     }
-    for shard in shards {
+    for (shard, shard_readers) in shards {
+        shard_readers.stop_gracefully().await.unwrap();
+        shard_readers.wait_for_shutdown().await;
         shard.stop_gracefully().await.unwrap();
         shard.wait_for_shutdown().await;
     }
@@ -323,51 +330,52 @@ async fn inconsistent_writes_queue_while_all_writes_wait_for_ack() {
     let entered = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));
     let dir = tempfile::tempdir().unwrap();
-    let remote = ShardActor::spawn(
-        ShardActor::new(dir.path().join("remote.sqlite").to_str().unwrap().into())
-            .await
-            .unwrap(),
-    );
-    let replica = api::router(remote.clone()).layer(axum::middleware::from_fn({
-        let entered = entered.clone();
-        let release = release.clone();
-        move |request: axum::extract::Request, next: axum::middleware::Next| {
+    let remote = ShardActor::new(dir.path().join("remote.sqlite").to_str().unwrap().into())
+        .await
+        .unwrap();
+    let remote_readers = remote.read_pool(2).unwrap();
+    let remote = ShardActor::spawn(remote);
+    let replica =
+        api::router(remote.clone(), remote_readers.clone()).layer(axum::middleware::from_fn({
             let entered = entered.clone();
             let release = release.clone();
-            async move {
-                assert_eq!(
-                    request.uri().path(),
-                    "/patchwork.dataplane.DataPlane/WriteRecord"
-                );
-                entered.add_permits(1);
-                release.acquire().await.unwrap().forget();
-                next.run(request).await
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let entered = entered.clone();
+                let release = release.clone();
+                async move {
+                    assert_eq!(
+                        request.uri().path(),
+                        "/patchwork.dataplane.DataPlane/WriteRecord"
+                    );
+                    entered.add_permits(1);
+                    release.acquire().await.unwrap().forget();
+                    next.run(request).await
+                }
             }
-        }
-    }));
+        }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let replica_url = format!("http://{}", listener.local_addr().unwrap());
     let replica_server = tokio::spawn(async move { axum::serve(listener, replica).await.unwrap() });
 
-    let shard = ShardActor::spawn(
-        ShardActor::new(dir.path().join("local.sqlite").to_str().unwrap().into())
-            .await
-            .unwrap(),
-    );
+    let shard = ShardActor::new(dir.path().join("local.sqlite").to_str().unwrap().into())
+        .await
+        .unwrap();
+    let shard_readers = shard.read_pool(2).unwrap();
+    let shard = ShardActor::spawn(shard);
     let writer = SubordinateShardWriter::spawn(SubordinateShardWriter);
-    let app = api::router_with_writer(shard.clone(), writer.clone());
+    let app = api::router_with_writer(shard.clone(), shard_readers.clone(), writer.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-    let failover = ShardActor::spawn(
-        ShardActor::new(dir.path().join("failover.sqlite").to_str().unwrap().into())
-            .await
-            .unwrap(),
-    );
+    let failover = ShardActor::new(dir.path().join("failover.sqlite").to_str().unwrap().into())
+        .await
+        .unwrap();
+    let failover_readers = failover.read_pool(2).unwrap();
+    let failover = ShardActor::spawn(failover);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let failover_url = format!("http://{}", listener.local_addr().unwrap());
-    let failover_app = api::router(failover.clone());
+    let failover_app = api::router(failover.clone(), failover_readers.clone());
     let failover_server =
         tokio::spawn(async move { axum::serve(listener, failover_app).await.unwrap() });
 
@@ -472,27 +480,35 @@ async fn inconsistent_writes_queue_while_all_writes_wait_for_ack() {
         .await
         .unwrap();
     assert_eq!(entered.available_permits(), 1); // Queued second write was processed.
-    let saved = remote
-        .ask(patchwork_data_plane::shard_actor::Get {
-            table_id: 1,
-            partition_key: 10,
-            secondary_key: 99,
-            include_deleted: false,
-        })
+    let saved = remote_readers
+        .ask(patchwork_data_plane::read_shard::Dispatch(
+            patchwork_data_plane::read_shard::Get {
+                table_id: 1,
+                partition_key: 10,
+                secondary_key: 99,
+                include_deleted: false,
+            },
+        ))
         .await
         .unwrap()
         .unwrap();
     assert_eq!(saved.timestamp, 1);
     failover_server.abort();
     let _ = failover_server.await;
+    failover_readers.stop_gracefully().await.unwrap();
+    failover_readers.wait_for_shutdown().await;
     failover.stop_gracefully().await.unwrap();
     failover.wait_for_shutdown().await;
     server.abort();
     replica_server.abort();
     let _ = server.await;
     let _ = replica_server.await;
+    shard_readers.stop_gracefully().await.unwrap();
+    shard_readers.wait_for_shutdown().await;
     shard.stop_gracefully().await.unwrap();
     shard.wait_for_shutdown().await;
+    remote_readers.stop_gracefully().await.unwrap();
+    remote_readers.wait_for_shutdown().await;
     remote.stop_gracefully().await.unwrap();
     remote.wait_for_shutdown().await;
 }

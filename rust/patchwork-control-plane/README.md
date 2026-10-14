@@ -17,6 +17,15 @@ The server starts the existing workflow executor, including its random backgroun
 scale checks. Table changes go through that executor; HTTP responses wait for
 completion. Ctrl-C drains HTTP requests before stopping the executor.
 
+The control server, data server, and load generator use Tokio's multithread runtime.
+The default is one worker thread per available CPU; each executable logs its actual
+worker count. To override it, export `TOKIO_WORKER_THREADS` before starting the
+process (for example, `TOKIO_WORKER_THREADS=4 cargo run -p patchwork-control-plane`).
+Putting it in `.env` is too late: the runtime starts before `.env` is loaded.
+The load generator's `workers` setting limits in-flight requests, not OS threads.
+Independent requests can use different threads. Each data node keeps one write
+connection in its shard actor and uses Kameo's actor pool for read connections.
+
 - `POST /tables` invokes `MakeTable` and returns `201` with the ready table.
   Send `{"table_name":"accounts","table_owner":1,"partition_key_name":"account","sort_key_name":"id"}`.
 - `DELETE /tables/{table_id}` invokes `DeleteTable` and returns `204` after cleanup.

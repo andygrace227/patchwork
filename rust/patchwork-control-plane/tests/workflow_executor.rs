@@ -72,15 +72,15 @@ async fn executor_limits_jobs_keeps_tables_separate_and_recovers_after_failure()
     let handler_gates = gates.clone();
     let (started, mut requests) = mpsc::unbounded_channel();
     let dir = tempfile::tempdir().unwrap();
-    let shard = patchwork_data_plane::shard_actor::ShardActor::spawn(
-        patchwork_data_plane::shard_actor::ShardActor::new(
-            dir.path().join("shard.sqlite").to_str().unwrap().into(),
-        )
-        .await
-        .unwrap(),
-    );
-    let app = patchwork_data_plane::api::router(shard.clone()).layer(middleware::from_fn(
-        move |request: Request, next: Next| {
+    let shard = patchwork_data_plane::shard_actor::ShardActor::new(
+        dir.path().join("shard.sqlite").to_str().unwrap().into(),
+    )
+    .await
+    .unwrap();
+    let shard_readers = shard.read_pool(2).unwrap();
+    let shard = patchwork_data_plane::shard_actor::ShardActor::spawn(shard);
+    let app = patchwork_data_plane::api::router(shard.clone(), shard_readers.clone()).layer(
+        middleware::from_fn(move |request: Request, next: Next| {
             let handler_gates = handler_gates.clone();
             let started = started.clone();
             async move {
@@ -102,8 +102,8 @@ async fn executor_limits_jobs_keeps_tables_separate_and_recovers_after_failure()
                 next.run(Request::from_parts(parts, Body::from(bytes)))
                     .await
             }
-        },
-    ));
+        }),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -261,6 +261,8 @@ async fn executor_limits_jobs_keeps_tables_separate_and_recovers_after_failure()
     executor.wait_for_shutdown().await;
     server.abort();
     let _ = server.await;
+    shard_readers.stop_gracefully().await.unwrap();
+    shard_readers.wait_for_shutdown().await;
     shard.stop_gracefully().await.unwrap();
     shard.wait_for_shutdown().await;
     node.stop_gracefully().await.unwrap();

@@ -1,8 +1,9 @@
 use anyhow::Result;
-use kameo::{Actor, messages};
+use kameo::{Actor, actor::Spawn, messages};
+use kameo_actors::pool::ActorPool;
 use sea_orm::{
     ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection, EntityTrait,
-    QueryFilter, QueryOrder, Schema,
+    QueryFilter, Schema,
 };
 
 use std::{
@@ -12,10 +13,11 @@ use std::{
 
 use crate::{
     data,
+    read_shard::{ReadShard, ReadShardPool},
     telemetry::{self, KeyTracker},
 };
 
-/// Serializes database access for one shard.
+/// Owns the single write connection for one shard.
 #[derive(Actor)]
 pub struct ShardActor {
     db: DatabaseConnection,
@@ -59,6 +61,14 @@ impl ShardActor {
             telemetry_cleanup: Instant::now(),
         })
     }
+
+    pub fn read_pool(&self, size: usize) -> Result<ReadShardPool> {
+        anyhow::ensure!(size > 0, "Read shard pool must have at least one actor");
+        let path = self.path.clone();
+        Ok(ActorPool::spawn(ActorPool::new(size, move || {
+            ReadShard::spawn(path.clone())
+        })))
+    }
 }
 
 impl ShardActor {
@@ -77,25 +87,6 @@ impl ShardActor {
             .entry((table_id, partition_key))
             .or_insert_with(|| KeyTracker::new(telemetry::BUFFER_SIZE))
             .inc(secondary_key, is_write);
-    }
-
-    async fn range_total(
-        &self,
-        table_id: i64,
-        upper_bound: i64,
-        lower_bound: i64,
-        aggregate: &str,
-    ) -> Result<u64> {
-        anyhow::ensure!(
-            lower_bound < upper_bound,
-            "lower_bound must be less than upper_bound"
-        );
-        let row = self.db.query_one_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DbBackend::Sqlite,
-            format!("SELECT {aggregate} AS total FROM data WHERE table_id = ? AND partition_key >= ? AND partition_key < ? AND deleted = 0"),
-            [table_id.into(), lower_bound.into(), upper_bound.into()],
-        )).await?.ok_or_else(|| anyhow::anyhow!("Missing range total"))?;
-        Ok(u64::try_from(row.try_get::<i64>("", "total")?)?)
     }
 }
 
@@ -142,35 +133,6 @@ impl ShardActor {
     #[message]
     pub async fn get_size(&self) -> Result<u64> {
         Ok(std::fs::metadata(&self.path)?.len())
-    }
-
-    /// Number of records in one table's [lower_bound, upper_bound) range.
-    #[message]
-    pub async fn count_range(
-        &self,
-        table_id: i64,
-        upper_bound: i64,
-        lower_bound: i64,
-    ) -> Result<u64> {
-        self.range_total(table_id, upper_bound, lower_bound, "COUNT(*)")
-            .await
-    }
-
-    /// Stored JSON payload bytes, excluding keys, indexes and SQLite overhead.
-    #[message]
-    pub async fn get_range_size(
-        &self,
-        table_id: i64,
-        upper_bound: i64,
-        lower_bound: i64,
-    ) -> Result<u64> {
-        self.range_total(
-            table_id,
-            upper_bound,
-            lower_bound,
-            "COALESCE(SUM(LENGTH(CAST(data AS BLOB))), 0)",
-        )
-        .await
     }
 
     #[message]
@@ -278,50 +240,6 @@ impl ShardActor {
         Ok(result.rows_affected)
     }
 
-    #[message]
-    pub async fn get(
-        &mut self,
-        table_id: i64,
-        partition_key: i64,
-        secondary_key: i64,
-        include_deleted: bool,
-    ) -> Result<Option<data::Model>> {
-        let record = data::Entity::find_by_id((table_id, partition_key, secondary_key))
-            .filter(if include_deleted {
-                sea_orm::Condition::all()
-            } else {
-                sea_orm::Condition::all().add(data::Column::Deleted.eq(false))
-            })
-            .one(&self.db)
-            .await?;
-        self.track_access(table_id, partition_key, secondary_key, false);
-        Ok(record)
-    }
-
-    #[message]
-    pub async fn get_partition_key(
-        &mut self,
-        table_id: i64,
-        partition_key: i64,
-        include_deleted: bool,
-    ) -> Result<Vec<data::Model>> {
-        let records = data::Entity::find()
-            .filter(data::Column::TableId.eq(table_id))
-            .filter(data::Column::PartitionKey.eq(partition_key))
-            .order_by_asc(data::Column::SecondaryKey)
-            .filter(if include_deleted {
-                sea_orm::Condition::all()
-            } else {
-                sea_orm::Condition::all().add(data::Column::Deleted.eq(false))
-            })
-            .all(&self.db)
-            .await?;
-        for record in &records {
-            self.track_access(table_id, partition_key, record.secondary_key, false);
-        }
-        Ok(records)
-    }
-
     /// Deletes partition keys in [lower_bound, upper_bound), scoped to one table.
     #[message]
     pub async fn delete_range(
@@ -340,34 +258,6 @@ impl ShardActor {
             table != table_id || key < lower_bound || key >= upper_bound
         });
         Ok(result.rows_affected)
-    }
-
-    /// Reads partition keys in [lower_bound, upper_bound).
-    #[message]
-    pub async fn get_range(
-        &mut self,
-        table_id: i64,
-        upper_bound: i64,
-        lower_bound: i64,
-        include_deleted: bool,
-    ) -> Result<Vec<data::Model>> {
-        let records = data::Entity::find()
-            .filter(data::Column::TableId.eq(table_id))
-            .filter(data::Column::PartitionKey.gte(lower_bound))
-            .filter(data::Column::PartitionKey.lt(upper_bound))
-            .order_by_asc(data::Column::PartitionKey)
-            .order_by_asc(data::Column::SecondaryKey)
-            .filter(if include_deleted {
-                sea_orm::Condition::all()
-            } else {
-                sea_orm::Condition::all().add(data::Column::Deleted.eq(false))
-            })
-            .all(&self.db)
-            .await?;
-        for record in &records {
-            self.track_access(table_id, record.partition_key, record.secondary_key, false);
-        }
-        Ok(records)
     }
 }
 

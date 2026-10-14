@@ -19,7 +19,7 @@ async fn serve(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
     (url, server)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn routes_invoke_record_workflows_and_report_table_job_results() {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     let schema = Schema::new(db.get_database_backend());
@@ -39,18 +39,22 @@ async fn routes_invoke_record_workflows_and_report_table_job_results() {
     let mut replicas = Vec::new();
     let mut urls = Vec::new();
     for timestamp in [1, 2] {
-        let shard = ShardActor::spawn(
-            ShardActor::new(
-                dir.path()
-                    .join(format!("{timestamp}.sqlite"))
-                    .to_str()
-                    .unwrap()
-                    .into(),
-            )
-            .await
-            .unwrap(),
-        );
-        let (url, server) = serve(patchwork_data_plane::api::router(shard.clone())).await;
+        let shard = ShardActor::new(
+            dir.path()
+                .join(format!("{timestamp}.sqlite"))
+                .to_str()
+                .unwrap()
+                .into(),
+        )
+        .await
+        .unwrap();
+        let shard_readers = shard.read_pool(2).unwrap();
+        let shard = ShardActor::spawn(shard);
+        let (url, server) = serve(patchwork_data_plane::api::router(
+            shard.clone(),
+            shard_readers.clone(),
+        ))
+        .await;
         Client::upsert(&url, 1, 10, 42, &json!({"value": timestamp}), timestamp)
             .await
             .unwrap();
@@ -64,7 +68,7 @@ async fn routes_invoke_record_workflows_and_report_table_job_results() {
             .await
             .unwrap();
         replicas.push(replica.node_id);
-        shards.push(shard);
+        shards.push((shard, shard_readers));
         servers.push(server);
         urls.push(url);
     }
@@ -314,6 +318,10 @@ async fn routes_invoke_record_workflows_and_report_table_job_results() {
     }
     assert_eq!(timings["fetch_consistent"]["errors"], 1);
     assert_eq!(
+        timings["fetch_consistent"]["stages"]["replica_grpc"]["calls"],
+        4
+    );
+    assert_eq!(
         http.delete(format!("{url}/telemetry"))
             .send()
             .await
@@ -381,7 +389,9 @@ async fn routes_invoke_record_workflows_and_report_table_job_results() {
         server.abort();
         let _ = server.await;
     }
-    for shard in shards {
+    for (shard, shard_readers) in shards {
+        shard_readers.stop_gracefully().await.unwrap();
+        shard_readers.wait_for_shutdown().await;
         shard.stop_gracefully().await.unwrap();
         shard.wait_for_shutdown().await;
     }

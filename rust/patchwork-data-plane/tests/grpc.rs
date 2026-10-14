@@ -12,16 +12,16 @@ use tonic::Code;
 #[tokio::test]
 async fn grpc_validates_writes_and_carries_large_payloads_and_exact_telemetry() {
     let dir = tempfile::tempdir().unwrap();
-    let shard = ShardActor::spawn(
-        ShardActor::new(dir.path().join("shard.sqlite").to_str().unwrap().into())
-            .await
-            .unwrap(),
-    );
+    let shard = ShardActor::new(dir.path().join("shard.sqlite").to_str().unwrap().into())
+        .await
+        .unwrap();
+    let shard_readers = shard.read_pool(2).unwrap();
+    let shard = ShardActor::spawn(shard);
     let writer = SubordinateShardWriter::spawn(SubordinateShardWriter);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     // This listener has no HTTP/JSON routes: every shared-client call must be gRPC.
-    let app = grpc::router(shard.clone(), writer.clone());
+    let app = grpc::router(shard.clone(), shard_readers.clone(), writer.clone());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let mut raw = DataPlaneClient::connect(url.clone()).await.unwrap();
     let mut request = proto::WriteRequest {
@@ -92,6 +92,8 @@ async fn grpc_validates_writes_and_carries_large_payloads_and_exact_telemetry() 
     let _ = server.await;
     writer.stop_gracefully().await.unwrap();
     writer.wait_for_shutdown().await;
+    shard_readers.stop_gracefully().await.unwrap();
+    shard_readers.wait_for_shutdown().await;
     shard.stop_gracefully().await.unwrap();
     shard.wait_for_shutdown().await;
 }

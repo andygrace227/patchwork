@@ -1,10 +1,12 @@
 //! gRPC handlers use the same shard actor and replica writer as the HTTP API.
 use crate::{
     data,
+    read_shard::{CountRange, Get, GetPartitionKey, GetRange, GetRangeSize, ReadShardPool},
     shard_actor::*,
     subordinate_shard_writer::{Put, SubordinateShardWriter},
 };
 use kameo::actor::ActorRef;
+use kameo_actors::pool::Dispatch;
 use patchwork_common::grpc::{
     MAX_MESSAGE_SIZE,
     proto::{
@@ -16,18 +18,24 @@ use tonic::{Request, Response, Status};
 
 pub fn router(
     shard: ActorRef<ShardActor>,
+    readers: ReadShardPool,
     writer: ActorRef<SubordinateShardWriter>,
 ) -> axum::Router {
     tonic::service::Routes::new(
-        DataPlaneServer::new(Service { shard, writer })
-            .max_decoding_message_size(MAX_MESSAGE_SIZE)
-            .max_encoding_message_size(MAX_MESSAGE_SIZE),
+        DataPlaneServer::new(Service {
+            shard,
+            readers,
+            writer,
+        })
+        .max_decoding_message_size(MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(MAX_MESSAGE_SIZE),
     )
     .into_axum_router()
 }
 
 struct Service {
     shard: ActorRef<ShardActor>,
+    readers: ReadShardPool,
     writer: ActorRef<SubordinateShardWriter>,
 }
 
@@ -146,13 +154,13 @@ impl DataPlane for Service {
     ) -> Result<Response<proto::Record>, Status> {
         let request = request.into_inner();
         let value = self
-            .shard
-            .ask(Get {
+            .readers
+            .ask(Dispatch(Get {
                 table_id: request.table_id,
                 partition_key: request.partition_key,
                 secondary_key: request.secondary_key,
                 include_deleted: request.include_deleted,
-            })
+            }))
             .await
             .map_err(internal_error)?
             .ok_or_else(|| Status::not_found("record not found"))?;
@@ -183,12 +191,12 @@ impl DataPlane for Service {
     ) -> Result<Response<proto::Records>, Status> {
         let request = request.into_inner();
         records(
-            self.shard
-                .ask(GetPartitionKey {
+            self.readers
+                .ask(Dispatch(GetPartitionKey {
                     table_id: request.table_id,
                     partition_key: request.partition_key,
                     include_deleted: request.include_deleted,
-                })
+                }))
                 .await
                 .map_err(internal_error)?,
         )
@@ -217,13 +225,13 @@ impl DataPlane for Service {
         let request = request.into_inner();
         validate_range(&request)?;
         records(
-            self.shard
-                .ask(GetRange {
+            self.readers
+                .ask(Dispatch(GetRange {
                     table_id: request.table_id,
                     lower_bound: request.lower_bound,
                     upper_bound: request.upper_bound,
                     include_deleted: request.include_deleted,
-                })
+                }))
                 .await
                 .map_err(internal_error)?,
         )
@@ -254,12 +262,12 @@ impl DataPlane for Service {
         let request = request.into_inner();
         validate_range(&request)?;
         let count = self
-            .shard
-            .ask(CountRange {
+            .readers
+            .ask(Dispatch(CountRange {
                 table_id: request.table_id,
                 lower_bound: request.lower_bound,
                 upper_bound: request.upper_bound,
-            })
+            }))
             .await
             .map_err(internal_error)?;
         Ok(Response::new(proto::Count { count }))
@@ -272,12 +280,12 @@ impl DataPlane for Service {
         let request = request.into_inner();
         validate_range(&request)?;
         let size_bytes = self
-            .shard
-            .ask(GetRangeSize {
+            .readers
+            .ask(Dispatch(GetRangeSize {
                 table_id: request.table_id,
                 lower_bound: request.lower_bound,
                 upper_bound: request.upper_bound,
-            })
+            }))
             .await
             .map_err(internal_error)?;
         Ok(Response::new(proto::Size { size_bytes }))

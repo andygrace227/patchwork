@@ -322,6 +322,10 @@ fn emit(value: &Value) -> Result<()> {
 }
 
 async fn run(config: Config, mut cancel: watch::Receiver<bool>, report_dir: PathBuf) -> Result<()> {
+    eprintln!(
+        "Load generator using {} Tokio worker threads",
+        tokio::runtime::Handle::current().metrics().num_workers(),
+    );
     let client = Client::builder()
         .no_proxy()
         .tcp_nodelay(true)
@@ -433,7 +437,7 @@ async fn run(config: Config, mut cancel: watch::Receiver<bool>, report_dir: Path
     Ok(())
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() {
     if let Err(error) = main_result().await {
         let _ = emit(&json!({"error": format!("{error:#}")}));
