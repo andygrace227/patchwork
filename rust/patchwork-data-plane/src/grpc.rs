@@ -92,7 +92,7 @@ impl Service {
         let data = serde_json::from_slice(&request.data_json)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         if replicated {
-            crate::replicas::write(
+            crate::subordinate_shard_writer::write(
                 &self.shard,
                 &self.writer,
                 Put {

@@ -2,7 +2,13 @@ use anyhow::{Context, Result};
 use axum::serve::ListenerExt;
 use kameo::actor::Spawn;
 use patchwork_data_plane::{
-    api, shard_actor::ShardActor, subordinate_shard_writer::SubordinateShardWriter,
+    api,
+    shard_actor::ShardActor,
+    subordinate_shard_writer::SubordinateShardWriter,
+    telemetry::{
+        AccessStatsActor,
+        access_stats_actor::{FLUSH_INTERVAL, Flush, RETENTION},
+    },
 };
 
 #[tokio::main(flavor = "multi_thread")]
@@ -19,7 +25,25 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "4".into())
         .parse::<usize>()
         .context("READ_SHARD_POOL_SIZE must be a positive integer")?;
-    let shard = ShardActor::new(shard_path).await?;
+    let stats_path = std::env::var("ACCESS_STATS_PATH")
+        .unwrap_or_else(|_| format!("{shard_path}.access-stats.sqlite"));
+    let flush_interval = std::env::var("ACCESS_STATS_FLUSH_SECONDS")
+        .unwrap_or_else(|_| FLUSH_INTERVAL.as_secs().to_string())
+        .parse::<u64>()
+        .context("ACCESS_STATS_FLUSH_SECONDS must be a positive integer")?;
+    let retention = std::env::var("ACCESS_STATS_RETENTION_SECONDS")
+        .unwrap_or_else(|_| RETENTION.as_secs().to_string())
+        .parse::<u64>()
+        .context("ACCESS_STATS_RETENTION_SECONDS must be a positive integer")?;
+    let access_stats = AccessStatsActor::spawn(
+        AccessStatsActor::with_config(
+            stats_path,
+            std::time::Duration::from_secs(flush_interval),
+            std::time::Duration::from_secs(retention),
+        )
+        .await?,
+    );
+    let shard = ShardActor::with_access_stats(shard_path, access_stats.clone()).await?;
     let readers = shard.read_pool(pool_size)?;
     let shard = ShardActor::spawn(shard);
     let writer = SubordinateShardWriter::spawn(SubordinateShardWriter);
@@ -48,6 +72,12 @@ async fn main() -> Result<()> {
     readers.wait_for_shutdown().await;
     shard.stop_gracefully().await?;
     shard.wait_for_shutdown().await;
+    access_stats
+        .ask(Flush {})
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    access_stats.stop_gracefully().await?;
+    access_stats.wait_for_shutdown().await;
     result?;
     Ok(())
 }

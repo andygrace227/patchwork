@@ -3,7 +3,7 @@ pub mod node;
 pub mod parition_lock;
 pub mod partition;
 pub mod table;
-
+pub mod access_stats;
 pub use node::NodeActor;
 pub type PartitionActor = actor::CrudActor<partition::Entity>;
 pub type TableActor = actor::CrudActor<table::Entity>;

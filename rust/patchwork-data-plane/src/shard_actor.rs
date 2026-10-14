@@ -1,20 +1,27 @@
 use anyhow::Result;
-use kameo::{Actor, actor::Spawn, messages};
+use kameo::{
+    Actor,
+    actor::{ActorRef, Spawn},
+    messages,
+};
 use kameo_actors::pool::ActorPool;
 use sea_orm::{
     ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection, EntityTrait,
     QueryFilter, Schema,
 };
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    time::Instant,
-};
+use std::collections::HashMap;
 
 use crate::{
     data,
     read_shard::{ReadShard, ReadShardPool},
-    telemetry::{self, KeyTracker},
+    telemetry::{
+        self, AccessStatsActor,
+        access_stats_actor::{
+            GetTelemetry as GetAccessTelemetry, GetTelemetryForTable as GetAccessTelemetryForTable,
+            TrackAccess,
+        },
+    },
 };
 
 /// Owns the single write connection for one shard.
@@ -22,12 +29,22 @@ use crate::{
 pub struct ShardActor {
     db: DatabaseConnection,
     path: std::path::PathBuf,
-    telemetry: BTreeMap<(i64, i64), KeyTracker>,
-    telemetry_cleanup: Instant,
+    access_stats: ActorRef<AccessStatsActor>,
 }
 
 impl ShardActor {
     pub async fn new(path: String) -> Result<Self> {
+        let stats = AccessStatsActor::spawn(
+            AccessStatsActor::new(format!("{path}.access-stats.sqlite")).await?,
+        );
+        Self::with_access_stats(path, stats).await
+    }
+
+    /// Share one host statistics actor across shards and their read pools.
+    pub async fn with_access_stats(
+        path: String,
+        access_stats: ActorRef<AccessStatsActor>,
+    ) -> Result<Self> {
         if let Some(parent) = std::path::Path::new(&path).parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
@@ -57,76 +74,40 @@ impl ShardActor {
         Ok(Self {
             db,
             path: std::fs::canonicalize(path)?,
-            telemetry: BTreeMap::new(),
-            telemetry_cleanup: Instant::now(),
+            access_stats,
         })
     }
 
     pub fn read_pool(&self, size: usize) -> Result<ReadShardPool> {
         anyhow::ensure!(size > 0, "Read shard pool must have at least one actor");
         let path = self.path.clone();
+        let stats = self.access_stats.clone();
         Ok(ActorPool::spawn(ActorPool::new(size, move || {
-            ReadShard::spawn(path.clone())
+            ReadShard::spawn((path.clone(), stats.clone()))
         })))
-    }
-}
-
-impl ShardActor {
-    fn track_access(
-        &mut self,
-        table_id: i64,
-        partition_key: i64,
-        secondary_key: i64,
-        is_write: bool,
-    ) {
-        if self.telemetry_cleanup.elapsed() >= telemetry::WINDOW {
-            self.telemetry.retain(|_, tracker| !tracker.is_idle());
-            self.telemetry_cleanup = Instant::now();
-        }
-        self.telemetry
-            .entry((table_id, partition_key))
-            .or_insert_with(|| KeyTracker::new(telemetry::BUFFER_SIZE))
-            .inc(secondary_key, is_write);
     }
 }
 
 #[messages]
 impl ShardActor {
-    /// Recent local record accesses, grouped by table and partition key.
+    /// Current unflushed host accesses, grouped by table and partition key.
     #[message]
-    pub async fn get_telemetry(&mut self) -> Vec<telemetry::Model> {
-        self.telemetry.retain(|_, tracker| !tracker.is_idle());
-        self.telemetry
-            .iter()
-            .map(|(&(table_id, partition_key), tracker)| telemetry::Model {
-                table_id,
-                partition_key,
-                statistics: tracker.stats(),
-            })
-            .collect()
+    pub async fn get_telemetry(&mut self) -> Result<Vec<telemetry::Model>> {
+        self.access_stats
+            .ask(GetAccessTelemetry {})
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))
     }
 
-    /// Recent accesses for one table, keyed by partition key.
     #[message]
     pub async fn get_telemetry_for_table(
         &mut self,
         table_id: i64,
-    ) -> HashMap<i64, telemetry::Model> {
-        self.telemetry.retain(|_, tracker| !tracker.is_idle());
-        self.telemetry
-            .iter()
-            .filter(|((table, _), _)| *table == table_id)
-            .map(|(&(_, partition_key), tracker)| {
-                (
-                    partition_key,
-                    telemetry::Model {
-                        table_id,
-                        partition_key,
-                        statistics: tracker.stats(),
-                    },
-                )
-            })
-            .collect()
+    ) -> Result<HashMap<i64, telemetry::Model>> {
+        self.access_stats
+            .ask(GetAccessTelemetryForTable { table_id })
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))
     }
 
     /// Main SQLite file length in bytes, excluding WAL and SHM sidecar files.
@@ -195,7 +176,18 @@ impl ShardActor {
                 ],
             ))
             .await?;
-        self.track_access(table_id, partition_key, secondary_key, true);
+        if let Err(error) = self
+            .access_stats
+            .tell(TrackAccess {
+                table_id,
+                partition_key,
+                secondary_key,
+                is_write: true,
+            })
+            .await
+        {
+            eprintln!("Could not record write statistics: {error}");
+        }
         Ok(result.rows_affected())
     }
 
@@ -206,7 +198,6 @@ impl ShardActor {
             .filter(data::Column::TableId.eq(table_id))
             .exec(&self.db)
             .await?;
-        self.telemetry.retain(|&(table, _), _| table != table_id);
         Ok(result.rows_affected)
     }
 
@@ -236,7 +227,6 @@ impl ShardActor {
             .filter(data::Column::PartitionKey.eq(partition_key))
             .exec(&self.db)
             .await?;
-        self.telemetry.remove(&(table_id, partition_key));
         Ok(result.rows_affected)
     }
 
@@ -254,9 +244,6 @@ impl ShardActor {
             .filter(data::Column::PartitionKey.lt(upper_bound))
             .exec(&self.db)
             .await?;
-        self.telemetry.retain(|&(table, key), _| {
-            table != table_id || key < lower_bound || key >= upper_bound
-        });
         Ok(result.rows_affected)
     }
 }

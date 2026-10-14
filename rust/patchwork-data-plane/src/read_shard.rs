@@ -1,5 +1,8 @@
 //! Read workers for Kameo's actor pool, each with one read-only SQLite connection.
-use crate::data;
+use crate::{
+    data,
+    telemetry::{AccessStatsActor, access_stats_actor::TrackAccess},
+};
 use anyhow::Result;
 use kameo::{
     Actor,
@@ -19,13 +22,17 @@ pub type ReadShardPool = ActorRef<ActorPool<ReadShard>>;
 
 pub struct ReadShard {
     db: DatabaseConnection,
+    access_stats: ActorRef<AccessStatsActor>,
 }
 
 impl Actor for ReadShard {
-    type Args = PathBuf;
+    type Args = (PathBuf, ActorRef<AccessStatsActor>);
     type Error = sea_orm::DbErr;
 
-    async fn on_start(path: Self::Args, _: ActorRef<Self>) -> Result<Self, Self::Error> {
+    async fn on_start(
+        (path, access_stats): Self::Args,
+        _: ActorRef<Self>,
+    ) -> Result<Self, Self::Error> {
         let mut options = ConnectOptions::new(format!("sqlite://{}?mode=ro", path.display()));
         options
             .min_connections(1)
@@ -33,6 +40,7 @@ impl Actor for ReadShard {
             .sqlx_logging(false);
         Ok(Self {
             db: Database::connect(options).await?,
+            access_stats,
         })
     }
 
@@ -46,6 +54,21 @@ impl Actor for ReadShard {
 }
 
 impl ReadShard {
+    async fn track_access(&self, table_id: i64, partition_key: i64, secondary_key: i64) {
+        if let Err(error) = self
+            .access_stats
+            .tell(TrackAccess {
+                table_id,
+                partition_key,
+                secondary_key,
+                is_write: false,
+            })
+            .await
+        {
+            eprintln!("Could not record read statistics: {error}");
+        }
+    }
+
     async fn range_total(
         &self,
         table_id: i64,
@@ -113,6 +136,8 @@ impl ReadShard {
             })
             .one(&self.db)
             .await?;
+        self.track_access(table_id, partition_key, secondary_key)
+            .await;
         Ok(record)
     }
 
@@ -134,6 +159,10 @@ impl ReadShard {
             })
             .all(&self.db)
             .await?;
+        for record in &records {
+            self.track_access(record.table_id, record.partition_key, record.secondary_key)
+                .await;
+        }
         Ok(records)
     }
 
@@ -159,6 +188,10 @@ impl ReadShard {
             })
             .all(&self.db)
             .await?;
+        for record in &records {
+            self.track_access(record.table_id, record.partition_key, record.secondary_key)
+                .await;
+        }
         Ok(records)
     }
 }

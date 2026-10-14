@@ -4,7 +4,14 @@ use axum::{
     http::{Request, StatusCode},
 };
 use kameo::actor::Spawn;
-use patchwork_data_plane::{api, shard_actor::ShardActor};
+use patchwork_data_plane::{
+    api,
+    shard_actor::ShardActor,
+    telemetry::{
+        AccessStatsActor,
+        access_stats_actor::{Flush, GetHistory},
+    },
+};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -58,10 +65,14 @@ async fn request_at(
 }
 
 #[tokio::test]
-async fn telemetry_tracks_local_accesses_and_clears_with_data() {
+async fn telemetry_tracks_local_accesses_and_preserves_history_when_data_is_deleted() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("shard.sqlite").to_str().unwrap().to_owned();
-    let shard = ShardActor::new(path.clone()).await.unwrap();
+    let stats_path = dir.path().join("access-stats.sqlite");
+    let access_stats = AccessStatsActor::spawn(AccessStatsActor::new(&stats_path).await.unwrap());
+    let shard = ShardActor::with_access_stats(path.clone(), access_stats.clone())
+        .await
+        .unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
     let shard = ShardActor::spawn(shard);
     let app = api::router(shard.clone(), shard_readers.clone());
@@ -138,18 +149,52 @@ async fn telemetry_tracks_local_accesses_and_clears_with_data() {
     )
     .await;
     let stats = request(&app, "GET", "/shard/telemetry", None).await.1;
-    assert_eq!(stats.as_array().unwrap().len(), 1);
-    assert_eq!(stats[0]["table_id"], 2);
+    assert_eq!(stats.as_array().unwrap().len(), 3);
     assert_eq!(
-        request(&app, "GET", "/tables/1/telemetry", None).await.1,
-        json!({})
+        request(&app, "GET", "/tables/1/telemetry", None)
+            .await
+            .1
+            .as_object()
+            .unwrap()
+            .len(),
+        2
     );
     shard_readers.stop_gracefully().await.unwrap();
     shard_readers.wait_for_shutdown().await;
     shard.stop_gracefully().await.unwrap();
     shard.wait_for_shutdown().await;
+    access_stats.ask(Flush {}).await.unwrap();
+    let history = access_stats
+        .ask(GetHistory {
+            table_id: 1,
+            hash_start: 10,
+            start_ms: 0,
+            end_ms: i64::MAX,
+        })
+        .await
+        .unwrap();
+    assert_eq!(history[0].write_count, 3);
+    assert_eq!(history[0].read_count, 3);
+    access_stats.stop_gracefully().await.unwrap();
+    access_stats.wait_for_shutdown().await;
     drop(app);
-    let reopened = ShardActor::new(path).await.unwrap();
+    let access_stats = AccessStatsActor::spawn(AccessStatsActor::new(&stats_path).await.unwrap());
+    assert_eq!(
+        access_stats
+            .ask(GetHistory {
+                table_id: 1,
+                hash_start: 10,
+                start_ms: 0,
+                end_ms: i64::MAX
+            })
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let reopened = ShardActor::with_access_stats(path, access_stats.clone())
+        .await
+        .unwrap();
     let reopened_readers = reopened.read_pool(2).unwrap();
     let reopened = ShardActor::spawn(reopened);
     let app = api::router(reopened.clone(), reopened_readers.clone());
@@ -163,13 +208,21 @@ async fn telemetry_tracks_local_accesses_and_clears_with_data() {
     assert_eq!(stats[0]["median_write_position"], Value::Null);
     request(&app, "DELETE", "/tables/2", None).await;
     assert_eq!(
-        request(&app, "GET", "/shard/telemetry", None).await.1,
-        json!([])
+        request(&app, "GET", "/shard/telemetry", None)
+            .await
+            .1
+            .as_array()
+            .unwrap()
+            .len(),
+        1
     );
     reopened_readers.stop_gracefully().await.unwrap();
     reopened_readers.wait_for_shutdown().await;
     reopened.stop_gracefully().await.unwrap();
     reopened.wait_for_shutdown().await;
+    access_stats.ask(Flush {}).await.unwrap();
+    access_stats.stop_gracefully().await.unwrap();
+    access_stats.wait_for_shutdown().await;
 }
 
 #[tokio::test]

@@ -4,7 +4,6 @@ pub mod api;
 pub mod data;
 pub mod grpc;
 pub mod read_shard;
-mod replicas;
 pub mod shard_actor;
 pub mod subordinate_shard_writer;
 pub mod telemetry;

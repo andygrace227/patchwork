@@ -13,6 +13,9 @@ directory or a parent; exported environment variables take precedence.
 - BIND_ADDR defaults to 127.0.0.1:3000.
 - SHARD_PATH is required. Relative paths resolve from the working directory.
 - READ_SHARD_POOL_SIZE defaults to 4 and must be a positive integer.
+- ACCESS_STATS_PATH defaults to `<SHARD_PATH>.access-stats.sqlite`, a separate database.
+- ACCESS_STATS_FLUSH_SECONDS defaults to 60 and must be positive.
+- ACCESS_STATS_RETENTION_SECONDS defaults to 2592000 (30 days) and must be positive.
 
 Startup opens one SQLite shard through SeaORM, enables WAL, creates its data table
 if missing, and keeps the single write connection in `ShardActor`. Reads use
@@ -21,7 +24,8 @@ opens one read-only connection to the same WAL database. Point reads, partition-
 reads, range scans, counts, and payload-size queries use the pool in both APIs.
 Kameo selects a worker with the least queued work.
 Existing tables are not migrated automatically. Ctrl-C drains requests and queued
-replica writes before stopping the read pool and write actor.
+replica writes before stopping the read pool and write actor, then flushes access
+statistics before stopping their actor.
 
 Set `READ_SHARD_POOL_SIZE=8` in `.env` or the environment to change the reader
 count, then restart the data nodes. This is separate from Tokio's thread count.
@@ -136,14 +140,27 @@ GET `/tables/{table_id}/telemetry` returns only that table's entries as an objec
 keyed by partition key. `Client::get_telemetry_for_table(url, table_id)` returns
 `HashMap<i64, Telemetry>`; no recent accesses returns an empty map.
 
-Telemetry currently lives in the write actor's local `BTreeMap` and resets on restart.
-Read-pool accesses are not recorded while telemetry is being reworked. Each tracker
-retains at most 1024 accesses from the last ten seconds. During startup or buffer
-overflow, both rates use the shorter retained window reported in `window_seconds`.
-Inactive trackers are discarded when telemetry is requested or during periodic
-cleanup on access. Writes include tombstones, replicas, and acknowledged stale
-writes or retries. Physical cleanup deletes clear affected trackers; count, size,
-and telemetry requests do not count as record accesses.
+`AccessStatsActor` owns the host's in-memory `TelemetryCache` and its separate
+SQLite database. Read workers and the write actor send it record accesses. Point
+reads include misses; partition-key and range reads count each returned record.
+Writes include tombstones, replicas, and acknowledged stale writes or retries.
+Count, size, and telemetry requests do not count as record accesses. Physical
+cleanup deletes preserve access history.
+
+The cache retains at most 4096 accesses per `(table_id, partition_key)` between
+flushes. A full buffer keeps the latest accesses and shortens only that key's
+observation window. Counts and positions describe this bounded sample, rather
+than every access since startup. Each timer tick appends samples and deletes rows
+older than the retention period in one transaction, then clears the cache. A
+failed flush leaves the cache available for retry. Unflushed samples are lost if
+the process crashes.
+
+The telemetry endpoints return current unflushed samples, so they can be empty
+immediately after a flush or restart. Stored history survives restart and is
+available through `AccessStatsActor`'s `GetHistory` message, filtered by table,
+partition key, and an overlapping time range. Stored sums use decimal text to
+preserve `i128` precision. To share statistics across multiple shards in one
+process, pass the same actor to `ShardActor::with_access_stats`.
 
 Shards use auto_vacuum=FULL to reclaim completely free pages on commit.
 Existing shards with auto-vacuum disabled are rebuilt once during startup; this

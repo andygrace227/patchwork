@@ -146,7 +146,7 @@ async fn put_with_replicas(
 ) -> Result<StatusCode, ApiError> {
     let timestamp = write_timestamp(&headers)?;
     let deleted = write_deleted(&headers)?;
-    crate::replicas::write(
+    crate::subordinate_shard_writer::write(
         &shard,
         &writer,
         Put {
@@ -180,7 +180,7 @@ async fn put_with_replicas_inconsistent(
             Json(serde_json::json!({"error": "at least one remote replica is required"})),
         ));
     }
-    crate::replicas::write(
+    crate::subordinate_shard_writer::write(
         &shard,
         &writer,
         Put {
