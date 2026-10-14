@@ -3,7 +3,7 @@ use axum::serve::ListenerExt;
 use kameo::actor::Spawn;
 use patchwork_data_plane::{
     api,
-    subordinate_shard_writer::SubordinateShardWriter,
+    subordinate_shard_writer::ReplicaWriter,
     telemetry::{
         AccessStatsActor,
         access_stats_actor::{FLUSH_INTERVAL, Flush, RETENTION},
@@ -44,11 +44,19 @@ async fn main() -> Result<()> {
         )
         .await?,
     );
+    let wal_path = std::path::PathBuf::from(format!("{shard_path}.wal"));
     let shard = WriteShard::with_access_stats(shard_path, access_stats.clone()).await?;
     let readers = shard.read_pool(pool_size)?;
     let shard = WriteShard::spawn(shard);
-    let writer = SubordinateShardWriter::spawn(SubordinateShardWriter::default());
-    let handler = WriteHandler::spawn(WriteHandler::new(shard.clone(), writer.clone()));
+    let writer = ReplicaWriter::spawn(ReplicaWriter::default());
+    let handler = WriteHandler::spawn(WriteHandler::new(shard.clone(), writer.clone(), &wal_path)?);
+    handler
+        .wait_for_startup_with_result(|result| {
+            result
+                .map(|_| ())
+                .map_err(|error| anyhow::anyhow!("{error}"))
+        })
+        .await?;
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     eprintln!(
         "Data plane gRPC and HTTP listening on {} with {} Tokio worker threads and {} read actors",
@@ -69,7 +77,13 @@ async fn main() -> Result<()> {
     })
     .await;
     handler.stop_gracefully().await?;
-    handler.wait_for_shutdown().await;
+    handler
+        .wait_for_shutdown_with_result(|result| {
+            result
+                .map(|_| ())
+                .map_err(|error| anyhow::anyhow!("{error}"))
+        })
+        .await?;
     writer.stop_gracefully().await?;
     writer.wait_for_shutdown().await;
     readers.stop_gracefully().await?;

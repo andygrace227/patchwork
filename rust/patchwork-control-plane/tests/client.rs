@@ -23,10 +23,12 @@ async fn client_calls_all_shard_operations() {
     let app = patchwork_data_plane::grpc::router(
         shard.clone(),
         shard_readers.clone(),
-        patchwork_data_plane::subordinate_shard_writer::SubordinateShardWriter::spawn(
-            patchwork_data_plane::subordinate_shard_writer::SubordinateShardWriter::default(),
+        patchwork_data_plane::subordinate_shard_writer::ReplicaWriter::spawn(
+            patchwork_data_plane::subordinate_shard_writer::ReplicaWriter::default(),
         ),
-    );
+        &dir.path().join("wal"),
+    )
+    .unwrap();
     let connections = Arc::new(AtomicUsize::new(0));
     let accepted = connections.clone();
     let server = tokio::spawn(async move {
@@ -177,7 +179,12 @@ async fn range_totals_are_scoped_and_measure_payload_bytes() {
     let shard = WriteShard::spawn(shard);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let app = api::router(shard.clone(), shard_readers.clone());
+    let app = api::router(
+        shard.clone(),
+        shard_readers.clone(),
+        &dir.path().join("wal"),
+    )
+    .unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let payload = json!({"text": "café"});
     for (table, key, secondary) in [(1, 10, 1), (1, 10, 2), (1, 20, 1), (2, 10, 1)] {
@@ -261,7 +268,12 @@ async fn put_with_replicas_writes_all_and_reports_partial_failure() {
         let shard = WriteShard::spawn(shard);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         urls.push(format!("http://{}", listener.local_addr().unwrap()));
-        let app = api::router(shard.clone(), shard_readers.clone());
+        let app = api::router(
+            shard.clone(),
+            shard_readers.clone(),
+            &dir.path().join(format!("{index}.wal")),
+        )
+        .unwrap();
         servers.push(tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap()
         }));
@@ -368,7 +380,7 @@ async fn put_with_replicas_writes_all_and_reports_partial_failure() {
 #[tokio::test]
 async fn inconsistent_writes_ack_early_and_consistent_writes_wait_for_neighbors() {
     use patchwork_data_plane::{
-        subordinate_shard_writer::SubordinateShardWriter, write_handler::WriteHandler,
+        subordinate_shard_writer::ReplicaWriter, write_handler::WriteHandler,
     };
     use std::{sync::Arc, time::Duration};
     use tokio::sync::Semaphore;
@@ -382,22 +394,27 @@ async fn inconsistent_writes_ack_early_and_consistent_writes_wait_for_neighbors(
         .unwrap();
     let remote_readers = remote.read_pool(2).unwrap();
     let remote = WriteShard::spawn(remote);
-    let replica =
-        api::router(remote.clone(), remote_readers.clone()).layer(axum::middleware::from_fn({
+    let replica = api::router(
+        remote.clone(),
+        remote_readers.clone(),
+        &dir.path().join("remote-wal"),
+    )
+    .unwrap()
+    .layer(axum::middleware::from_fn({
+        let entered = entered.clone();
+        let release = release.clone();
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
             let entered = entered.clone();
             let release = release.clone();
-            move |request: axum::extract::Request, next: axum::middleware::Next| {
-                let entered = entered.clone();
-                let release = release.clone();
-                async move {
-                    if request.uri().path() == "/patchwork.dataplane.DataPlane/WriteRecord" {
-                        entered.add_permits(1);
-                        release.acquire().await.unwrap().forget();
-                    }
-                    next.run(request).await
+            async move {
+                if request.uri().path() == "/patchwork.dataplane.DataPlane/WriteRecord" {
+                    entered.add_permits(1);
+                    release.acquire().await.unwrap().forget();
                 }
+                next.run(request).await
             }
-        }));
+        }
+    }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let replica_url = format!("http://{}", listener.local_addr().unwrap());
     let replica_server = tokio::spawn(async move { axum::serve(listener, replica).await.unwrap() });
@@ -406,8 +423,10 @@ async fn inconsistent_writes_ack_early_and_consistent_writes_wait_for_neighbors(
         .unwrap();
     let readers = shard.read_pool(2).unwrap();
     let shard = WriteShard::spawn(shard);
-    let writer = SubordinateShardWriter::spawn(SubordinateShardWriter::default());
-    let handler = WriteHandler::spawn(WriteHandler::new(shard.clone(), writer.clone()));
+    let writer = ReplicaWriter::spawn(ReplicaWriter::default());
+    let handler = WriteHandler::spawn(
+        WriteHandler::new(shard.clone(), writer.clone(), &dir.path().join("local-wal")).unwrap(),
+    );
     let app = api::router_with_handler(shard.clone(), readers.clone(), handler.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());

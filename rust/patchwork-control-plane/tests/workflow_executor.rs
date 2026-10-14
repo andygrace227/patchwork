@@ -76,31 +76,35 @@ async fn executor_limits_jobs_keeps_tables_separate_and_recovers_after_failure()
     .unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
     let shard = patchwork_data_plane::write_shard::WriteShard::spawn(shard);
-    let app = patchwork_data_plane::api::router(shard.clone(), shard_readers.clone()).layer(
-        middleware::from_fn(move |request: Request, next: Next| {
-            let handler_gates = handler_gates.clone();
-            let started = started.clone();
-            async move {
-                assert_eq!(
-                    request.uri().path(),
-                    "/patchwork.dataplane.DataPlane/GetTelemetryForTable"
-                );
-                let (parts, body) = request.into_parts();
-                let bytes = to_bytes(body, 1024).await.unwrap();
-                let id = patchwork_common::grpc::proto::TableRequest::decode(&bytes[5..])
-                    .unwrap()
-                    .table_id;
-                started.send(id).unwrap();
-                handler_gates[(id - 1) as usize]
-                    .acquire()
-                    .await
-                    .unwrap()
-                    .forget();
-                next.run(Request::from_parts(parts, Body::from(bytes)))
-                    .await
-            }
-        }),
-    );
+    let app = patchwork_data_plane::api::router(
+        shard.clone(),
+        shard_readers.clone(),
+        &dir.path().join("wal"),
+    )
+    .unwrap()
+    .layer(middleware::from_fn(move |request: Request, next: Next| {
+        let handler_gates = handler_gates.clone();
+        let started = started.clone();
+        async move {
+            assert_eq!(
+                request.uri().path(),
+                "/patchwork.dataplane.DataPlane/GetTelemetryForTable"
+            );
+            let (parts, body) = request.into_parts();
+            let bytes = to_bytes(body, 1024).await.unwrap();
+            let id = patchwork_common::grpc::proto::TableRequest::decode(&bytes[5..])
+                .unwrap()
+                .table_id;
+            started.send(id).unwrap();
+            handler_gates[(id - 1) as usize]
+                .acquire()
+                .await
+                .unwrap()
+                .forget();
+            next.run(Request::from_parts(parts, Body::from(bytes)))
+                .await
+        }
+    }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

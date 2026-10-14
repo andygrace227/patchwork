@@ -46,8 +46,13 @@ class LoadGenerator:
                     raise ValueError(initial["error"])
             except Exception:
                 process.stdin.close()
-                process.wait(timeout=20)
-                process.stdout.close()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                finally:
+                    process.stdout.close()
                 raise
             self.process, self.state = process, initial
             self.thread = threading.Thread(target=self.read_progress, args=(process,), daemon=True)
@@ -71,8 +76,14 @@ class LoadGenerator:
             with self.lock:
                 self.state.update(phase="failed", running=False, last_error=str(error))
         finally:
-            process.stdout.close()
             process.stdin.close()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            finally:
+                process.stdout.close()
 
     def snapshot(self):
         with self.lock:
@@ -80,7 +91,7 @@ class LoadGenerator:
 
     def stop(self):
         with self.lock:
-            if self.process is not None and self.process.poll() is None and self.state["running"]:
+            if self.process is not None and self.process.poll() is None:
                 try:
                     self.process.stdin.write("stop\n")
                     self.process.stdin.flush()
@@ -94,6 +105,9 @@ class LoadGenerator:
         self.stop()
         if self.thread is not None:
             self.thread.join(timeout=20)
-            if self.thread.is_alive():
+        if self.process is not None:
+            if self.process.poll() is None:
                 self.process.kill()
-                self.thread.join()
+            self.process.wait()
+        if self.thread is not None:
+            self.thread.join()

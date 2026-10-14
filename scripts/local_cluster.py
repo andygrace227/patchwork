@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a fresh local Patchwork cluster. Requires Python 3, Cargo, and MySQL/MariaDB."""
+"""Run a fresh local Patchwork cluster. Requires Python 3, Cargo, lsof, and MySQL/MariaDB."""
 
 import argparse
 import json
@@ -45,6 +45,56 @@ def require(name):
     if path is None:
         raise RuntimeError(f"Missing {name}; install MySQL or MariaDB and put its bin directory on PATH")
     return path
+
+
+def clear_ports(ports):
+    if len(set(ports)) != len(ports) or any(not 1 <= port <= 65535 for port in ports):
+        raise RuntimeError("Choose distinct ports between 1 and 65535")
+    lsof = shutil.which("lsof")
+    if lsof is None:
+        raise RuntimeError("Install lsof to clear occupied cluster ports")
+
+    def listeners():
+        pids = set()
+        for port in ports:
+            result = subprocess.run(
+                [lsof, "-nP", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"],
+                text=True, capture_output=True,
+            )
+            if result.returncode not in (0, 1):
+                raise RuntimeError(result.stderr.strip() or f"Could not inspect port {port}")
+            pids.update(int(pid) for pid in result.stdout.split())
+        return pids
+
+    pids = listeners()
+    for pid in pids:
+        print(f"Stopping process {pid} on a configured port", flush=True)
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 3
+    while pids and time.monotonic() < deadline:
+        time.sleep(0.1)
+        pids.intersection_update(listeners())
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    # Wait for killed listeners to release their sockets before starting replacements.
+    deadline = time.monotonic() + 3
+    while True:
+        try:
+            for port in ports:
+                with socket.socket() as probe:
+                    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    probe.bind(("0.0.0.0", port))
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.1)
 
 
 class Cluster:
@@ -103,12 +153,7 @@ class Cluster:
             ports.append(self.args.web_port)
         ports.extend(self.args.control_port + i for i in range(self.args.control_nodes))
         ports.extend(self.args.data_port + i for i in range(self.args.data_nodes))
-        if len(set(ports)) != len(ports) or any(not 1 <= port <= 65535 for port in ports):
-            raise RuntimeError("Choose distinct ports between 1 and 65535")
-        for port in ports:
-            with socket.socket() as probe:
-                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                probe.bind(("127.0.0.1", port))
+        clear_ports(ports)
 
         print(f"Run directory: {self.directory}", flush=True)
         if not self.args.no_build:
@@ -283,6 +328,7 @@ class RemoteCluster:
         return result
 
     def start(self):
+        clear_ports([self.args.web_port])
         if not self.args.no_build:
             subprocess.run(["cargo", "build", "--release", "--manifest-path", str(ROOT / "rust" / "Cargo.toml"),
                             "--target-dir", str(TARGET.parent), "-p", "patchwork-control-plane", "--bin", "patchwork-load"], cwd=ROOT, check=True)
@@ -363,13 +409,20 @@ def main():
         print(f"Error: {error}", file=sys.stderr)
         return 1
     finally:
-        if web_app is not None:
-            web_app.extensions["load_generator"].close()
-        if server is not None:
-            server.shutdown()
-            server.server_close()
-        if cluster is not None:
-            cluster.stop()
+        # A second Ctrl-C must not abandon the remaining child processes.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        try:
+            try:
+                if web_app is not None:
+                    web_app.extensions["load_generator"].close()
+            finally:
+                if server is not None:
+                    server.shutdown()
+                    server.server_close()
+        finally:
+            if cluster is not None:
+                cluster.stop()
     return 0
 
 

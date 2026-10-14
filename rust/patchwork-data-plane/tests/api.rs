@@ -75,7 +75,12 @@ async fn telemetry_tracks_local_accesses_and_preserves_history_when_data_is_dele
         .unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
     let shard = WriteShard::spawn(shard);
-    let app = api::router(shard.clone(), shard_readers.clone());
+    let app = api::router(
+        shard.clone(),
+        shard_readers.clone(),
+        &dir.path().join("wal"),
+    )
+    .unwrap();
     assert_eq!(
         request(&app, "GET", "/shard/telemetry", None).await,
         (StatusCode::OK, json!([]))
@@ -197,7 +202,12 @@ async fn telemetry_tracks_local_accesses_and_preserves_history_when_data_is_dele
         .unwrap();
     let reopened_readers = reopened.read_pool(2).unwrap();
     let reopened = WriteShard::spawn(reopened);
-    let app = api::router(reopened.clone(), reopened_readers.clone());
+    let app = api::router(
+        reopened.clone(),
+        reopened_readers.clone(),
+        &dir.path().join("wal"),
+    )
+    .unwrap();
     assert_eq!(
         request(&app, "GET", "/shard/telemetry", None).await.1,
         json!([])
@@ -237,7 +247,12 @@ async fn operations_are_scoped_and_persist_after_reopening() {
     let shard = WriteShard::new(path.clone()).await.unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
     let shard = WriteShard::spawn(shard);
-    let app = api::router(shard.clone(), shard_readers.clone());
+    let app = api::router(
+        shard.clone(),
+        shard_readers.clone(),
+        &dir.path().join("wal"),
+    )
+    .unwrap();
     for (table_id, partition_key, secondary_key) in
         [(1, 10, -1), (1, 10, 2), (1, 20, 3), (2, 10, -1)]
     {
@@ -374,7 +389,12 @@ async fn operations_are_scoped_and_persist_after_reopening() {
     let shard = WriteShard::new(path).await.unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
     let shard = WriteShard::spawn(shard);
-    let app = api::router(shard.clone(), shard_readers.clone());
+    let app = api::router(
+        shard.clone(),
+        shard_readers.clone(),
+        &dir.path().join("wal"),
+    )
+    .unwrap();
     assert_eq!(
         request(&app, "GET", "/tables/2/partition-keys/10/records/-1", None)
             .await
@@ -427,7 +447,12 @@ async fn timestamp_wins_regardless_of_arrival_order() {
     .unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
     let shard = WriteShard::spawn(shard);
-    let app = api::router(shard.clone(), shard_readers.clone());
+    let app = api::router(
+        shard.clone(),
+        shard_readers.clone(),
+        &dir.path().join("wal"),
+    )
+    .unwrap();
     for (key, writes) in [
         (1, vec![(20, "new"), (10, "old"), (20, "new")]),
         (2, vec![(10, "old"), (20, "new")]),
@@ -485,7 +510,12 @@ async fn tombstones_win_ties_and_survive_reopening() {
     let shard = WriteShard::new(path.clone()).await.unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
     let shard = WriteShard::spawn(shard);
-    let app = api::router(shard.clone(), shard_readers.clone());
+    let app = api::router(
+        shard.clone(),
+        shard_readers.clone(),
+        &dir.path().join("wal"),
+    )
+    .unwrap();
     let record = "/tables/1/partition-keys/10/records/1";
     // Delete before the original write arrives, including an exact timestamp tie.
     assert_eq!(
@@ -580,7 +610,12 @@ async fn tombstones_win_ties_and_survive_reopening() {
     let shard = WriteShard::new(path).await.unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
     let shard = WriteShard::spawn(shard);
-    let app = api::router(shard.clone(), shard_readers.clone());
+    let app = api::router(
+        shard.clone(),
+        shard_readers.clone(),
+        &dir.path().join("wal"),
+    )
+    .unwrap();
     request_at(&app, "PUT", record, Some(json!("late")), 30).await;
     assert_eq!(
         request(&app, "GET", record, None).await.0,

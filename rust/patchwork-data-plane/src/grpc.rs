@@ -3,7 +3,7 @@ use crate::write_handler::{self, WriteHandler};
 use crate::{
     data,
     read_shard::{CountRange, Get, GetPartitionKey, GetRange, GetRangeSize, ReadShardPool},
-    subordinate_shard_writer::SubordinateShardWriter,
+    subordinate_shard_writer::ReplicaWriter,
     write_shard::*,
 };
 use kameo::actor::{ActorRef, Spawn};
@@ -21,10 +21,11 @@ use tonic::{Request, Response, Status};
 pub fn router(
     shard: ActorRef<WriteShard>,
     readers: ReadShardPool,
-    writer: ActorRef<SubordinateShardWriter>,
-) -> axum::Router {
-    let handler = WriteHandler::spawn(WriteHandler::new(shard.clone(), writer));
-    router_with_handler(shard, readers, handler)
+    writer: ActorRef<ReplicaWriter>,
+    wal_path: &std::path::Path,
+) -> anyhow::Result<axum::Router> {
+    let handler = WriteHandler::spawn(WriteHandler::new(shard.clone(), writer, wal_path)?);
+    Ok(router_with_handler(shard, readers, handler))
 }
 
 pub fn router_with_handler(

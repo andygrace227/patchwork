@@ -2,7 +2,7 @@ use crate::write_handler::{self, WriteHandler};
 use crate::{
     data,
     read_shard::{CountRange, Get, GetPartitionKey, GetRange, GetRangeSize, ReadShardPool},
-    subordinate_shard_writer::SubordinateShardWriter,
+    subordinate_shard_writer::ReplicaWriter,
     telemetry,
     write_shard::{GetSize, GetTelemetry, GetTelemetryForTable, WriteShard},
 };
@@ -19,21 +19,27 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Inject the writer and Kameo read pool into every handler.
-pub fn router(shard: ActorRef<WriteShard>, readers: ReadShardPool) -> Router {
+pub fn router(
+    shard: ActorRef<WriteShard>,
+    readers: ReadShardPool,
+    wal_path: &std::path::Path,
+) -> anyhow::Result<Router> {
     router_with_writer(
         shard,
         readers,
-        SubordinateShardWriter::spawn(SubordinateShardWriter::default()),
+        ReplicaWriter::spawn(ReplicaWriter::default()),
+        wal_path,
     )
 }
 
 pub fn router_with_writer(
     shard: ActorRef<WriteShard>,
     readers: ReadShardPool,
-    writer: ActorRef<SubordinateShardWriter>,
-) -> Router {
-    let handler = WriteHandler::spawn(WriteHandler::new(shard.clone(), writer));
-    router_with_handler(shard, readers, handler)
+    writer: ActorRef<ReplicaWriter>,
+    wal_path: &std::path::Path,
+) -> anyhow::Result<Router> {
+    let handler = WriteHandler::spawn(WriteHandler::new(shard.clone(), writer, wal_path)?);
+    Ok(router_with_handler(shard, readers, handler))
 }
 
 pub fn router_with_handler(

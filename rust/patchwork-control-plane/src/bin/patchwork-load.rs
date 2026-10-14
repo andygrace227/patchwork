@@ -208,7 +208,7 @@ async fn request(
         Ok::<_, anyhow::Error>((status.as_u16().to_string(), error))
     }
     .await;
-    let (status, error) = result.unwrap_or_else(|error| ("network".into(), error.to_string()));
+    let (status, error) = result.unwrap_or_else(|error| ("network".into(), format!("{error:#}")));
     Completion {
         status,
         read,

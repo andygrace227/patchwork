@@ -33,7 +33,12 @@ async fn copy_reads_all_sources_preserves_deletes_and_newer_destination_writes()
         let shard = WriteShard::spawn(shard);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let app = api::router(shard.clone(), shard_readers.clone());
+        let app = api::router(
+            shard.clone(),
+            shard_readers.clone(),
+            &dir.path().join(format!("{i}.wal")),
+        )
+        .unwrap();
         servers.push(tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap()
         }));

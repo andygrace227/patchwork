@@ -52,10 +52,14 @@ async fn routes_invoke_record_workflows_and_report_table_job_results() {
         .unwrap();
         let shard_readers = shard.read_pool(2).unwrap();
         let shard = WriteShard::spawn(shard);
-        let (url, server) = serve(patchwork_data_plane::api::router(
-            shard.clone(),
-            shard_readers.clone(),
-        ))
+        let (url, server) = serve(
+            patchwork_data_plane::api::router(
+                shard.clone(),
+                shard_readers.clone(),
+                &dir.path().join(format!("{timestamp}.wal")),
+            )
+            .unwrap(),
+        )
         .await;
         client
             .upsert(&url, 1, 10, 42, &json!({"value": timestamp}), timestamp)

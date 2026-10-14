@@ -8,3 +8,4 @@ pub mod subordinate_shard_writer;
 pub mod telemetry;
 pub mod write_handler;
 pub mod write_shard;
+pub mod mutation;

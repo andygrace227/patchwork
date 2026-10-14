@@ -5,12 +5,12 @@ use tokio::task::JoinSet;
 
 /// Owns a reusable client and sends requests to other nodes.
 #[derive(Actor, Default)]
-pub struct SubordinateShardWriter {
+pub struct ReplicaWriter {
     client: Client,
 }
 
 #[messages]
-impl SubordinateShardWriter {
+impl ReplicaWriter {
     #[message(ctx)]
     pub async fn put(
         &mut self,
