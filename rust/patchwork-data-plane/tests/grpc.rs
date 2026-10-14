@@ -4,7 +4,7 @@ use patchwork_common::{
     grpc::proto::{self, data_plane_client::DataPlaneClient},
 };
 use patchwork_data_plane::{
-    grpc, subordinate_shard_writer::ReplicaWriter, write_shard::WriteShard,
+    grpc, replica_writer::ReplicaWriter, write_shard::WriteShard,
 };
 use serde_json::json;
 use tonic::Code;

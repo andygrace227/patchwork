@@ -3,7 +3,7 @@ use crate::write_handler::{self, WriteHandler};
 use crate::{
     data,
     read_shard::{CountRange, Get, GetPartitionKey, GetRange, GetRangeSize, ReadShardPool},
-    subordinate_shard_writer::ReplicaWriter,
+    replica_writer::ReplicaWriter,
     write_shard::*,
 };
 use kameo::actor::{ActorRef, Spawn};

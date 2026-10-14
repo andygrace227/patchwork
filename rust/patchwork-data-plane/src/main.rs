@@ -3,7 +3,7 @@ use axum::serve::ListenerExt;
 use kameo::actor::Spawn;
 use patchwork_data_plane::{
     api,
-    subordinate_shard_writer::ReplicaWriter,
+    replica_writer::ReplicaWriter,
     telemetry::{
         AccessStatsActor,
         access_stats_actor::{FLUSH_INTERVAL, Flush, RETENTION},

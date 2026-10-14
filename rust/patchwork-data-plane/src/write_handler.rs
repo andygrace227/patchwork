@@ -20,7 +20,7 @@ use wal_db::{Lsn, SegmentedStore, Wal};
 
 use crate::{
     mutation::Mutation,
-    subordinate_shard_writer::{Put, ReplicaWriter},
+    replica_writer::{Put, ReplicaWriter},
     write_shard::{ApplyBatch, WriteShard},
 };
 

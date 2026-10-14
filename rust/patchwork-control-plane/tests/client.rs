@@ -23,8 +23,8 @@ async fn client_calls_all_shard_operations() {
     let app = patchwork_data_plane::grpc::router(
         shard.clone(),
         shard_readers.clone(),
-        patchwork_data_plane::subordinate_shard_writer::ReplicaWriter::spawn(
-            patchwork_data_plane::subordinate_shard_writer::ReplicaWriter::default(),
+        patchwork_data_plane::replica_writer::ReplicaWriter::spawn(
+            patchwork_data_plane::replica_writer::ReplicaWriter::default(),
         ),
         &dir.path().join("wal"),
     )
@@ -380,7 +380,7 @@ async fn put_with_replicas_writes_all_and_reports_partial_failure() {
 #[tokio::test]
 async fn inconsistent_writes_ack_early_and_consistent_writes_wait_for_neighbors() {
     use patchwork_data_plane::{
-        subordinate_shard_writer::ReplicaWriter, write_handler::WriteHandler,
+        replica_writer::ReplicaWriter, write_handler::WriteHandler,
     };
     use std::{sync::Arc, time::Duration};
     use tokio::sync::Semaphore;
