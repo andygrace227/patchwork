@@ -41,7 +41,7 @@ async fn routes_invoke_record_workflows_and_report_table_job_results() {
     let mut replicas = Vec::new();
     let mut urls = Vec::new();
     for timestamp in [1, 2] {
-        let shard = WriteShard::new(
+        let shard = patchwork_data_plane::initialize::shard(
             dir.path()
                 .join(format!("{timestamp}.sqlite"))
                 .to_str()

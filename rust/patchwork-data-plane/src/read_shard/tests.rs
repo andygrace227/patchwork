@@ -38,7 +38,7 @@ impl Message<TryWrite> for ReadShard {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kameo_pool_uses_another_reader_while_one_is_busy() {
     let dir = tempfile::tempdir().unwrap();
-    let shard = WriteShard::new(dir.path().join("shard.sqlite").to_str().unwrap().into())
+    let shard = crate::initialize::shard(dir.path().join("shard.sqlite").to_str().unwrap().into())
         .await
         .unwrap();
     assert!(shard.read_pool(0).is_err());

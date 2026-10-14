@@ -3,9 +3,7 @@ use patchwork_common::{
     dataplane_client::Client,
     grpc::proto::{self, data_plane_client::DataPlaneClient},
 };
-use patchwork_data_plane::{
-    grpc, replica_writer::ReplicaWriter, write_shard::WriteShard,
-};
+use patchwork_data_plane::{grpc, replica_writer::ReplicaWriter, write_shard::WriteShard};
 use serde_json::json;
 use tonic::Code;
 
@@ -13,9 +11,11 @@ use tonic::Code;
 async fn grpc_validates_writes_and_carries_large_payloads_and_exact_telemetry() {
     let client = Client::new();
     let dir = tempfile::tempdir().unwrap();
-    let shard = WriteShard::new(dir.path().join("shard.sqlite").to_str().unwrap().into())
-        .await
-        .unwrap();
+    let shard = patchwork_data_plane::initialize::shard(
+        dir.path().join("shard.sqlite").to_str().unwrap().into(),
+    )
+    .await
+    .unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
     let shard = WriteShard::spawn(shard);
     let writer = ReplicaWriter::spawn(ReplicaWriter::default());
@@ -119,7 +119,7 @@ async fn consistent_writes_to_each_other_do_not_block_replica_admission() {
     let mut nodes = Vec::new();
     let mut urls = Vec::new();
     for index in 0..2 {
-        let shard = WriteShard::new(
+        let shard = patchwork_data_plane::initialize::shard(
             dir.path()
                 .join(format!("{index}.sqlite"))
                 .to_str()

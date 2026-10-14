@@ -20,7 +20,7 @@ async fn copy_reads_all_sources_preserves_deletes_and_newer_destination_writes()
     let mut urls = Vec::new();
     let mut ids = Vec::new();
     for i in 0..4 {
-        let shard = WriteShard::new(
+        let shard = patchwork_data_plane::initialize::shard(
             dir.path()
                 .join(format!("{i}.sqlite"))
                 .to_str()

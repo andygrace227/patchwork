@@ -69,7 +69,7 @@ async fn executor_limits_jobs_keeps_tables_separate_and_recovers_after_failure()
     let handler_gates = gates.clone();
     let (started, mut requests) = mpsc::unbounded_channel();
     let dir = tempfile::tempdir().unwrap();
-    let shard = patchwork_data_plane::write_shard::WriteShard::new(
+    let shard = patchwork_data_plane::initialize::shard(
         dir.path().join("shard.sqlite").to_str().unwrap().into(),
     )
     .await

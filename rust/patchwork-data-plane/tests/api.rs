@@ -70,9 +70,12 @@ async fn telemetry_tracks_local_accesses_and_preserves_history_when_data_is_dele
     let path = dir.path().join("shard.sqlite").to_str().unwrap().to_owned();
     let stats_path = dir.path().join("access-stats.sqlite");
     let access_stats = AccessStatsActor::spawn(AccessStatsActor::new(&stats_path).await.unwrap());
-    let shard = WriteShard::with_access_stats(path.clone(), access_stats.clone())
-        .await
-        .unwrap();
+    let shard = patchwork_data_plane::initialize::shard_with_access_stats(
+        path.clone(),
+        access_stats.clone(),
+    )
+    .await
+    .unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
     let shard = WriteShard::spawn(shard);
     let app = api::router(
@@ -197,9 +200,10 @@ async fn telemetry_tracks_local_accesses_and_preserves_history_when_data_is_dele
             .len(),
         1
     );
-    let reopened = WriteShard::with_access_stats(path, access_stats.clone())
-        .await
-        .unwrap();
+    let reopened =
+        patchwork_data_plane::initialize::shard_with_access_stats(path, access_stats.clone())
+            .await
+            .unwrap();
     let reopened_readers = reopened.read_pool(2).unwrap();
     let reopened = WriteShard::spawn(reopened);
     let app = api::router(
@@ -244,7 +248,9 @@ async fn operations_are_scoped_and_persist_after_reopening() {
         .to_str()
         .unwrap()
         .to_owned();
-    let shard = WriteShard::new(path.clone()).await.unwrap();
+    let shard = patchwork_data_plane::initialize::shard(path.clone())
+        .await
+        .unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
     let shard = WriteShard::spawn(shard);
     let app = api::router(
@@ -386,7 +392,7 @@ async fn operations_are_scoped_and_persist_after_reopening() {
     shard.stop_gracefully().await.unwrap();
     shard.wait_for_shutdown().await;
 
-    let shard = WriteShard::new(path).await.unwrap();
+    let shard = patchwork_data_plane::initialize::shard(path).await.unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
     let shard = WriteShard::spawn(shard);
     let app = api::router(
@@ -436,7 +442,7 @@ async fn operations_are_scoped_and_persist_after_reopening() {
 #[tokio::test]
 async fn timestamp_wins_regardless_of_arrival_order() {
     let dir = tempfile::tempdir().unwrap();
-    let shard = WriteShard::new(
+    let shard = patchwork_data_plane::initialize::shard(
         dir.path()
             .join("timestamps.sqlite")
             .to_str()
@@ -507,7 +513,9 @@ async fn tombstones_win_ties_and_survive_reopening() {
         .to_str()
         .unwrap()
         .to_owned();
-    let shard = WriteShard::new(path.clone()).await.unwrap();
+    let shard = patchwork_data_plane::initialize::shard(path.clone())
+        .await
+        .unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
     let shard = WriteShard::spawn(shard);
     let app = api::router(
@@ -607,7 +615,7 @@ async fn tombstones_win_ties_and_survive_reopening() {
     shard_readers.wait_for_shutdown().await;
     shard.stop_gracefully().await.unwrap();
     shard.wait_for_shutdown().await;
-    let shard = WriteShard::new(path).await.unwrap();
+    let shard = patchwork_data_plane::initialize::shard(path).await.unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
     let shard = WriteShard::spawn(shard);
     let app = api::router(

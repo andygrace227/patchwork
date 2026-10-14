@@ -17,7 +17,7 @@ directory or a parent; exported environment variables take precedence.
 - ACCESS_STATS_FLUSH_SECONDS defaults to 60 and must be positive.
 - ACCESS_STATS_RETENTION_SECONDS defaults to 2592000 (30 days) and must be positive.
 
-Startup opens one SQLite shard through SeaORM, enables WAL, creates its data table
+`initialize` opens one SQLite shard through SeaORM, enables WAL, creates its data table
 if missing, and keeps the single write connection in `WriteShard`. Reads use
 `kameo_actors::pool::ActorPool<ReadShard>` through `Dispatch` messages. Each reader
 opens one read-only connection to the same WAL database. Point reads, partition-key
@@ -25,14 +25,18 @@ reads, range scans, counts, and payload-size queries use the pool in both APIs.
 Kameo selects a worker with the least queued work. Data queries use bound parameters
 and SQLx's prepared statement cache on each connection; startup PRAGMA and VACUUM
 commands run unprepared.
-`WriteHandler` appends requests to `<SHARD_PATH>.write-wal` and queues individual
-messages to `WriteShard` and `SubordinateShardWriter`. Kameo owns the queues and
-replies. Local SQLite and neighbor requests run independently; consistent writes
-wait for both, while inconsistent writes wait only for local SQLite. Reads use
-the read pool directly.
+`WriteHandler` appends requests to `<SHARD_PATH>.wal` and sends pending
+mutations to `WriteShard` in batches every 5 ms. One batch is in flight at a time;
+new writes accumulate in a separate queue while SQLite commits. Successful batch
+replies advance the committed log position. Failed batches return to the front
+of the queue for retry, and cleanup removes only committed log entries.
+`ReplicaWriter` sends neighbor requests independently. Consistent writes wait for
+local log acceptance and all neighbor acknowledgements; inconsistent writes wait
+for local log acceptance and replication queue admission. Reads use the read pool
+directly and may lag acknowledged writes until SQLite applies their batch.
 
-WAL appends do not force a disk sync. Automatic replay, retries, and checkpointing
-are not implemented; inconsistent neighbor requests are best effort.
+WAL appends do not force a disk sync. Startup replays retained log entries before
+accepting requests; inconsistent neighbor requests remain best effort.
 
 Existing tables are not migrated automatically. Ctrl-C drains requests and
 `WriteHandler` before stopping its network writer, the read pool, and `WriteShard`,
@@ -175,7 +179,7 @@ immediately after a flush or restart. Stored history survives restart and is
 available through `AccessStatsActor`'s `GetHistory` message, filtered by table,
 partition key, and an overlapping time range. Stored sums use decimal text to
 preserve `i128` precision. To share statistics across multiple shards in one
-process, pass the same actor to `WriteShard::with_access_stats`.
+process, pass the same actor to `initialize::shard_with_access_stats`.
 
 Shards use auto_vacuum=FULL to reclaim completely free pages on commit.
 Existing shards with auto-vacuum disabled are rebuilt once during startup; this

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use axum::serve::ListenerExt;
 use kameo::actor::Spawn;
 use patchwork_data_plane::{
-    api,
+    api, initialize,
     replica_writer::ReplicaWriter,
     telemetry::{
         AccessStatsActor,
@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
         .await?,
     );
     let wal_path = std::path::PathBuf::from(format!("{shard_path}.wal"));
-    let shard = WriteShard::with_access_stats(shard_path, access_stats.clone()).await?;
+    let shard = initialize::shard_with_access_stats(shard_path, access_stats.clone()).await?;
     let readers = shard.read_pool(pool_size)?;
     let shard = WriteShard::spawn(shard);
     let writer = ReplicaWriter::spawn(ReplicaWriter::default());

@@ -1,4 +1,5 @@
 use super::*;
+use sea_orm::Database;
 
 async fn pragma(db: &DatabaseConnection, name: &str) -> i64 {
     db.query_one_raw(sea_orm::Statement::from_string(
@@ -37,7 +38,7 @@ async fn auto_vacuum_handles_new_and_existing_shards() {
                 .unwrap();
             db.close().await.unwrap();
         }
-        let mut shard = WriteShard::new(path.clone()).await.unwrap();
+        let mut shard = crate::initialize::shard(path.clone()).await.unwrap();
         assert_eq!(pragma(&shard.db, "auto_vacuum").await, 1);
         if existing {
             let row = shard
@@ -60,7 +61,7 @@ async fn auto_vacuum_handles_new_and_existing_shards() {
         assert!(pragma(&shard.db, "page_count").await < before);
         assert_eq!(pragma(&shard.db, "freelist_count").await, 0);
         shard.db.close().await.unwrap();
-        let reopened = WriteShard::new(path).await.unwrap();
+        let reopened = crate::initialize::shard(path).await.unwrap();
         assert_eq!(pragma(&reopened.db, "auto_vacuum").await, 1);
         reopened.db.close().await.unwrap();
     }

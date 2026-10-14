@@ -13,9 +13,11 @@ async fn client_calls_all_shard_operations() {
 
     let client = Client::new();
     let dir = tempfile::tempdir().unwrap();
-    let shard = WriteShard::new(dir.path().join("shard.sqlite").to_str().unwrap().into())
-        .await
-        .unwrap();
+    let shard = patchwork_data_plane::initialize::shard(
+        dir.path().join("shard.sqlite").to_str().unwrap().into(),
+    )
+    .await
+    .unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
     let shard = WriteShard::spawn(shard);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -172,9 +174,11 @@ async fn client_calls_all_shard_operations() {
 async fn range_totals_are_scoped_and_measure_payload_bytes() {
     let client = Client::new();
     let dir = tempfile::tempdir().unwrap();
-    let shard = WriteShard::new(dir.path().join("totals.sqlite").to_str().unwrap().into())
-        .await
-        .unwrap();
+    let shard = patchwork_data_plane::initialize::shard(
+        dir.path().join("totals.sqlite").to_str().unwrap().into(),
+    )
+    .await
+    .unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
     let shard = WriteShard::spawn(shard);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -255,7 +259,7 @@ async fn put_with_replicas_writes_all_and_reports_partial_failure() {
     let mut servers = Vec::new();
     let mut urls = Vec::new();
     for index in 0..3 {
-        let shard = WriteShard::new(
+        let shard = patchwork_data_plane::initialize::shard(
             dir.path()
                 .join(format!("{index}.sqlite"))
                 .to_str()
@@ -379,9 +383,7 @@ async fn put_with_replicas_writes_all_and_reports_partial_failure() {
 
 #[tokio::test]
 async fn inconsistent_writes_ack_early_and_consistent_writes_wait_for_neighbors() {
-    use patchwork_data_plane::{
-        replica_writer::ReplicaWriter, write_handler::WriteHandler,
-    };
+    use patchwork_data_plane::{replica_writer::ReplicaWriter, write_handler::WriteHandler};
     use std::{sync::Arc, time::Duration};
     use tokio::sync::Semaphore;
 
@@ -389,9 +391,11 @@ async fn inconsistent_writes_ack_early_and_consistent_writes_wait_for_neighbors(
     let entered = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));
     let dir = tempfile::tempdir().unwrap();
-    let remote = WriteShard::new(dir.path().join("remote.sqlite").to_str().unwrap().into())
-        .await
-        .unwrap();
+    let remote = patchwork_data_plane::initialize::shard(
+        dir.path().join("remote.sqlite").to_str().unwrap().into(),
+    )
+    .await
+    .unwrap();
     let remote_readers = remote.read_pool(2).unwrap();
     let remote = WriteShard::spawn(remote);
     let replica = api::router(
@@ -418,9 +422,11 @@ async fn inconsistent_writes_ack_early_and_consistent_writes_wait_for_neighbors(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let replica_url = format!("http://{}", listener.local_addr().unwrap());
     let replica_server = tokio::spawn(async move { axum::serve(listener, replica).await.unwrap() });
-    let shard = WriteShard::new(dir.path().join("local.sqlite").to_str().unwrap().into())
-        .await
-        .unwrap();
+    let shard = patchwork_data_plane::initialize::shard(
+        dir.path().join("local.sqlite").to_str().unwrap().into(),
+    )
+    .await
+    .unwrap();
     let readers = shard.read_pool(2).unwrap();
     let shard = WriteShard::spawn(shard);
     let writer = ReplicaWriter::spawn(ReplicaWriter::default());

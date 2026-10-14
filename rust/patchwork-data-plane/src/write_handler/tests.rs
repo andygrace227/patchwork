@@ -1,14 +1,57 @@
 use super::*;
 use crate::data;
-use kameo::actor::Spawn;
+use kameo::{actor::Spawn, message::Message};
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, EntityTrait};
 use serde_json::json;
+
+struct PauseShard {
+    entered: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+}
+
+impl Message<PauseShard> for WriteShard {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: PauseShard, _: &mut Context<Self, ()>) {
+        msg.entered.send(()).unwrap();
+        msg.release.await.unwrap();
+    }
+}
+
+struct BatchState;
+
+impl Message<BatchState> for WriteHandler {
+    type Reply = (Lsn, Lsn, Option<Lsn>, usize);
+
+    async fn handle(&mut self, _: BatchState, _: &mut Context<Self, Self::Reply>) -> Self::Reply {
+        // Drive flushes explicitly so assertions do not depend on the timer.
+        if let Some(timer) = self.timer.take() {
+            timer.abort();
+        }
+        (
+            self.current_lsn,
+            self.committed_lsn,
+            self.in_flight.as_ref().map(|batch| batch.end_lsn),
+            self.queue.len(),
+        )
+    }
+}
+
+struct WaitForBatch;
+
+impl Message<WaitForBatch> for WriteHandler {
+    type Reply = Result<()>;
+
+    async fn handle(&mut self, _: WaitForBatch, _: &mut Context<Self, Self::Reply>) -> Self::Reply {
+        self.wait_for_batch().await
+    }
+}
 
 async fn setup() -> (tempfile::TempDir, WriteHandler, DatabaseConnection) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("shard.sqlite");
     let shard = WriteShard::spawn(
-        WriteShard::new(path.to_str().unwrap().into())
+        crate::initialize::shard(path.to_str().unwrap().into())
             .await
             .unwrap(),
     );
@@ -56,7 +99,7 @@ async fn mixed_mutations_wait_for_flush_and_keep_queue_order() {
     assert!(data::Entity::find().all(&db).await.unwrap().is_empty());
     assert_eq!(handler.queue.len(), 10);
     assert_eq!(handler.wal.iter().unwrap().count(), 10);
-    handler.flush_to_shard().await.unwrap();
+    handler.drain_to_shard().await.unwrap();
     assert!(handler.queue.is_empty());
     let rows = data::Entity::find().all(&db).await.unwrap();
     assert_eq!(rows.len(), 2);
@@ -71,7 +114,7 @@ async fn mixed_mutations_wait_for_flush_and_keep_queue_order() {
             .partition_key,
         12
     );
-    handler.flush_to_shard().await.unwrap();
+    handler.drain_to_shard().await.unwrap();
     stop(handler, db).await;
 }
 
@@ -89,7 +132,7 @@ async fn failed_batch_rolls_back_and_keeps_mutations_for_retry() {
     }
     let committed = handler.committed_lsn;
     assert!(handler.current_lsn > committed);
-    assert!(handler.flush_to_shard().await.is_err());
+    assert!(handler.drain_to_shard().await.is_err());
     assert_eq!(handler.committed_lsn, committed);
     handler.cleanup_wal().unwrap();
     assert_eq!(handler.wal.iter().unwrap().count(), 2);
@@ -98,7 +141,7 @@ async fn failed_batch_rolls_back_and_keeps_mutations_for_retry() {
     db.execute_unprepared("DROP TRIGGER reject_second")
         .await
         .unwrap();
-    handler.flush_to_shard().await.unwrap();
+    handler.drain_to_shard().await.unwrap();
     assert_eq!(handler.committed_lsn, handler.current_lsn);
     assert!(handler.queue.is_empty());
     assert_eq!(data::Entity::find().all(&db).await.unwrap().len(), 2);
@@ -155,7 +198,7 @@ async fn actor_flushes_periodically_and_on_shutdown() {
 async fn cleanup_keeps_uncommitted_commands_and_startup_replays_them_in_order() {
     let (dir, mut handler, db) = setup().await;
     handler.enqueue_record(&record(99, 1, 1)).unwrap();
-    handler.flush_to_shard().await.unwrap();
+    handler.drain_to_shard().await.unwrap();
     let committed = handler.committed_lsn;
 
     handler.enqueue_record(&record(1, 10, 1)).unwrap();
@@ -257,9 +300,195 @@ async fn timer_cleans_committed_wal_and_restart_continues_from_its_end() {
     handler.enqueue_record(&record(1, 2, 2)).unwrap();
     assert!(handler.current_lsn > previous_end);
     assert_eq!(handler.committed_lsn, previous_end);
-    handler.flush_to_shard().await.unwrap();
+    handler.drain_to_shard().await.unwrap();
     handler.cleanup_wal().unwrap();
     assert!(handler.wal.iter().unwrap().next().is_none());
     assert_eq!(data::Entity::find().all(&db).await.unwrap().len(), 2);
     stop(handler, db).await;
+}
+
+#[tokio::test]
+async fn writes_continue_during_batch_and_shutdown_drains_both_queues() {
+    let (dir, handler, db) = setup().await;
+    let shard = handler.shard.clone();
+    let writer = handler.replica_writer.clone();
+    let actor = WriteHandler::spawn(handler);
+    let _ = actor.ask(BatchState).await.unwrap();
+
+    let (entered, ready) = oneshot::channel();
+    let (release, wait) = oneshot::channel();
+    shard
+        .tell(PauseShard {
+            entered,
+            release: wait,
+        })
+        .await
+        .unwrap();
+    ready.await.unwrap();
+    actor
+        .ask(WriteRecord {
+            record: record(1, 1, 1),
+            replicas: vec![],
+            consistent: false,
+        })
+        .await
+        .unwrap();
+    let first_end = actor.ask(BatchState).await.unwrap().0;
+    tokio::time::timeout(Duration::from_secs(1), actor.ask(FlushToShard {}))
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        actor.ask(WriteRecord {
+            record: record(1, 2, 2),
+            replicas: vec![],
+            consistent: false,
+        }),
+    )
+    .await
+    .expect("PUT waited for SQLite")
+    .unwrap();
+    let (current, committed, in_flight, pending) = actor.ask(BatchState).await.unwrap();
+    assert!(current > first_end);
+    assert_eq!(committed, Lsn::new(0));
+    assert_eq!(in_flight, Some(first_end));
+    assert_eq!(pending, 1);
+    actor.ask(FlushToShard {}).await.unwrap();
+    assert_eq!(actor.ask(BatchState).await.unwrap().2, Some(first_end));
+    actor.ask(CleanupWal {}).await.unwrap();
+    assert_eq!(
+        Wal::open_segmented(dir.path().join("wal"), 16 * 1024 * 1024)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .count(),
+        2
+    );
+
+    release.send(()).unwrap();
+    actor.ask(WaitForBatch).await.unwrap();
+    let (_, committed, in_flight, pending) = actor.ask(BatchState).await.unwrap();
+    assert_eq!(committed, first_end);
+    assert!(in_flight.is_none());
+    assert_eq!(pending, 1);
+    actor.ask(CleanupWal {}).await.unwrap();
+    assert_eq!(
+        Wal::open_segmented(dir.path().join("wal"), 16 * 1024 * 1024)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .count(),
+        1
+    );
+
+    // Stop with another batch blocked and a newer write still pending.
+    let (entered, ready) = oneshot::channel();
+    let (release, wait) = oneshot::channel();
+    shard
+        .tell(PauseShard {
+            entered,
+            release: wait,
+        })
+        .await
+        .unwrap();
+    ready.await.unwrap();
+    actor.ask(FlushToShard {}).await.unwrap();
+    actor
+        .ask(WriteRecord {
+            record: record(1, 3, 3),
+            replicas: vec![],
+            consistent: false,
+        })
+        .await
+        .unwrap();
+    actor.stop_gracefully().await.unwrap();
+    release.send(()).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        actor.wait_for_shutdown_with_result(|result| {
+            result.unwrap();
+        }),
+    )
+    .await
+    .expect("Shutdown waited for a commit message");
+    assert_eq!(data::Entity::find().all(&db).await.unwrap().len(), 3);
+    let handler = WriteHandler::new(shard, writer, &dir.path().join("wal")).unwrap();
+    stop(handler, db).await;
+}
+
+#[tokio::test]
+async fn failed_in_flight_batch_retries_before_newer_delete() {
+    let (_dir, handler, db) = setup().await;
+    db.execute_unprepared(
+        "CREATE TRIGGER reject_second BEFORE INSERT ON data
+         WHEN NEW.partition_key = 2 BEGIN SELECT RAISE(ABORT, 'reject second'); END",
+    )
+    .await
+    .unwrap();
+    let shard = handler.shard.clone();
+    let writer = handler.replica_writer.clone();
+    let actor = WriteHandler::spawn(handler);
+    let (_, committed, _, _) = actor.ask(BatchState).await.unwrap();
+    let (entered, ready) = oneshot::channel();
+    let (release, wait) = oneshot::channel();
+    shard
+        .tell(PauseShard {
+            entered,
+            release: wait,
+        })
+        .await
+        .unwrap();
+    ready.await.unwrap();
+    for key in [1, 2] {
+        actor
+            .ask(WriteRecord {
+                record: record(1, key, 1),
+                replicas: vec![],
+                consistent: false,
+            })
+            .await
+            .unwrap();
+    }
+    actor.ask(FlushToShard {}).await.unwrap();
+    actor
+        .ask(DeletePartitionKey {
+            table_id: 1,
+            partition_key: 1,
+        })
+        .await
+        .unwrap();
+    release.send(()).unwrap();
+    // The callback may already have reported the failure before this request.
+    let _ = actor.ask(WaitForBatch).await;
+    let (_, after_failure, in_flight, pending) = actor.ask(BatchState).await.unwrap();
+    assert_eq!(after_failure, committed);
+    assert!(in_flight.is_none());
+    assert_eq!(pending, 3);
+    assert!(data::Entity::find().all(&db).await.unwrap().is_empty());
+    actor.ask(CleanupWal {}).await.unwrap();
+    db.execute_unprepared("DROP TRIGGER reject_second")
+        .await
+        .unwrap();
+    actor.ask(FlushToShard {}).await.unwrap();
+    actor.ask(WaitForBatch).await.unwrap();
+    let (current, committed, in_flight, pending) = actor.ask(BatchState).await.unwrap();
+    assert_eq!(committed, current);
+    assert!(in_flight.is_none());
+    assert_eq!(pending, 0);
+    let rows = data::Entity::find().all(&db).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].partition_key, 2);
+
+    actor.stop_gracefully().await.unwrap();
+    actor
+        .wait_for_shutdown_with_result(|result| {
+            result.unwrap();
+        })
+        .await;
+    writer.stop_gracefully().await.unwrap();
+    writer.wait_for_shutdown().await;
+    shard.stop_gracefully().await.unwrap();
+    shard.wait_for_shutdown().await;
+    db.close().await.unwrap();
 }

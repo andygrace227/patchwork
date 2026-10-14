@@ -1,16 +1,18 @@
 use anyhow::Result;
 use kameo::{
     Actor,
-    actor::{ActorRef, Spawn},
+    actor::{ActorRef, Spawn, WeakActorRef},
     messages,
 };
 use kameo_actors::pool::ActorPool;
 use sea_orm::{
-    ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend,
-    EntityTrait, QueryFilter, QueryTrait, Schema, Statement, TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, QueryFilter,
+    QueryTrait, Statement, TransactionTrait,
 };
 
-use std::collections::HashMap;
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use tokio::sync::oneshot;
+use wal_db::Lsn;
 
 use crate::{
     data,
@@ -23,6 +25,7 @@ use crate::{
             TrackAccess,
         },
     },
+    write_handler::{BatchFinished, WriteHandler},
 };
 
 /// Owns the single write connection for one shard.
@@ -117,50 +120,16 @@ impl WriteShard {
         })
     }
 
-    pub async fn new(path: String) -> Result<Self> {
-        let stats = AccessStatsActor::spawn(
-            AccessStatsActor::new(format!("{path}.access-stats.sqlite")).await?,
-        );
-        Self::with_access_stats(path, stats).await
-    }
-
-    /// Share one host statistics actor across shards and their read pools.
-    pub async fn with_access_stats(
-        path: String,
+    pub fn new(
+        db: DatabaseConnection,
+        path: PathBuf,
         access_stats: ActorRef<AccessStatsActor>,
-    ) -> Result<Self> {
-        if let Some(parent) = std::path::Path::new(&path).parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        let mut options = ConnectOptions::new(format!("sqlite://{path}?mode=rwc"));
-        options.max_connections(1).sqlx_logging(false);
-        let db = Database::connect(options).await?;
-        // These one-time setup commands do not need cached prepared statements.
-        db.execute_unprepared("PRAGMA auto_vacuum = FULL").await?;
-        // Existing databases without auto-vacuum need a one-time rebuild.
-        let mode = db
-            .query_one_raw(sea_orm::Statement::from_string(
-                sea_orm::DbBackend::Sqlite,
-                "PRAGMA auto_vacuum",
-            ))
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Missing auto_vacuum result"))?;
-        if mode.try_get::<i64>("", "auto_vacuum")? == 0 {
-            db.execute_unprepared("VACUUM").await?;
-        }
-        db.execute_unprepared("PRAGMA journal_mode = WAL").await?;
-
-        let backend = db.get_database_backend();
-        let mut statement = Schema::new(backend).create_table_from_entity(data::Entity);
-        statement.if_not_exists();
-        db.execute(&statement).await?;
-        Ok(Self {
+    ) -> Self {
+        Self {
             db,
-            path: std::fs::canonicalize(path)?,
+            path,
             access_stats,
-        })
+        }
     }
 
     pub fn read_pool(&self, size: usize) -> Result<ReadShardPool> {
@@ -177,7 +146,7 @@ impl WriteShard {
 impl WriteShard {
     /// Apply the queued mutations in order, committing the entire batch together.
     #[message]
-    pub async fn apply_batch(&mut self, mutations: Vec<Mutation>) -> Result<()> {
+    pub async fn apply_batch(&mut self, mutations: Arc<Vec<Mutation>>) -> Result<()> {
         if mutations.is_empty() {
             return Ok(());
         }
@@ -193,7 +162,7 @@ impl WriteShard {
             }
         }
         txn.commit().await?;
-        for mutation in mutations {
+        for mutation in mutations.iter() {
             if let Mutation::Write(record) = mutation {
                 if let Err(error) = self
                     .access_stats
@@ -210,6 +179,22 @@ impl WriteShard {
             }
         }
         Ok(())
+    }
+
+    #[message]
+    pub async fn apply_queued_batch(
+        &mut self,
+        mutations: Arc<Vec<Mutation>>,
+        end_lsn: Lsn,
+        handler: WeakActorRef<WriteHandler>,
+        completed: oneshot::Sender<Result<()>>,
+    ) {
+        let result = self.apply_batch(mutations).await;
+        let _ = completed.send(result);
+        if let Some(handler) = handler.upgrade() {
+            // The timer also checks completion if the handler's mailbox is full.
+            let _ = handler.tell(BatchFinished { end_lsn }).try_send();
+        }
     }
 
     /// Current unflushed host accesses, grouped by table and partition key.

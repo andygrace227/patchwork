@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     path::Path,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -15,13 +16,13 @@ use kameo::{
 };
 use patchwork_common::dataplane_client::Record;
 use serde::{Deserialize, Serialize};
-use tokio::task::JoinHandle;
+use tokio::{sync::oneshot, task::JoinHandle};
 use wal_db::{Lsn, SegmentedStore, Wal};
 
 use crate::{
     mutation::Mutation,
     replica_writer::{Put, ReplicaWriter},
-    write_shard::{ApplyBatch, WriteShard},
+    write_shard::{ApplyBatch, ApplyQueuedBatch, WriteShard},
 };
 
 type ReplicationReply = ForwardedReply<Put, DelegatedReply<Result<()>>>;
@@ -34,10 +35,17 @@ enum LogEntry {
     Write { mutation: Mutation },
 }
 
+struct InFlightBatch {
+    mutations: Arc<Vec<Mutation>>,
+    end_lsn: Lsn,
+    completed: oneshot::Receiver<Result<()>>,
+}
+
 pub struct WriteHandler {
     shard: ActorRef<WriteShard>,
     wal: Wal<SegmentedStore>,
     queue: VecDeque<Mutation>,
+    in_flight: Option<InFlightBatch>,
     // End offsets: the next record starts at current_lsn.
     current_lsn: Lsn,
     committed_lsn: Lsn,
@@ -69,6 +77,7 @@ impl WriteHandler {
             shard,
             wal,
             queue,
+            in_flight: None,
             current_lsn,
             committed_lsn,
             replica_writer: shard_writer,
@@ -88,6 +97,59 @@ impl WriteHandler {
     fn enqueue_record(&mut self, record: &Record) -> Result<()> {
         ensure!(record.timestamp >= 0, "timestamp must be nonnegative");
         self.enqueue_mutation(Mutation::Write(record.clone()))
+    }
+
+    fn complete_batch(&mut self, result: Result<()>) -> Result<()> {
+        let batch = self.in_flight.take().expect("No batch in flight");
+        match result {
+            Ok(()) => self.committed_lsn = batch.end_lsn,
+            Err(error) => {
+                // Failed mutations must stay ahead of writes received during the batch.
+                let mut queue = VecDeque::from(Arc::unwrap_or_clone(batch.mutations));
+                queue.append(&mut self.queue);
+                self.queue = queue;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn check_batch(&mut self) -> Result<()> {
+        let Some(batch) = &mut self.in_flight else {
+            return Ok(());
+        };
+        let result = match batch.completed.try_recv() {
+            Ok(result) => result,
+            Err(oneshot::error::TryRecvError::Empty) => return Ok(()),
+            Err(error) => Err(anyhow::anyhow!("Batch completion lost: {error}")),
+        };
+        self.complete_batch(result)
+    }
+
+    async fn wait_for_batch(&mut self) -> Result<()> {
+        if let Some(batch) = &mut self.in_flight {
+            let result = (&mut batch.completed)
+                .await
+                .unwrap_or_else(|error| Err(anyhow::anyhow!("Batch completion lost: {error}")));
+            self.complete_batch(result)?;
+        }
+        Ok(())
+    }
+
+    // Startup and shutdown can wait directly, without processing commit messages.
+    async fn drain_to_shard(&mut self) -> Result<()> {
+        self.wait_for_batch().await?;
+        if !self.queue.is_empty() {
+            self.shard
+                .ask(ApplyBatch {
+                    mutations: Arc::new(self.queue.iter().cloned().collect()),
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            self.committed_lsn = self.current_lsn;
+            self.queue.clear();
+        }
+        Ok(())
     }
 
     pub async fn write_internal_logic(
@@ -121,7 +183,7 @@ impl Actor for WriteHandler {
 
     async fn on_start(mut state: Self, actor_ref: ActorRef<Self>) -> Result<Self> {
         // Replay the retained log before accepting new messages.
-        state.flush_to_shard().await?;
+        state.drain_to_shard().await?;
         let weak = actor_ref.downgrade();
         state.timer = Some(tokio::spawn(async move {
             let mut last_cleanup = Instant::now();
@@ -152,27 +214,54 @@ impl Actor for WriteHandler {
         if let Some(timer) = self.timer.take() {
             timer.abort();
         }
-        self.flush_to_shard().await
+        self.drain_to_shard().await
     }
 }
 
 #[messages]
 impl WriteHandler {
-    /// Keep the queue intact until the shard confirms the whole batch committed.
-    #[message]
-    pub async fn flush_to_shard(&mut self) -> Result<()> {
-        if self.queue.is_empty() {
+    /// Move pending mutations aside so new writes can arrive during the commit.
+    /// Returns after sending; the completion reply advances committed_lsn separately.
+    #[message(ctx)]
+    pub async fn flush_to_shard(&mut self, ctx: &mut Context<Self, Result<()>>) -> Result<()> {
+        self.check_batch()?;
+        if self.in_flight.is_some() || self.queue.is_empty() {
             return Ok(());
         }
-        self.shard
-            .ask(ApplyBatch {
-                mutations: self.queue.iter().cloned().collect(),
+        let mutations = Arc::new(Vec::from(std::mem::take(&mut self.queue)));
+        let end_lsn = self.current_lsn;
+        let (completed, receiver) = oneshot::channel();
+        self.in_flight = Some(InFlightBatch {
+            mutations: mutations.clone(),
+            end_lsn,
+            completed: receiver,
+        });
+        if let Err(error) = self
+            .shard
+            .tell(ApplyQueuedBatch {
+                mutations,
+                end_lsn,
+                handler: ctx.actor_ref().downgrade(),
+                completed,
             })
-            .await
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-        self.committed_lsn = self.current_lsn;
-        self.queue.clear();
+            .try_send()
+        {
+            return self.complete_batch(Err(anyhow::anyhow!("Could not send batch: {error}")));
+        }
         Ok(())
+    }
+
+    #[message]
+    pub fn batch_finished(&mut self, end_lsn: Lsn) {
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|batch| batch.end_lsn == end_lsn)
+        {
+            if let Err(error) = self.check_batch() {
+                eprintln!("Could not flush queued mutations: {error}");
+            }
+        }
     }
 
     /// Reclaim only the prefix already applied to SQLite.
