@@ -21,7 +21,7 @@ directory or a parent; exported environment variables take precedence.
 if missing, and keeps the single write connection in `WriteShard`. Reads use
 `kameo_actors::pool::ActorPool<ReadShard>` through `Dispatch` messages. Each reader
 opens one read-only connection to the same WAL database. Point reads, partition-key
-reads, range scans, counts, and payload-size queries use the pool in both APIs.
+reads, range scans, counts, and payload-size queries use the pool through gRPC.
 Kameo selects a worker with the least queued work. Data queries use bound parameters
 and SQLx's prepared statement cache on each connection; startup PRAGMA and VACUUM
 commands run unprepared.
@@ -44,14 +44,14 @@ then flushes access statistics before stopping their actor.
 
 Set `READ_SHARD_POOL_SIZE=8` in `.env` or the environment to change the reader
 count, then restart the data nodes. This is separate from Tokio's thread count.
-Await a write acknowledgement before issuing a dependent read.
+An acknowledgement covers log acceptance; reads can lag until the queued batch commits.
 
 Control-to-data and data-to-data calls use gRPC exclusively, including replication,
 partition copying, cleanup, and telemetry. Each `Client` caches one HTTP/2
 channel per node; clones share its cache, and separately constructed clients own
-separate caches. Retain a client across requests. It never falls back to HTTP
-endpoints. gRPC and the HTTP endpoints below share `BIND_ADDR`, so existing node
-URLs and cluster tools still work.
+separate caches. Retain a client across requests. The data service serves only gRPC
+on `BIND_ADDR`; REST routes have been removed. Node URLs still use `http://` or
+`https://` because gRPC uses HTTP/2. The public control-plane API remains HTTP/JSON.
 Restart all data nodes with this version before starting the updated control plane.
 
 The service definition is `patchwork-common/proto/dataplane.proto`. Keys, timestamps,
@@ -63,17 +63,10 @@ Requests time out after 30 seconds, or 60 seconds for all-replica writes.
 Requests and responses, including whole range replies, are limited to 64 MiB.
 The build supplies `protoc` automatically; no separate installation is needed.
 
-Writes use `PUT /tables/{table_id}/partition-keys/{partition_key}/records/{secondary_key}`.
-The body is the JSON payload. Every write requires `x-patchwork-timestamp`: a
-nonnegative signed 64-bit Unix timestamp in microseconds, chosen by the caller.
-Missing or invalid timestamps return 400. The server never generates one.
-
-```sh
-curl -X PUT http://127.0.0.1:3000/tables/1/partition-keys/10/records/42 \
-  -H 'Content-Type: application/json' \
-  -H 'x-patchwork-timestamp: 1791158400000000' \
-  -d '{"name":"example"}'
-```
+Writes use `WriteRecord`, `WriteWithReplicas`, or `WriteWithReplicasInconsistent`.
+Every write requires a nonnegative signed 64-bit `timestamp` in Unix microseconds,
+chosen by the caller. Missing or negative timestamps return `InvalidArgument`.
+The server never generates one.
 
 The highest timestamp wins for the entire JSON record. Deletion wins an equal
 timestamp tie; ties between live values use the greater serialized JSON byte
@@ -92,40 +85,36 @@ client.put_with_replicas(url, table_id, partition_key, secondary_key, &data, &re
 client.put_with_replicas_inconsistent(url, table_id, partition_key, secondary_key, &data, &replicas, timestamp).await?;
 ```
 
-The replica endpoints append `/with-replicas` or `/with-replicas-inconsistent`
-to the record path and accept `{"data": ..., "replicas": ["http://..."]}`.
-They use the same required timestamp header and pass it unchanged to every copy.
-The first waits for local SQLite and all supplied neighbors. The second waits
-for local SQLite and queues neighbor requests independently. Replica URLs must
-exclude the receiving node; the inconsistent call requires at least one.
-Neighbors receive individual local-only `WriteRecord` RPCs, without forwarding
-writes again.
+`WriteWithReplicas` and `WriteWithReplicasInconsistent` accept the record and
+replica URLs in `WriteRequest`. Both preserve the supplied timestamp. The first
+waits for local log acceptance and all supplied neighbors; the second waits for
+local log acceptance and neighbor queue admission. Replica URLs must exclude the
+receiving node; the inconsistent call requires at least one. Neighbors receive
+local-only `WriteRecord` RPCs, without forwarding writes again.
 A failed request can leave some copies saved.
 
-GET on the record path returns the record including `timestamp` (replacing the
-old per-node `version` counter), or 404 if absent. Reads currently return the
-contacted node's copy; they do not reconcile multiple replicas.
+`GetRecord` returns the record including `timestamp`, or `NotFound` if absent.
+Reads return the contacted node's copy; they do not reconcile multiple replicas.
 
-Record DELETE requires the timestamp header and stores a tombstone (`deleted:
-true`, `data: null`), even for a key not yet present. A later arrival with an
-older or equal timestamp cannot resurrect it. A strictly newer write can.
-The response `{"deleted": N}` counts stored tombstone changes, including markers
-for absent keys; stale deletes and identical retries return zero.
+`DeleteRecord` requires a timestamp and queues a tombstone (`deleted: true`,
+`data: null`), even for a key not yet present. An older or equal timestamp cannot
+resurrect it. A strictly newer write can. Delete RPC counts currently return zero
+because mutations are queued before SQLite applies them.
 
 `Client::delete(..., timestamp)`, `delete_with_replicas(..., replicas, timestamp)`,
 and `delete_with_replicas_inconsistent(..., replicas, timestamp)` use the same
-acknowledgment rules as writes. Replicated tombstones travel through the PUT
-endpoints with `x-patchwork-deleted: true`. The flag defaults to false for normal
-writes and is preserved by the asynchronous queue.
+acknowledgement rules as writes. Replicated tombstones travel through write RPCs
+with `deleted: true`. The flag defaults to false for normal writes and is preserved
+by the asynchronous queue.
 
-Normal GET, partition-key and range reads, counts, and payload sizes exclude
-tombstones. Add `include_deleted=true` to record, partition-key, or range GETs
+Normal record, partition-key and range reads, counts, and payload sizes exclude
+tombstones. Set `include_deleted: true` on record, partition-key, or range requests
 for reconciliation. The shared client provides `get_including_deleted` and
 `get_range_including_deleted`; copy workflows use the latter and preserve both
 `timestamp` and `deleted` through `write_record`.
 
-Tombstones have no automatic expiry. Bulk table, partition-key, and range DELETE
-endpoints remain physical cleanup operations, including tombstones, for retiring
+Tombstones have no automatic expiry. Bulk `DeleteTable`, `DeletePartitionKey`, and `DeleteRange`
+RPCs remain physical cleanup operations, including tombstones, for retiring
 local data. They are not replicated logical deletes or range tombstones; use
 record deletes for logical removal. Placement and multi-replica read workflows
 remain separate work.
@@ -133,13 +122,13 @@ remain separate work.
 Existing test databases must be recreated for the `timestamp` and `deleted`
 columns. There is no schema migration.
 
-GET `/tables/{table_id}/partition-keys/{partition_key}` lists one partition key.
-GET `/tables/{table_id}/range?lower_bound=0&upper_bound=100` uses `[0, 100)`.
-Range count and size endpoints append `/count` and `/size` before the query.
-GET `/shard/size` returns `{"size_bytes": N}` for the main SQLite file,
-excluding WAL and SHM files.
+`GetPartitionKey` lists one partition key. `GetRange`, `CountRange`, and
+`GetRangeSize` use `[lower_bound, upper_bound)` and require the lower bound to be
+less than the upper bound. `GetSize` reports the main SQLite file's `size_bytes`,
+excluding WAL and SHM files. `GetWriteBacklog` reports `queued`, `in_flight`, and
+`total` mutations; it does not create access samples.
 
-GET `/shard/telemetry` returns an array grouped by `table_id` and `partition_key`,
+`GetTelemetry` returns entries grouped by `table_id` and `partition_key`,
 with `reads_per_second`, `writes_per_second`, `average_write_position`,
 `median_write_position`, and `window_seconds`. Positions refer to secondary keys;
 the median uses the upper middle observed key when the write count is even.
@@ -155,8 +144,7 @@ since individual medians cannot determine the combined median. The merged
 individual nodes' rates, measured over their own windows.
 `client.get_telemetry(url)` returns these entries as `Vec<Telemetry>` from
 `patchwork_common::dataplane_client`.
-GET `/tables/{table_id}/telemetry` returns only that table's entries as an object
-keyed by partition key. `client.get_telemetry_for_table(url, table_id)` returns
+`GetTelemetryForTable` returns only that table's entries. `client.get_telemetry_for_table(url, table_id)` returns
 `HashMap<i64, Telemetry>`; no recent accesses returns an empty map.
 
 `AccessStatsActor` owns the host's in-memory `TelemetryCache` and its separate
@@ -174,7 +162,7 @@ older than the retention period in one transaction, then clears the cache. A
 failed flush leaves the cache available for retry. Unflushed samples are lost if
 the process crashes.
 
-The telemetry endpoints return current unflushed samples, so they can be empty
+The telemetry RPCs return current unflushed samples, so they can be empty
 immediately after a flush or restart. Stored history survives restart and is
 available through `AccessStatsActor`'s `GetHistory` message, filtered by table,
 partition key, and an overlapping time range. Stored sums use decimal text to
@@ -186,3 +174,11 @@ Existing shards with auto-vacuum disabled are rebuilt once during startup; this
 can take time and temporary disk space. Later opens skip the rebuild. In WAL
 mode the main file's size may only reflect the reclamation after checkpointing.
 This does not compact partially filled pages like a full VACUUM.
+
+The local dashboard, startup checks, and smoke test use `patchwork-data`, a small
+command-line wrapper around the same Rust gRPC client. It accepts a JSON object
+on stdin and reports the gRPC status and decoded body on stdout:
+
+```sh
+echo '{"url":"http://127.0.0.1:3000","operation":"GetSize"}' | cargo run -p patchwork-data-plane --bin patchwork-data
+```

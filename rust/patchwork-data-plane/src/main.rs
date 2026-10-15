@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use axum::serve::ListenerExt;
 use kameo::actor::Spawn;
 use patchwork_data_plane::{
-    api, initialize,
+    grpc, initialize,
     replica_writer::ReplicaWriter,
     telemetry::{
         AccessStatsActor,
@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
         .await?;
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     eprintln!(
-        "Data plane gRPC and HTTP listening on {} with {} Tokio worker threads and {} read actors",
+        "Data plane gRPC listening on {} with {} Tokio worker threads and {} read actors",
         listener.local_addr()?,
         tokio::runtime::Handle::current().metrics().num_workers(),
         pool_size,
@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
                 eprintln!("Could not enable TCP_NODELAY: {error}");
             }
         }),
-        api::router_with_handler(shard.clone(), readers.clone(), handler.clone()),
+        grpc::router_with_handler(shard.clone(), readers.clone(), handler.clone()),
     )
     .with_graceful_shutdown(async {
         let _ = tokio::signal::ctrl_c().await;

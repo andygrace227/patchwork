@@ -1,6 +1,5 @@
 pub use patchwork_common::{actors, datamodels, dataplane_client};
 
-pub mod api;
 pub mod data;
 pub mod grpc;
 pub mod initialize;

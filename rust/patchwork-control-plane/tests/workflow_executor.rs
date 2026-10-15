@@ -76,7 +76,7 @@ async fn executor_limits_jobs_keeps_tables_separate_and_recovers_after_failure()
     .unwrap();
     let shard_readers = shard.read_pool(2).unwrap();
     let shard = patchwork_data_plane::write_shard::WriteShard::spawn(shard);
-    let app = patchwork_data_plane::api::router(
+    let app = patchwork_data_plane::grpc::router(
         shard.clone(),
         shard_readers.clone(),
         &dir.path().join("wal"),

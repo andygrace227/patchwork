@@ -8,6 +8,7 @@ import time
 from flask import Flask, jsonify, request
 
 from load_generator import LoadGenerator
+from data_client import data_request
 
 
 RECORD_PATH = re.compile(r"/tables/(-?\d+)/partition-keys/(-?\d+)/records/(-?\d+)")
@@ -128,32 +129,56 @@ def create_app(cluster, send_request):
                 raise ValueError("Send a JSON request object")
             node = values["node"]
             url = node_urls[node]
+            if node.startswith("data-"):
+                operation = values["path"]
+                if values["method"] != "gRPC" or operation not in {
+                    "WriteRecord", "WriteWithReplicas", "WriteWithReplicasInconsistent", "GetRecord", "DeleteRecord",
+                    "GetPartitionKey", "DeletePartitionKey", "GetRange", "DeleteRange", "CountRange", "GetRangeSize",
+                    "DeleteTable", "GetSize", "GetTelemetry", "GetTelemetryForTable", "GetWriteBacklog",
+                }:
+                    raise ValueError("Choose a supported data-node gRPC operation")
+                fields = {}
+                for key in ("table_id", "partition_key", "secondary_key", "lower_bound", "upper_bound"):
+                    if key in values.get("fields", {}):
+                        fields[key] = int(values["fields"][key])
+                        if not -(1 << 63) <= fields[key] <= (1 << 63) - 1:
+                            raise ValueError(f"{key} must be a signed 64-bit integer")
+                fields["include_deleted"] = bool(values.get("include_deleted"))
+                raw_body = values.get("body", "")
+                fields["data"] = json.loads(raw_body) if raw_body.strip() else None
+                timestamp, replicas = values.get("timestamp", ""), []
+                if operation in ("WriteRecord", "WriteWithReplicas", "WriteWithReplicasInconsistent", "DeleteRecord"):
+                    timestamp = str(timestamp if timestamp != "" else time.time_ns() // 1000)
+                    fields["timestamp"] = int(timestamp)
+                    if not 0 <= fields["timestamp"] <= (1 << 63) - 1:
+                        raise ValueError("Timestamp must be nonnegative Unix microseconds within a signed 64-bit integer")
+                    if values.get("replicate"):
+                        replicas = table_replicas(fields["table_id"], fields["partition_key"])
+                        if url not in replicas:
+                            url = replicas[0]
+                        fields["replicas"] = [replica for replica in replicas if replica != url]
+                        fields["deleted"] = operation == "DeleteRecord"
+                        if fields["deleted"]:
+                            fields["data"] = None
+                        operation = "WriteWithReplicas"
+                started = time.monotonic()
+                result = data_request(url, operation, fields, expected=None)
+                result["body"] = json.dumps(json.loads(result["body"]), indent=2, ensure_ascii=False)
+                return jsonify(**result, url=f"{url}/patchwork.dataplane.DataPlane/{operation}", method="gRPC",
+                               timestamp=timestamp, replicas=replicas, elapsed_ms=round((time.monotonic() - started) * 1000))
             method, path = values["method"], values["path"]
-            if method not in ("GET", "POST", "PUT", "DELETE") or not path.startswith(("/tables", "/shard/", "/telemetry")):
-                raise ValueError("Choose a supported method and a /tables, /shard/, or /telemetry path")
+            if method not in ("GET", "POST", "PUT", "DELETE") or not path.startswith(("/tables", "/telemetry")):
+                raise ValueError("Choose a supported method and a /tables or /telemetry path")
             raw_body = values.get("body", "")
             body = json.loads(raw_body) if raw_body.strip() else None
             headers, replicas = {}, []
             timestamp = values.get("timestamp", "")
-            record = RECORD_PATH.fullmatch(path.split("?")[0].removesuffix("/with-replicas-inconsistent").removesuffix("/with-replicas"))
+            record = RECORD_PATH.fullmatch(path.split("?")[0])
             if method in ("PUT", "DELETE") and record:
                 timestamp = str(timestamp or time.time_ns() // 1000)
                 if not 0 <= int(timestamp) <= (1 << 63) - 1:
                     raise ValueError("Timestamp must be nonnegative Unix microseconds within a signed 64-bit integer")
                 headers["x-patchwork-timestamp"] = timestamp
-            if values.get("replicate"):
-                if not node.startswith("data-") or method not in ("PUT", "DELETE") or not RECORD_PATH.fullmatch(path):
-                    raise ValueError("Replica writes need a data node and a plain record path")
-                table_id, partition_key, _ = map(int, record.groups())
-                replicas = table_replicas(table_id, partition_key)
-                if url not in replicas:
-                    url = replicas[0]
-                # Replicated deletion is the data plane's timestamped tombstone PUT.
-                if method == "DELETE":
-                    headers["x-patchwork-deleted"] = "true"
-                    body = None
-                body = {"data": body, "replicas": [replica for replica in replicas if replica != url]}
-                method, path = "PUT", path + "/with-replicas"
             if values.get("telemetry") and node.startswith("control-") and method in ("GET", "PUT"):
                 path += ("&" if "?" in path else "?") + "telemetry=true"
             started = time.monotonic()
@@ -173,7 +198,7 @@ def create_app(cluster, send_request):
         name, url = item
         result = {"name": name, "kind": name.split("-")[0]}
         try:
-            data = send_request(url + ("/telemetry" if name.startswith("control-") else "/shard/telemetry"))
+            data = send_request(url + "/telemetry") if name.startswith("control-") else data_request(url, "GetTelemetry")
             if name.startswith("data-"):
                 # Keep signed 64-bit keys exact when the browser parses JSON.
                 for row in data:
@@ -188,7 +213,7 @@ def create_app(cluster, send_request):
     def node_write_backlog(item):
         name, url = item
         try:
-            return {"name": name, "write_backlog": send_request(url + "/shard/write-backlog")}
+            return {"name": name, "write_backlog": data_request(url, "GetWriteBacklog")}
         except (RuntimeError, OSError, ValueError) as error:
             return {"name": name, "error": str(error)}
 

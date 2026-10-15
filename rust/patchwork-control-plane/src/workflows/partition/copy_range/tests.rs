@@ -1,7 +1,7 @@
 use super::*;
 use crate::{actors::crud::Create, datamodels::node, dataplane_client::Client};
 use kameo::actor::Spawn;
-use patchwork_data_plane::{api, write_shard::WriteShard};
+use patchwork_data_plane::{grpc, write_shard::WriteShard};
 use sea_orm::{ActiveValue::Set, ConnectionTrait, Database, Schema};
 use serde_json::json;
 
@@ -33,7 +33,7 @@ async fn copy_reads_all_sources_preserves_deletes_and_newer_destination_writes()
         let shard = WriteShard::spawn(shard);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let app = api::router(
+        let app = grpc::router(
             shard.clone(),
             shard_readers.clone(),
             &dir.path().join(format!("{i}.wal")),

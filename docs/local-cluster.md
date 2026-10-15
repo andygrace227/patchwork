@@ -47,13 +47,14 @@ directory when you're finished. Each new invocation starts fresh.
 Open `http://127.0.0.1:3300` while the rig is running. Pick a control node and send
 **Create a table**, then choose **Write record · consistent** or
 **Write record · inconsistent** on a control node. The created table is
-selected automatically. The page shows the node's HTTP status and response body,
+selected automatically. The page shows the node's HTTP or gRPC status and response body,
 and refreshes tables, partition placement, and lease locks every five seconds.
 
 Control node writes use the existing Rust write workflows to choose replicas.
 Consistent writes wait for every replica; inconsistent writes wait for two nodes
 and queue the others in memory. You can also pick a data node to work directly
-with its copy. Data node writes and deletes use the table's actual replicas by default, including
+with its copy over gRPC. The dashboard uses the `patchwork-data` Rust helper,
+built alongside the servers; no Python gRPC package is required. Data node writes and deletes use the table's actual replicas by default, including
 forwarding destinations. If the selected data node is outside that set, the
 request goes to a replica instead; the response shows the actual URL and replica
 list. Uncheck **Write to this table’s replicas** to touch only the selected node.
@@ -96,7 +97,7 @@ automatic split/merge/replication scheduling remains unfinished.
 
 **Data-node telemetry** shows the 100 busiest partition keys per node, read/write
 rates and sample counts, observation window, and average/median write positions.
-It reads the existing `/shard/telemetry` endpoint every five seconds; disable the
+It calls `GetTelemetry` over gRPC every five seconds; disable the
 refresh checkbox when measuring peak throughput. These are each node’s bounded
 samples, including replica traffic, so they are different from control-node TPS.
 
@@ -132,7 +133,7 @@ python3 scripts/local_cluster.py --control-nodes 2 --data-nodes 4 --smoke-test
 ```
 
 This creates a table through one control node, finds its actual replicas in
-MySQL, writes through the data plane's replica endpoint, checks each replica,
+MySQL, writes through the data plane's `WriteWithReplicas` RPC, checks each replica,
 and reads the record and range through every control node. It then checks that
 a newer tombstone wins a consistent read, checks that a held partition lease
 blocks deletion and releases partially acquired locks, expires that lease,

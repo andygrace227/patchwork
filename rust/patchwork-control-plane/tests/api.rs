@@ -53,7 +53,7 @@ async fn routes_invoke_record_workflows_and_report_table_job_results() {
         let shard_readers = shard.read_pool(2).unwrap();
         let shard = WriteShard::spawn(shard);
         let (url, server) = serve(
-            patchwork_data_plane::api::router(
+            patchwork_data_plane::grpc::router(
                 shard.clone(),
                 shard_readers.clone(),
                 &dir.path().join(format!("{timestamp}.wal")),

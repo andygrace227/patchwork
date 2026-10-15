@@ -1,4 +1,4 @@
-//! gRPC handlers use the same shard actor and replica writer as the HTTP API.
+//! Data-plane gRPC service.
 use crate::write_handler::{self, WriteHandler};
 use crate::{
     data,
@@ -19,6 +19,19 @@ use patchwork_common::grpc::{
 use tonic::{Request, Response, Status};
 
 pub fn router(
+    shard: ActorRef<WriteShard>,
+    readers: ReadShardPool,
+    wal_path: &std::path::Path,
+) -> anyhow::Result<axum::Router> {
+    router_with_writer(
+        shard,
+        readers,
+        ReplicaWriter::spawn(ReplicaWriter::default()),
+        wal_path,
+    )
+}
+
+pub fn router_with_writer(
     shard: ActorRef<WriteShard>,
     readers: ReadShardPool,
     writer: ActorRef<ReplicaWriter>,
@@ -319,6 +332,22 @@ impl DataPlane for Service {
     async fn get_size(&self, _: Request<proto::Empty>) -> Result<Response<proto::Size>, Status> {
         let size_bytes = self.shard.ask(GetSize {}).await.map_err(internal_error)?;
         Ok(Response::new(proto::Size { size_bytes }))
+    }
+
+    async fn get_write_backlog(
+        &self,
+        _: Request<proto::Empty>,
+    ) -> Result<Response<proto::WriteBacklog>, Status> {
+        let backlog = self
+            .handler
+            .ask(write_handler::GetWriteBacklog {})
+            .await
+            .map_err(internal_error)?;
+        Ok(Response::new(proto::WriteBacklog {
+            queued: backlog.queued as u64,
+            in_flight: backlog.in_flight as u64,
+            total: backlog.total as u64,
+        }))
     }
 
     async fn get_telemetry(

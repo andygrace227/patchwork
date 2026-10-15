@@ -15,6 +15,7 @@ service DataPlane {
   rpc GetRangeSize(RangeRequest) returns (Size);
   rpc DeleteTable(TableRequest) returns (Count);
   rpc GetSize(Empty) returns (Size);
+  rpc GetWriteBacklog(Empty) returns (WriteBacklog);
   rpc GetTelemetry(Empty) returns (TelemetryEntries);
   rpc GetTelemetryForTable(TableRequest) returns (TelemetryEntries);
 }
@@ -65,6 +66,11 @@ message Record {
 message Records { repeated Record records = 1; }
 message Count { uint64 count = 1; }
 message Size { uint64 size_bytes = 1; }
+message WriteBacklog {
+  uint64 queued = 1;
+  uint64 in_flight = 2;
+  uint64 total = 3;
+}
 message TelemetryEntries { repeated Telemetry entries = 1; }
 message Telemetry {
   int64 table_id = 1;

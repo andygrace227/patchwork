@@ -17,6 +17,8 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlsplit, urlunsplit
 
+from data_client import data_request
+
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGET = ROOT / "rust" / "target" / "release"
@@ -203,7 +205,7 @@ class Cluster:
                 "SHARD_PATH": str(self.directory / f"data-{i + 1}.sqlite"),
             })
         for url in self.data_urls:
-            self.wait_ready(lambda: request(url + "/shard/size"), url)
+            self.wait_ready(lambda: data_request(url, "GetSize"), url)
         for i, url in enumerate(self.control_urls):
             self.start_process(f"control-{i + 1}", [str(TARGET / "patchwork-control-plane")], {
                 "BIND_ADDR": ("0.0.0.0:" + urlsplit(url).netloc.rsplit(":", 1)[1]) if self.args.lan_host else url.removeprefix("http://"), "DATABASE_URL": self.database_url,
@@ -237,12 +239,19 @@ class Cluster:
         replicas = [self.data_urls[node_id - 1] for node_id in replica_ids]
         record_path = f"/tables/{table_id}/partition-keys/10/records/42"
         timestamp = time.time_ns() // 1000
-        headers = {"x-patchwork-timestamp": str(timestamp)}
         payload = {"name": "local test"}
-        request(replicas[0] + record_path + "/with-replicas", "PUT", {
-            "data": payload, "replicas": replicas[1:],
-        }, headers, expected=204)
-        for url in replicas + self.control_urls:
+        fields = {"table_id": table_id, "partition_key": 10, "secondary_key": 42}
+        data_request(replicas[0], "WriteWithReplicas", {
+            **fields, "data": payload, "replicas": replicas[1:], "timestamp": timestamp,
+        })
+        # Write acknowledgements precede SQLite application; wait for each copy.
+        for url in replicas:
+            def check_record():
+                record = data_request(url, "GetRecord", fields)
+                if record["data"] != payload or record["timestamp"] != timestamp:
+                    raise RuntimeError(f"Wrong record from {url}: {record}")
+            self.wait_ready(check_record, url)
+        for url in self.control_urls:
             record = request(url + record_path)
             if record["data"] != payload or record["timestamp"] != timestamp:
                 raise RuntimeError(f"Wrong record from {url}: {record}")
@@ -251,11 +260,9 @@ class Cluster:
             if len(records) != 1 or records[0]["data"] != payload:
                 raise RuntimeError(f"Wrong range from {url}: {records}")
         # A newer tombstone on one replica must beat older live copies.
-        request(replicas[0] + record_path, "DELETE", headers={
-            "x-patchwork-timestamp": str(timestamp + 1),
-        })
+        data_request(replicas[0], "DeleteRecord", {**fields, "timestamp": timestamp + 1})
         for url in self.control_urls:
-            request(url + record_path, expected=404)
+            self.wait_ready(lambda: request(url + record_path, expected=404), url)
 
         # Block the second boundary so failed deletion must release its first lock.
         boundary = int(self.sql(
@@ -276,7 +283,7 @@ class Cluster:
         # Retrying must replace the expired lease and finish cleanup.
         request(self.control_urls[-1] + f"/tables/{table_id}", "DELETE", expected=204)
         for url in self.data_urls:
-            request(url + record_path + "?include_deleted=true", expected=404)
+            self.wait_ready(lambda: data_request(url, "GetRecord", {**fields, "include_deleted": True}, expected="NotFound"), url)
         counts = self.sql(
             f"SELECT (SELECT COUNT(*) FROM `table` WHERE table_id = {table_id}), "
             f"(SELECT COUNT(*) FROM `partition` WHERE table_id = {table_id}), "

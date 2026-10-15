@@ -230,6 +230,15 @@ impl Client {
         Ok(serde_json::json!({"size_bytes": result.size_bytes}))
     }
 
+    pub async fn get_write_backlog(&self, url: &str) -> Result<Value, Status> {
+        let result = rpc(self.grpc(url)?.get_write_backlog(proto::Empty {}), 30).await?;
+        Ok(serde_json::json!({
+            "queued": result.queued,
+            "in_flight": result.in_flight,
+            "total": result.total,
+        }))
+    }
+
     /// Recent local accesses, grouped by table and partition key.
     pub async fn get_telemetry(&self, url: &str) -> Result<Vec<Telemetry>, Status> {
         rpc(self.grpc(url)?.get_telemetry(proto::Empty {}), 30)

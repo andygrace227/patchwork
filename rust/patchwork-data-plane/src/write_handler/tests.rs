@@ -368,11 +368,7 @@ async fn bounded_batches_keep_pending_wal_entries_replayable() {
 
 #[tokio::test]
 async fn full_backlog_rejects_writes_and_deletes_before_appending_to_wal() {
-    use axum::{
-        body::{Body, to_bytes},
-        http::{Request, StatusCode},
-    };
-    use tower::ServiceExt;
+    use patchwork_common::grpc::proto::{self, data_plane_client::DataPlaneClient};
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("shard.sqlite");
@@ -423,28 +419,37 @@ async fn full_backlog_rejects_writes_and_deletes_before_appending_to_wal() {
         error.status().unwrap().code(),
         tonic::Code::ResourceExhausted
     );
-    let app = crate::api::router_with_handler(shard.clone(), readers.clone(), actor.clone());
-    for method in ["PUT", "DELETE"] {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(method)
-                    .uri("/tables/1/partition-keys/1/records/1")
-                    .header("content-type", "application/json")
-                    .header("x-patchwork-timestamp", "99999")
-                    .body(Body::from("{}"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = to_bytes(response.into_body(), 1024).await.unwrap();
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
-            json!({"error": "write queue is full; retry later"})
-        );
-    }
+    let app = crate::grpc::router_with_handler(shard.clone(), readers.clone(), actor.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut client = DataPlaneClient::connect(url).await.unwrap();
+    let error = client
+        .write_record(proto::WriteRequest {
+            table_id: 1,
+            partition_key: 1,
+            secondary_key: 1,
+            timestamp: Some(99999),
+            data_json: b"{}".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    assert_eq!(error.message(), "write queue is full; retry later");
+    let error = client
+        .delete_record(proto::DeleteRequest {
+            table_id: 1,
+            partition_key: 1,
+            secondary_key: 1,
+            timestamp: Some(99999),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    assert_eq!(error.message(), "write queue is full; retry later");
+    server.abort();
+    let _ = server.await;
     assert_eq!(actor.ask(BatchState).await.unwrap().0, before);
     let backlog = actor.ask(GetWriteBacklog {}).await.unwrap();
     assert_eq!(backlog.total, MAX_WRITE_BACKLOG);

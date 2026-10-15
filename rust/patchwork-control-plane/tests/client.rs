@@ -1,6 +1,6 @@
 use kameo::actor::Spawn;
 use patchwork_control_plane::dataplane_client::Client;
-use patchwork_data_plane::{api, write_shard::WriteShard};
+use patchwork_data_plane::{grpc, write_shard::WriteShard};
 use serde_json::json;
 
 #[tokio::test]
@@ -22,7 +22,7 @@ async fn client_calls_all_shard_operations() {
     let shard = WriteShard::spawn(shard);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
-    let app = patchwork_data_plane::grpc::router(
+    let app = patchwork_data_plane::grpc::router_with_writer(
         shard.clone(),
         shard_readers.clone(),
         patchwork_data_plane::replica_writer::ReplicaWriter::spawn(
@@ -183,7 +183,7 @@ async fn range_totals_are_scoped_and_measure_payload_bytes() {
     let shard = WriteShard::spawn(shard);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let app = api::router(
+    let app = grpc::router(
         shard.clone(),
         shard_readers.clone(),
         &dir.path().join("wal"),
@@ -272,7 +272,7 @@ async fn put_with_replicas_writes_all_and_reports_partial_failure() {
         let shard = WriteShard::spawn(shard);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         urls.push(format!("http://{}", listener.local_addr().unwrap()));
-        let app = api::router(
+        let app = grpc::router(
             shard.clone(),
             shard_readers.clone(),
             &dir.path().join(format!("{index}.wal")),
@@ -398,7 +398,7 @@ async fn inconsistent_writes_ack_early_and_consistent_writes_wait_for_neighbors(
     .unwrap();
     let remote_readers = remote.read_pool(2).unwrap();
     let remote = WriteShard::spawn(remote);
-    let replica = api::router(
+    let replica = grpc::router(
         remote.clone(),
         remote_readers.clone(),
         &dir.path().join("remote-wal"),
@@ -433,7 +433,7 @@ async fn inconsistent_writes_ack_early_and_consistent_writes_wait_for_neighbors(
     let handler = WriteHandler::spawn(
         WriteHandler::new(shard.clone(), writer.clone(), &dir.path().join("local-wal")).unwrap(),
     );
-    let app = api::router_with_handler(shard.clone(), readers.clone(), handler.clone());
+    let app = grpc::router_with_handler(shard.clone(), readers.clone(), handler.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

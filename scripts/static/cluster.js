@@ -14,16 +14,16 @@ const actions = {
     { id: "delete-table", name: "Delete a table", method: "DELETE", path: "/tables/{table}" },
   ],
   data: [
-    { id: "write", name: "Write a record", method: "PUT", path: recordPath, body: { name: "local test" }, write: true },
-    { id: "read", name: "Read this node’s copy", method: "GET", path: recordPath },
-    { id: "read-deleted", name: "Read including tombstones", method: "GET", path: recordPath + "?include_deleted=true" },
-    { id: "delete", name: "Delete a record · tombstone", method: "DELETE", path: recordPath, write: true },
-    { id: "data-range", name: "Read a range", method: "GET", path: rangePath },
-    { id: "count", name: "Count records in a range", method: "GET", path: rangePath.replace("/range?", "/range/count?") },
-    { id: "size", name: "Payload size of a range", method: "GET", path: rangePath.replace("/range?", "/range/size?") },
-    { id: "shard-size", name: "Shard file size", method: "GET", path: "/shard/size" },
-    { id: "telemetry", name: "Shard telemetry", method: "GET", path: "/shard/telemetry" },
-    { id: "table-telemetry", name: "Table telemetry", method: "GET", path: "/tables/{table}/telemetry" },
+    { id: "write", name: "Write a record", method: "gRPC", path: "WriteRecord", scope: "record", body: { name: "local test" }, write: true },
+    { id: "read", name: "Read this node’s copy", method: "gRPC", path: "GetRecord", scope: "record" },
+    { id: "read-deleted", name: "Read including tombstones", method: "gRPC", path: "GetRecord", scope: "record", include_deleted: true },
+    { id: "delete", name: "Delete a record · tombstone", method: "gRPC", path: "DeleteRecord", scope: "record", write: true },
+    { id: "data-range", name: "Read a range", method: "gRPC", path: "GetRange", scope: "range" },
+    { id: "count", name: "Count records in a range", method: "gRPC", path: "CountRange", scope: "range" },
+    { id: "size", name: "Payload size of a range", method: "gRPC", path: "GetRangeSize", scope: "range" },
+    { id: "shard-size", name: "Shard file size", method: "gRPC", path: "GetSize" },
+    { id: "telemetry", name: "Shard telemetry", method: "gRPC", path: "GetTelemetry" },
+    { id: "table-telemetry", name: "Table telemetry", method: "gRPC", path: "GetTelemetryForTable", scope: "table" },
   ],
 };
 let cluster = { nodes: [], tables: [], partitions: [], locks: [] };
@@ -48,13 +48,26 @@ function pathForAction(validate = false) {
   });
 }
 
+function dataFields() {
+  const scope = action().scope;
+  const fields = scope ? { table_id: $("table").value } : {};
+  if (scope === "record") Object.assign(fields, { partition_key: $("partition-key").value.trim(), secondary_key: $("secondary-key").value.trim() });
+  if (scope === "range") Object.assign(fields, { lower_bound: $("lower-bound").value.trim(), upper_bound: $("upper-bound").value.trim() });
+  for (const [key, value] of Object.entries(fields)) {
+    if (!/^-?\d+$/.test(value) || BigInt(value) < -(1n << 63n) || BigInt(value) > (1n << 63n) - 1n) {
+      throw new Error(`${key} must be a signed 64-bit integer.`);
+    }
+  }
+  return fields;
+}
+
 function updateForm(resetBody = false) {
   const current = action();
   if (!current) return;
   $("node-kind").textContent = node().kind === "control" ? "Control plane" : "Data plane";
-  $("table-field").hidden = !current.path.includes("{table}");
-  $("key-fields").hidden = !current.path.includes("{partition}");
-  $("range-fields").hidden = !current.path.includes("{lower}");
+  $("table-field").hidden = !(current.path.includes("{table}") || current.scope);
+  $("key-fields").hidden = !(current.path.includes("{partition}") || current.scope === "record");
+  $("range-fields").hidden = !(current.path.includes("{lower}") || current.scope === "range");
   $("body-field").hidden = !current.body;
   $("timestamp-field").hidden = !current.write;
   $("request-telemetry-field").hidden = node().kind !== "control" || !(current.method === "GET" || current.method === "PUT");
@@ -154,8 +167,8 @@ async function send(values) {
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || "The dashboard could not send the request");
     lastRequest = { ...values, timestamp: result.timestamp || values.timestamp };
-    $("response-status").textContent = `HTTP ${result.status}`;
-    $("response-status").className = "tag" + (result.status >= 400 ? " bad" : "");
+    $("response-status").textContent = `${result.protocol || "HTTP"} ${result.status}`;
+    $("response-status").className = "tag" + ((result.protocol === "gRPC" ? result.status !== "OK" : result.status >= 400) ? " bad" : "");
     $("response-time").textContent = `${result.elapsed_ms} ms`;
     $("response-meta").textContent = `${result.method} ${result.url}` + (result.timestamp ? `\nTimestamp: ${result.timestamp}` : "") + (result.replicas.length ? `\nReplicas: ${result.replicas.join(", ")}` : "") + (result.server_timing ? `\nServer timing (ms): ${result.server_timing}` : "");
     $("response-body").textContent = result.body || "Request completed. No response body.";
@@ -187,6 +200,7 @@ $("request-form").onsubmit = (event) => {
     const current = action();
     if (!current) throw new Error("Wait for the cluster to connect.");
     send({ node: node().name, method: current.method, path: pathForAction(true),
+      fields: node().kind === "data" ? dataFields() : {}, include_deleted: Boolean(current.include_deleted),
       body: current.body ? $("body").value : "", timestamp: current.write ? $("timestamp").value.trim() : "",
       telemetry: node().kind === "control" && $("request-telemetry").checked,
       replicate: Boolean(current.write && node().kind === "data" && $("replicate").checked) });
