@@ -39,6 +39,23 @@ impl Message<BatchState> for WriteHandler {
 
 struct WaitForBatch;
 
+struct QueueWrites(usize);
+
+impl Message<QueueWrites> for WriteHandler {
+    type Reply = Result<()>;
+
+    async fn handle(
+        &mut self,
+        msg: QueueWrites,
+        _: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        for i in 0..msg.0 {
+            self.enqueue_record(&record(1, 1, i as i64 + 1))?;
+        }
+        Ok(())
+    }
+}
+
 impl Message<WaitForBatch> for WriteHandler {
     type Reply = Result<()>;
 
@@ -308,6 +325,225 @@ async fn timer_cleans_committed_wal_and_restart_continues_from_its_end() {
 }
 
 #[tokio::test]
+async fn bounded_batches_keep_pending_wal_entries_replayable() {
+    let (dir, handler, db) = setup().await;
+    let shard = handler.shard.clone();
+    let writer = handler.replica_writer.clone();
+    let actor = WriteHandler::spawn(handler);
+    let _ = actor.ask(BatchState).await.unwrap();
+    actor.ask(QueueWrites(FLUSH_THRESHOLD + 1)).await.unwrap();
+    actor.ask(FlushToShard {}).await.unwrap();
+    actor.ask(WaitForBatch).await.unwrap();
+    let (current, committed, in_flight, pending) = actor.ask(BatchState).await.unwrap();
+    assert!(committed < current);
+    assert!(in_flight.is_none());
+    assert_eq!(pending, 1);
+    actor.ask(CleanupWal {}).await.unwrap();
+
+    // Reopen the retained log before the final queued mutation is applied.
+    let mut recovered =
+        WriteHandler::new(shard.clone(), writer.clone(), &dir.path().join("wal")).unwrap();
+    assert_eq!(recovered.queue.len(), 1);
+    assert_eq!(recovered.queue.front().unwrap().lsn, committed);
+    recovered.drain_to_shard().await.unwrap();
+    assert_eq!(recovered.committed_lsn, current);
+    assert_eq!(
+        data::Entity::find()
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .timestamp,
+        FLUSH_THRESHOLD as i64 + 1
+    );
+    drop(recovered);
+    actor.stop_gracefully().await.unwrap();
+    actor.wait_for_shutdown().await;
+    stop(
+        WriteHandler::new(shard, writer, &dir.path().join("wal")).unwrap(),
+        db,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn full_backlog_rejects_writes_and_deletes_before_appending_to_wal() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shard.sqlite");
+    let state = crate::initialize::shard(path.display().to_string())
+        .await
+        .unwrap();
+    let readers = state.read_pool(1).unwrap();
+    let shard = WriteShard::spawn(state);
+    let writer = ReplicaWriter::spawn(ReplicaWriter::default());
+    let handler =
+        WriteHandler::new(shard.clone(), writer.clone(), &dir.path().join("wal")).unwrap();
+    let db = Database::connect(format!("sqlite://{}", path.display()))
+        .await
+        .unwrap();
+    let actor = WriteHandler::spawn(handler);
+    let _ = actor.ask(BatchState).await.unwrap();
+    let (entered, ready) = oneshot::channel();
+    let (release, wait) = oneshot::channel();
+    shard
+        .tell(PauseShard {
+            entered,
+            release: wait,
+        })
+        .await
+        .unwrap();
+    ready.await.unwrap();
+    actor.ask(QueueWrites(FLUSH_THRESHOLD)).await.unwrap();
+    actor.ask(FlushToShard {}).await.unwrap();
+    actor
+        .ask(QueueWrites(MAX_WRITE_BACKLOG - FLUSH_THRESHOLD))
+        .await
+        .unwrap();
+    let before = actor.ask(BatchState).await.unwrap().0;
+    let error = actor
+        .ask(WriteRecord {
+            record: record(1, 1, 99999),
+            replicas: vec![],
+            consistent: false,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.status().unwrap().code(),
+        tonic::Code::ResourceExhausted
+    );
+    let error = actor.ask(DeleteTable { table_id: 1 }).await.unwrap_err();
+    assert_eq!(
+        error.status().unwrap().code(),
+        tonic::Code::ResourceExhausted
+    );
+    let app = crate::api::router_with_handler(shard.clone(), readers.clone(), actor.clone());
+    for method in ["PUT", "DELETE"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/tables/1/partition-keys/1/records/1")
+                    .header("content-type", "application/json")
+                    .header("x-patchwork-timestamp", "99999")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            json!({"error": "write queue is full; retry later"})
+        );
+    }
+    assert_eq!(actor.ask(BatchState).await.unwrap().0, before);
+    let backlog = actor.ask(GetWriteBacklog {}).await.unwrap();
+    assert_eq!(backlog.total, MAX_WRITE_BACKLOG);
+    assert_eq!(backlog.in_flight, FLUSH_THRESHOLD);
+    release.send(()).unwrap();
+    actor.stop_gracefully().await.unwrap();
+    actor
+        .wait_for_shutdown_with_result(|result| {
+            result.unwrap();
+        })
+        .await;
+    readers.stop_gracefully().await.unwrap();
+    readers.wait_for_shutdown().await;
+    stop(
+        WriteHandler::new(shard, writer, &dir.path().join("wal")).unwrap(),
+        db,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn queue_threshold_flushes_without_the_timer_or_waiting_for_sqlite() {
+    let (dir, handler, db) = setup().await;
+    let shard = handler.shard.clone();
+    let writer = handler.replica_writer.clone();
+    let actor = WriteHandler::spawn(handler);
+    let _ = actor.ask(BatchState).await.unwrap(); // Disable the timer.
+    let (entered, ready) = oneshot::channel();
+    let (release, wait) = oneshot::channel();
+    shard
+        .tell(PauseShard {
+            entered,
+            release: wait,
+        })
+        .await
+        .unwrap();
+    ready.await.unwrap();
+
+    for timestamp in 1..FLUSH_THRESHOLD as i64 {
+        actor
+            .ask(WriteRecord {
+                record: record(1, 1, timestamp),
+                replicas: vec![],
+                consistent: false,
+            })
+            .await
+            .unwrap();
+    }
+    let backlog = actor.ask(GetWriteBacklog {}).await.unwrap();
+    assert_eq!(backlog.queued, FLUSH_THRESHOLD - 1);
+    assert_eq!(backlog.in_flight, 0);
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        actor.ask(WriteRecord {
+            record: record(1, 1, FLUSH_THRESHOLD as i64),
+            replicas: vec![],
+            consistent: false,
+        }),
+    )
+    .await
+    .expect("Threshold flush waited for SQLite")
+    .unwrap();
+    let backlog = actor.ask(GetWriteBacklog {}).await.unwrap();
+    assert_eq!(backlog.queued, 0);
+    assert_eq!(backlog.in_flight, FLUSH_THRESHOLD);
+
+    actor
+        .ask(WriteRecord {
+            record: record(1, 1, FLUSH_THRESHOLD as i64 + 1),
+            replicas: vec![],
+            consistent: false,
+        })
+        .await
+        .unwrap();
+    let backlog = actor.ask(GetWriteBacklog {}).await.unwrap();
+    assert_eq!(backlog.queued, 1);
+    assert_eq!(backlog.in_flight, FLUSH_THRESHOLD);
+    release.send(()).unwrap();
+    actor.ask(WaitForBatch).await.unwrap();
+    assert_eq!(
+        data::Entity::find()
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .timestamp,
+        FLUSH_THRESHOLD as i64
+    );
+    actor.stop_gracefully().await.unwrap();
+    actor
+        .wait_for_shutdown_with_result(|result| {
+            result.unwrap();
+        })
+        .await;
+    let handler = WriteHandler::new(shard, writer, &dir.path().join("wal")).unwrap();
+    stop(handler, db).await;
+}
+
+#[tokio::test]
 async fn writes_continue_during_batch_and_shutdown_drains_both_queues() {
     let (dir, handler, db) = setup().await;
     let shard = handler.shard.clone();
@@ -354,6 +590,18 @@ async fn writes_continue_during_batch_and_shutdown_drains_both_queues() {
     assert_eq!(committed, Lsn::new(0));
     assert_eq!(in_flight, Some(first_end));
     assert_eq!(pending, 1);
+    let backlog = tokio::time::timeout(Duration::from_secs(1), actor.ask(GetWriteBacklog {}))
+        .await
+        .expect("Backlog reporting waited for SQLite")
+        .unwrap();
+    assert_eq!(
+        backlog,
+        crate::telemetry::WriteBacklog {
+            queued: 1,
+            in_flight: 1,
+            total: 2
+        }
+    );
     actor.ask(FlushToShard {}).await.unwrap();
     assert_eq!(actor.ask(BatchState).await.unwrap().2, Some(first_end));
     actor.ask(CleanupWal {}).await.unwrap();
@@ -372,6 +620,14 @@ async fn writes_continue_during_batch_and_shutdown_drains_both_queues() {
     assert_eq!(committed, first_end);
     assert!(in_flight.is_none());
     assert_eq!(pending, 1);
+    assert_eq!(
+        actor.ask(GetWriteBacklog {}).await.unwrap(),
+        crate::telemetry::WriteBacklog {
+            queued: 1,
+            in_flight: 0,
+            total: 1
+        }
+    );
     actor.ask(CleanupWal {}).await.unwrap();
     assert_eq!(
         Wal::open_segmented(dir.path().join("wal"), 16 * 1024 * 1024)
@@ -465,6 +721,7 @@ async fn failed_in_flight_batch_retries_before_newer_delete() {
     assert_eq!(after_failure, committed);
     assert!(in_flight.is_none());
     assert_eq!(pending, 3);
+    assert_eq!(actor.ask(GetWriteBacklog {}).await.unwrap().total, 3);
     assert!(data::Entity::find().all(&db).await.unwrap().is_empty());
     actor.ask(CleanupWal {}).await.unwrap();
     db.execute_unprepared("DROP TRIGGER reject_second")
@@ -476,6 +733,7 @@ async fn failed_in_flight_batch_retries_before_newer_delete() {
     assert_eq!(committed, current);
     assert!(in_flight.is_none());
     assert_eq!(pending, 0);
+    assert_eq!(actor.ask(GetWriteBacklog {}).await.unwrap().total, 0);
     let rows = data::Entity::find().all(&db).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].partition_key, 2);

@@ -92,6 +92,16 @@ fn internal_error(error: impl std::fmt::Display) -> ApiError {
     )
 }
 
+fn write_error(error: anyhow::Error) -> ApiError {
+    if let Some(status) = error
+        .downcast_ref::<tonic::Status>()
+        .filter(|status| status.code() == tonic::Code::ResourceExhausted)
+    {
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, status.message());
+    }
+    internal_error(error)
+}
+
 // Keep table changes in the executor's queue and reply only after completion.
 async fn submit<W: Workflow>(
     state: &AppState,
@@ -296,7 +306,7 @@ async fn put_record(
                     })
                     .await
                 }
-                .map_err(internal_error)?;
+                .map_err(write_error)?;
                 Ok::<_, ApiError>(StatusCode::NO_CONTENT)
             },
         )

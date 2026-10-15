@@ -7,7 +7,7 @@ use kameo::{
 use kameo_actors::pool::ActorPool;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, QueryFilter,
-    QueryTrait, Statement, TransactionTrait,
+    QueryTrait, Statement, TransactionTrait, Value,
 };
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
@@ -28,6 +28,8 @@ use crate::{
     write_handler::{BatchFinished, WriteHandler},
 };
 
+pub const SQL_WRITE_BATCH_SIZE: usize = 256;
+
 /// Owns the single write connection for one shard.
 #[derive(Actor)]
 pub struct WriteShard {
@@ -47,33 +49,85 @@ impl WriteShard {
         timestamp: i64,
         deleted: bool,
     ) -> Result<Statement> {
+        Ok(Self::write_statement(Vec::from(Self::write_values(
+            table_id,
+            partition_key,
+            secondary_key,
+            data,
+            timestamp,
+            deleted,
+        )?)))
+    }
+
+    fn write_values(
+        table_id: i64,
+        partition_key: i64,
+        secondary_key: i64,
+        data: &serde_json::Value,
+        timestamp: i64,
+        deleted: bool,
+    ) -> Result<[Value; 6]> {
         anyhow::ensure!(timestamp >= 0, "timestamp must be nonnegative");
-        // Atomic comparison: old arrivals and retries cannot overwrite newer data.
-        // Deletion wins ties; live values then compare serialized JSON bytes.
         let data = if deleted {
             &serde_json::Value::Null
         } else {
             data
         };
-        Ok(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "INSERT INTO data (table_id, partition_key, secondary_key, data, timestamp, deleted)
-             VALUES (?, ?, ?, ?, ?, ?)
+        Ok([
+            table_id.into(),
+            partition_key.into(),
+            secondary_key.into(),
+            serde_json::to_string(data)?.into(),
+            timestamp.into(),
+            deleted.into(),
+        ])
+    }
+
+    fn write_statement(values: Vec<Value>) -> Statement {
+        let rows = vec!["(?, ?, ?, ?, ?, ?)"; values.len() / 6].join(", ");
+        // Keep the same timestamp, tombstone, and JSON tie ordering for every row.
+        Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            format!("INSERT INTO data (table_id, partition_key, secondary_key, data, timestamp, deleted)
+             VALUES {rows}
              ON CONFLICT (table_id, partition_key, secondary_key) DO UPDATE
              SET data = excluded.data, timestamp = excluded.timestamp, deleted = excluded.deleted
              WHERE excluded.timestamp > data.timestamp
                 OR (excluded.timestamp = data.timestamp
                     AND (excluded.deleted > data.deleted
-                         OR (excluded.deleted = data.deleted AND CAST(excluded.data AS BLOB) > CAST(data.data AS BLOB))))",
-                [
-                    table_id.into(),
-                    partition_key.into(),
-                    secondary_key.into(),
-                    serde_json::to_string(data)?.into(),
-                    timestamp.into(),
-                    deleted.into(),
-                ],
-            ))
+                         OR (excluded.deleted = data.deleted AND CAST(excluded.data AS BLOB) > CAST(data.data AS BLOB))))"),
+            values,
+        )
+    }
+
+    fn batch_statements(mutations: &[Mutation]) -> Result<Vec<Statement>> {
+        let mut statements = Vec::new();
+        let mut values = Vec::new();
+        for mutation in mutations {
+            if let Mutation::Write(record) = mutation {
+                values.extend(Self::write_values(
+                    record.table_id,
+                    record.partition_key,
+                    record.secondary_key,
+                    &record.data,
+                    record.timestamp,
+                    record.deleted,
+                )?);
+                if values.len() == SQL_WRITE_BATCH_SIZE * 6 {
+                    statements.push(Self::write_statement(std::mem::take(&mut values)));
+                }
+            } else {
+                // Scoped deletes must stay between the writes that surround them.
+                if !values.is_empty() {
+                    statements.push(Self::write_statement(std::mem::take(&mut values)));
+                }
+                statements.push(Self::mutation_statement(mutation)?);
+            }
+        }
+        if !values.is_empty() {
+            statements.push(Self::write_statement(values));
+        }
+        Ok(statements)
     }
 
     pub fn delete_table_statement(table_id: i64) -> Statement {
@@ -150,10 +204,7 @@ impl WriteShard {
         if mutations.is_empty() {
             return Ok(());
         }
-        let statements = mutations
-            .iter()
-            .map(Self::mutation_statement)
-            .collect::<Result<Vec<_>>>()?;
+        let statements = Self::batch_statements(&mutations)?;
         let txn = self.db.begin().await?;
         for statement in statements {
             if let Err(error) = txn.execute_raw(statement).await {

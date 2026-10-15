@@ -51,6 +51,7 @@ pub fn router_with_handler(
     Router::new()
         .route("/shard/size", get(get_size))
         .route("/shard/telemetry", get(get_telemetry))
+        .route("/shard/write-backlog", get(get_write_backlog))
         .route("/tables/{table_id}/telemetry", get(get_telemetry_for_table))
         .route(
             "/tables/{table_id}/partition-keys/{partition_key}/records/{secondary_key}/with-replicas-inconsistent",
@@ -89,6 +90,19 @@ fn internal_error(error: impl std::fmt::Display) -> ApiError {
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({"error": "shard request failed"})),
     )
+}
+
+fn write_error(error: impl write_handler::WriteFailure) -> ApiError {
+    if let Some(status) = error
+        .status()
+        .filter(|status| status.code() == tonic::Code::ResourceExhausted)
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": status.message()})),
+        );
+    }
+    internal_error(error)
 }
 
 fn write_timestamp(headers: &HeaderMap) -> Result<i64, ApiError> {
@@ -145,7 +159,7 @@ async fn upsert(
             consistent: false,
         })
         .await
-        .map_err(internal_error)?;
+        .map_err(write_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -177,7 +191,7 @@ async fn put_with_replicas(
             consistent: true,
         })
         .await
-        .map_err(internal_error)?;
+        .map_err(write_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -209,7 +223,7 @@ async fn put_with_replicas_inconsistent(
             consistent: false,
         })
         .await
-        .map_err(internal_error)?;
+        .map_err(write_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -255,7 +269,7 @@ async fn delete_record(
             timestamp,
         })
         .await
-        .map_err(internal_error)?;
+        .map_err(write_error)?;
     Ok(Json(Deleted { deleted }))
 }
 
@@ -286,7 +300,7 @@ async fn delete_partition_key(
             partition_key,
         })
         .await
-        .map_err(internal_error)?;
+        .map_err(write_error)?;
     Ok(Json(Deleted { deleted }))
 }
 
@@ -340,7 +354,7 @@ async fn delete_range(
             upper_bound: range.upper_bound,
         })
         .await
-        .map_err(internal_error)?;
+        .map_err(write_error)?;
     Ok(Json(Deleted { deleted }))
 }
 
@@ -356,6 +370,17 @@ async fn get_telemetry(
 ) -> Result<Json<Vec<telemetry::Model>>, ApiError> {
     Ok(Json(
         shard.ask(GetTelemetry {}).await.map_err(internal_error)?,
+    ))
+}
+
+async fn get_write_backlog(
+    Extension(handler): Extension<ActorRef<WriteHandler>>,
+) -> Result<Json<telemetry::WriteBacklog>, ApiError> {
+    Ok(Json(
+        handler
+            .ask(write_handler::GetWriteBacklog {})
+            .await
+            .map_err(internal_error)?,
     ))
 }
 
@@ -422,6 +447,6 @@ async fn delete_table(
     let deleted = handler
         .ask(write_handler::DeleteTable { table_id })
         .await
-        .map_err(internal_error)?;
+        .map_err(write_error)?;
     Ok(Json(Deleted { deleted }))
 }

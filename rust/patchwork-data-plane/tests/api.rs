@@ -65,6 +65,30 @@ async fn request_at(
 }
 
 #[tokio::test]
+async fn write_backlog_is_reported_without_access_samples() {
+    let dir = tempfile::tempdir().unwrap();
+    let shard = patchwork_data_plane::initialize::shard(
+        dir.path().join("shard.sqlite").display().to_string(),
+    )
+    .await
+    .unwrap();
+    let readers = shard.read_pool(1).unwrap();
+    let shard = WriteShard::spawn(shard);
+    let app = api::router(shard.clone(), readers.clone(), &dir.path().join("wal")).unwrap();
+    assert_eq!(
+        request(&app, "GET", "/shard/write-backlog", None).await,
+        (
+            StatusCode::OK,
+            json!({"queued": 0, "in_flight": 0, "total": 0})
+        )
+    );
+    assert_eq!(
+        request(&app, "GET", "/shard/telemetry", None).await,
+        (StatusCode::OK, json!([]))
+    );
+}
+
+#[tokio::test]
 async fn telemetry_tracks_local_accesses_and_preserves_history_when_data_is_deleted() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("shard.sqlite").to_str().unwrap().to_owned();

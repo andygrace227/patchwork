@@ -266,7 +266,35 @@ $("load-stop").onclick = async () => {
 updateLoad();
 setInterval(updateLoad, 1000);
 
+function accessStatisticsRows(nodes, combine) {
+  const rows = nodes.flatMap((node) => node.telemetry.map((stats) => ({ ...stats, name: node.name })));
+  if (!combine) return rows;
+  const combined = new Map();
+  for (const stats of rows) {
+    const key = JSON.stringify([stats.table_id, stats.partition_key]);
+    if (!combined.has(key)) combined.set(key, {
+      table_id: stats.table_id, partition_key: stats.partition_key,
+      reads_per_second: 0, writes_per_second: 0, read_count: 0, write_count: 0,
+      write_position_sum: 0n, window_seconds: 0, contributing_nodes: 0,
+      median_write_position: null, writing_nodes: 0,
+    });
+    const total = combined.get(key);
+    for (const field of ["reads_per_second", "writes_per_second", "read_count", "write_count", "contributing_nodes"]) total[field] += stats[field];
+    total.write_position_sum += BigInt(stats.write_position_sum);
+    if (stats.window_seconds > 0) total.window_seconds = total.window_seconds ? Math.min(total.window_seconds, stats.window_seconds) : stats.window_seconds;
+    if (stats.write_count) {
+      total.writing_nodes += 1;
+      total.median_write_position = total.writing_nodes === 1 ? stats.median_write_position : null;
+    }
+  }
+  return [...combined.values()].map((stats) => ({
+    ...stats, name: `All nodes (${stats.contributing_nodes})`,
+    average_write_position: stats.write_count ? String(stats.write_position_sum / BigInt(stats.write_count)) : null,
+  }));
+}
+
 let telemetryBusy = false;
+let lastTelemetry = null;
 async function refreshTelemetry(force = false) {
   if (telemetryBusy || (!force && !$("telemetry-live").checked)) return;
   telemetryBusy = true;
@@ -274,35 +302,75 @@ async function refreshTelemetry(force = false) {
     const response = await fetch("/api/telemetry");
     if (!response.ok) throw new Error("Could not read node telemetry");
     const result = await response.json();
-    const errors = [];
-    $("operation-timings").replaceChildren();
-    $("data-telemetry-rows").replaceChildren();
-    for (const node of result.nodes) {
-      if (node.error) { errors.push(`${node.name}: ${node.error}`); continue; }
-      if (node.kind === "control") {
-        for (const [operation, stats] of Object.entries(node.telemetry)) {
-          const row = $("operation-timings").insertRow();
-          cell(row, node.name); cell(row, operation.replaceAll("_", " "));
-          cell(row, `${stats.requests} / ${stats.errors}`);
-          for (const stage of ["total", "table_lookup", "partition_lookup", "replica_resolution", "replica_lookup", "replica_grpc"]) {
-            cell(row, stats.stages[stage] ? (stats.stages[stage].total_ms / stats.requests).toFixed(3) : "—");
-          }
-        }
-      } else {
-        const rows = node.telemetry.sort((a, b) => (b.reads_per_second + b.writes_per_second) - (a.reads_per_second + a.writes_per_second)).slice(0, 100);
-        for (const stats of rows) {
-          const row = $("data-telemetry-rows").insertRow();
-          for (const value of [node.name, stats.table_id, stats.partition_key, stats.reads_per_second.toFixed(1), stats.writes_per_second.toFixed(1), `${stats.read_count} / ${stats.write_count}`, stats.window_seconds.toFixed(2), stats.average_write_position ?? "—", stats.median_write_position ?? "—"]) cell(row, value);
-        }
-      }
-    }
-    if (!$("operation-timings").rows.length) emptyRow($("operation-timings"), 9, "Enable fetch / put measurement above to collect timings.");
-    if (!$("data-telemetry-rows").rows.length) emptyRow($("data-telemetry-rows"), 9, "No recent data-node accesses.");
-    $("telemetry-error").textContent = errors.join(" · ");
+    lastTelemetry = result;
+    renderTelemetry(result);
   } catch (error) { $("telemetry-error").textContent = error.message; }
   finally { telemetryBusy = false; }
 }
-$("telemetry-live").onchange = () => refreshTelemetry();
+
+function renderTelemetry(result) {
+  const errors = [];
+  $("operation-timings").replaceChildren();
+  $("data-telemetry-rows").replaceChildren();
+  for (const node of result.nodes) {
+    if (node.error) { errors.push(`${node.name}: ${node.error}`); continue; }
+    if (node.kind === "control") {
+      for (const [operation, stats] of Object.entries(node.telemetry)) {
+        const row = $("operation-timings").insertRow();
+        cell(row, node.name); cell(row, operation.replaceAll("_", " "));
+        cell(row, `${stats.requests} / ${stats.errors}`);
+        for (const stage of ["total", "table_lookup", "partition_lookup", "replica_resolution", "replica_lookup", "replica_grpc"]) {
+          cell(row, stats.stages[stage] ? (stats.stages[stage].total_ms / stats.requests).toFixed(3) : "—");
+        }
+      }
+    }
+  }
+  const dataNodes = result.nodes.filter((node) => node.kind === "data" && !node.error);
+  const combine = $("telemetry-combine").checked;
+  const rows = accessStatisticsRows(dataNodes, combine).sort((a, b) => (b.reads_per_second + b.writes_per_second) - (a.reads_per_second + a.writes_per_second)).slice(0, 100);
+  for (const stats of rows) {
+    const row = $("data-telemetry-rows").insertRow();
+    for (const value of [stats.name, stats.table_id, stats.partition_key, stats.reads_per_second.toFixed(1), stats.writes_per_second.toFixed(1), `${stats.read_count} / ${stats.write_count}`, stats.window_seconds.toFixed(2), stats.average_write_position ?? "—", stats.median_write_position ?? "—"]) cell(row, value);
+  }
+  if (!$("operation-timings").rows.length) emptyRow($("operation-timings"), 9, "Enable fetch / put measurement above to collect timings.");
+  if (!$("data-telemetry-rows").rows.length) emptyRow($("data-telemetry-rows"), 9, "No recent data-node accesses.");
+  $("telemetry-error").textContent = errors.join(" · ");
+}
+
+let backlogBusy = false;
+let lastBacklog = null;
+async function refreshWriteBacklog() {
+  if (backlogBusy || !$("telemetry-live").checked) return;
+  backlogBusy = true;
+  try {
+    const response = await fetch("/api/write-backlog");
+    if (!response.ok) throw new Error("Could not read write backlog");
+    lastBacklog = await response.json();
+    renderWriteBacklog(lastBacklog);
+  } catch (error) { $("write-backlog-error").textContent = error.message; }
+  finally { backlogBusy = false; }
+}
+
+function renderWriteBacklog(result) {
+  $("write-backlog-rows").replaceChildren();
+  let backlogs = result.nodes.filter((node) => node.write_backlog);
+  if ($("telemetry-combine").checked && backlogs.length) {
+    const total = { queued: 0, in_flight: 0, total: 0 };
+    for (const node of backlogs) for (const field of Object.keys(total)) total[field] += node.write_backlog[field];
+    backlogs = [{ name: `All reporting nodes (${backlogs.length}/${result.nodes.length})`, write_backlog: total }];
+  }
+  for (const node of backlogs) {
+    const row = $("write-backlog-rows").insertRow();
+    for (const value of [node.name, node.write_backlog.queued, node.write_backlog.in_flight, node.write_backlog.total]) cell(row, value);
+  }
+  if (!$("write-backlog-rows").rows.length) emptyRow($("write-backlog-rows"), 4, "Write backlog unavailable.");
+  $("write-backlog-error").textContent = result.nodes.filter((node) => node.error).map((node) => `${node.name}: ${node.error}`).join(" · ");
+}
+$("telemetry-combine").onchange = () => {
+  if (lastTelemetry) renderTelemetry(lastTelemetry);
+  if (lastBacklog) renderWriteBacklog(lastBacklog);
+};
+$("telemetry-live").onchange = () => { refreshTelemetry(); refreshWriteBacklog(); };
 $("reset-telemetry").onclick = async () => {
   $("reset-telemetry").disabled = true;
   try {
@@ -315,3 +383,5 @@ $("reset-telemetry").onclick = async () => {
 };
 refreshTelemetry();
 setInterval(refreshTelemetry, 5000);
+refreshWriteBacklog();
+setInterval(refreshWriteBacklog, 1000);

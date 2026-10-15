@@ -6,6 +6,13 @@ pub mod cache;
 pub use access_stats_actor::AccessStatsActor;
 pub use patchwork_common::dataplane_client::Telemetry as Model;
 
+#[derive(Debug, kameo::Reply, serde::Serialize, PartialEq, Eq)]
+pub struct WriteBacklog {
+    pub queued: usize,
+    pub in_flight: usize,
+    pub total: usize,
+}
+
 pub struct Access {
     pub secondary_key: i64,
     pub time: Instant,

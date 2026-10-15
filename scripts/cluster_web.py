@@ -85,7 +85,7 @@ def create_app(cluster, send_request):
                 return jsonify(cluster.metadata())
             except (RuntimeError, OSError) as error:
                 return jsonify(error=str(error)), 502
-        if request.path in ("/api/request", "/api/telemetry", "/api/telemetry/reset"):
+        if request.path in ("/api/request", "/api/telemetry", "/api/telemetry/reset", "/api/write-backlog"):
             try:
                 result = send_request(cluster.remote_dashboard + request.full_path.rstrip("?"),
                                       request.method, request.get_json(silent=True), expected=None)
@@ -171,6 +171,7 @@ def create_app(cluster, send_request):
 
     def node_telemetry(item):
         name, url = item
+        result = {"name": name, "kind": name.split("-")[0]}
         try:
             data = send_request(url + ("/telemetry" if name.startswith("control-") else "/shard/telemetry"))
             if name.startswith("data-"):
@@ -179,9 +180,23 @@ def create_app(cluster, send_request):
                     for key in ("table_id", "partition_key", "average_write_position", "median_write_position"):
                         if row.get(key) is not None:
                             row[key] = str(row[key])
-            return {"name": name, "kind": name.split("-")[0], "telemetry": data}
+            result["telemetry"] = data
         except (RuntimeError, OSError, ValueError) as error:
-            return {"name": name, "kind": name.split("-")[0], "error": str(error)}
+            result["error"] = str(error)
+        return result
+
+    def node_write_backlog(item):
+        name, url = item
+        try:
+            return {"name": name, "write_backlog": send_request(url + "/shard/write-backlog")}
+        except (RuntimeError, OSError, ValueError) as error:
+            return {"name": name, "error": str(error)}
+
+    @app.get("/api/write-backlog")
+    def write_backlog():
+        nodes = [(name, url) for name, url in node_urls.items() if name.startswith("data-")]
+        with ThreadPoolExecutor(max_workers=max(1, min(8, len(nodes)))) as pool:
+            return jsonify(nodes=list(pool.map(node_write_backlog, nodes)))
 
     @app.get("/api/telemetry")
     def telemetry():

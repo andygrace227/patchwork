@@ -1,5 +1,96 @@
 use super::*;
+use patchwork_common::dataplane_client::Record;
 use sea_orm::Database;
+use sea_orm::QueryOrder;
+use serde_json::json;
+
+#[tokio::test]
+async fn grouped_writes_match_ordered_single_writes_across_deletes_and_ties() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut grouped =
+        crate::initialize::shard(dir.path().join("grouped.sqlite").display().to_string())
+            .await
+            .unwrap();
+    let single = crate::initialize::shard(dir.path().join("single.sqlite").display().to_string())
+        .await
+        .unwrap();
+    let mut mutations = Vec::new();
+    for i in 0..SQL_WRITE_BATCH_SIZE * 3 + 7 {
+        mutations.push(Mutation::Write(Record {
+            table_id: 1 + (i % 2) as i64,
+            partition_key: (i % 3) as i64,
+            secondary_key: (i % 19) as i64,
+            data: json!({"value": i % 5}),
+            timestamp: (i % 7) as i64,
+            deleted: i % 11 == 0,
+        }));
+        if i == SQL_WRITE_BATCH_SIZE + 3 {
+            mutations.push(Mutation::DeletePartitionKey {
+                table_id: 1,
+                partition_key: 0,
+            });
+        }
+        if i == SQL_WRITE_BATCH_SIZE * 2 + 3 {
+            mutations.push(Mutation::DeleteRange {
+                table_id: 2,
+                lower_bound: 0,
+                upper_bound: 2,
+            });
+            mutations.push(Mutation::DeleteTable { table_id: 1 });
+        }
+    }
+    grouped
+        .apply_batch(Arc::new(mutations.clone()))
+        .await
+        .unwrap();
+    let txn = single.db.begin().await.unwrap();
+    for mutation in &mutations {
+        txn.execute_raw(WriteShard::mutation_statement(mutation).unwrap())
+            .await
+            .unwrap();
+    }
+    txn.commit().await.unwrap();
+    let query = || {
+        data::Entity::find()
+            .order_by_asc(data::Column::TableId)
+            .order_by_asc(data::Column::PartitionKey)
+            .order_by_asc(data::Column::SecondaryKey)
+    };
+    assert_eq!(
+        query().all(&grouped.db).await.unwrap(),
+        query().all(&single.db).await.unwrap()
+    );
+}
+
+#[tokio::test]
+async fn failure_in_a_later_sql_group_rolls_back_the_whole_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut shard = crate::initialize::shard(dir.path().join("shard.sqlite").display().to_string())
+        .await
+        .unwrap();
+    shard.db.execute_unprepared("CREATE TRIGGER reject_later BEFORE INSERT ON data WHEN NEW.secondary_key = 257 BEGIN SELECT RAISE(ABORT, 'reject later group'); END").await.unwrap();
+    let mutations = (0..SQL_WRITE_BATCH_SIZE + 3)
+        .map(|i| {
+            Mutation::Write(Record {
+                table_id: 1,
+                partition_key: 1,
+                secondary_key: i as i64,
+                data: json!(i),
+                timestamp: 1,
+                deleted: false,
+            })
+        })
+        .collect();
+    assert!(shard.apply_batch(Arc::new(mutations)).await.is_err());
+    assert!(
+        data::Entity::find()
+            .all(&shard.db)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(shard.get_telemetry().await.unwrap().is_empty());
+}
 
 async fn pragma(db: &DatabaseConnection, name: &str) -> i64 {
     db.query_one_raw(sea_orm::Statement::from_string(

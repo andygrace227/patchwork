@@ -13,6 +13,87 @@ struct Pause {
     release: oneshot::Receiver<()>,
 }
 
+#[tokio::test]
+async fn point_reads_preserve_keys_payload_and_tombstone_filtering() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut shard = crate::initialize::shard(dir.path().join("shard.sqlite").display().to_string())
+        .await
+        .unwrap();
+    let payload = json!({"text": "quotes: ' and unicode: 🔧", "nested": [true, null, 42]});
+    for (table_id, partition_key, secondary_key) in
+        [(1, -10, 42), (2, -10, 42), (1, -9, 42), (1, -10, 43)]
+    {
+        shard
+            .upsert(table_id, partition_key, secondary_key, payload.clone(), 123)
+            .await
+            .unwrap();
+    }
+    let readers = shard.read_pool(2).unwrap();
+    for include_deleted in [false, true] {
+        let record = readers
+            .ask(Dispatch(Get {
+                table_id: 1,
+                partition_key: -10,
+                secondary_key: 42,
+                include_deleted,
+            }))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record,
+            data::Model {
+                table_id: 1,
+                partition_key: -10,
+                secondary_key: 42,
+                data: payload.clone(),
+                timestamp: 123,
+                deleted: false,
+            }
+        );
+        assert!(
+            readers
+                .ask(Dispatch(Get {
+                    table_id: 1,
+                    partition_key: -10,
+                    secondary_key: 99,
+                    include_deleted,
+                }))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    shard.delete(1, -10, 42, 124).await.unwrap();
+    assert!(
+        readers
+            .ask(Dispatch(Get {
+                table_id: 1,
+                partition_key: -10,
+                secondary_key: 42,
+                include_deleted: false,
+            }))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let tombstone = readers
+        .ask(Dispatch(Get {
+            table_id: 1,
+            partition_key: -10,
+            secondary_key: 42,
+            include_deleted: true,
+        }))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tombstone.timestamp, 124);
+    assert!(tombstone.deleted);
+    assert_eq!(tombstone.data, serde_json::Value::Null);
+    readers.stop_gracefully().await.unwrap();
+    readers.wait_for_shutdown().await;
+}
+
 impl Message<Pause> for ReadShard {
     type Reply = ();
 

@@ -42,21 +42,37 @@ impl ReplicaWriter {
                             record.deleted,
                         )
                         .await
-                        .map_err(|error| anyhow::anyhow!("Replica {url}: {error}"))
+                        .map_err(|error| {
+                            anyhow::Error::new(error).context(format!("Replica {url}"))
+                        })
                 });
             }
             let mut failures = Vec::new();
             while let Some(result) = requests.join_next().await {
                 match result {
                     Ok(Ok(())) => {}
-                    Ok(Err(error)) => failures.push(error.to_string()),
-                    Err(error) => failures.push(error.to_string()),
+                    Ok(Err(error)) => failures.push(error),
+                    Err(error) => failures.push(error.into()),
                 }
+            }
+            if failures.iter().any(|error| {
+                error
+                    .downcast_ref::<tonic::Status>()
+                    .is_some_and(|status| status.code() == tonic::Code::ResourceExhausted)
+            }) {
+                return Err(tonic::Status::resource_exhausted(
+                    "a replica write queue is full; retry later",
+                )
+                .into());
             }
             anyhow::ensure!(
                 failures.is_empty(),
                 "Replica writes failed: {}",
-                failures.join("; ")
+                failures
+                    .iter()
+                    .map(|error| format!("{error:#}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
             );
             Ok(())
         })

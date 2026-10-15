@@ -13,8 +13,8 @@ use kameo::{
 use kameo_actors::pool::ActorPool;
 pub use kameo_actors::pool::Dispatch;
 use sea_orm::{
-    ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection, EntityTrait,
-    QueryFilter, QueryOrder,
+    ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend,
+    EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Statement,
 };
 use std::path::PathBuf;
 
@@ -129,14 +129,20 @@ impl ReadShard {
         secondary_key: i64,
         include_deleted: bool,
     ) -> Result<Option<data::Model>> {
-        let record = data::Entity::find_by_id((table_id, partition_key, secondary_key))
-            .filter(if include_deleted {
-                sea_orm::Condition::all()
-            } else {
-                sea_orm::Condition::all().add(data::Column::Deleted.eq(false))
-            })
-            .one(&self.db)
-            .await?;
+        let sql = if include_deleted {
+            "SELECT table_id, partition_key, secondary_key, data, timestamp, deleted
+             FROM data WHERE table_id = ? AND partition_key = ? AND secondary_key = ?"
+        } else {
+            "SELECT table_id, partition_key, secondary_key, data, timestamp, deleted
+             FROM data WHERE table_id = ? AND partition_key = ? AND secondary_key = ? AND deleted = 0"
+        };
+        let record = data::Model::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            sql,
+            [table_id.into(), partition_key.into(), secondary_key.into()],
+        ))
+        .one(&self.db)
+        .await?;
         self.track_access(table_id, partition_key, secondary_key)
             .await;
         Ok(record)

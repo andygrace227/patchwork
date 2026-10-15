@@ -56,6 +56,16 @@ fn internal_error(error: impl std::fmt::Display) -> Status {
     Status::internal("shard request failed")
 }
 
+fn write_error(error: impl write_handler::WriteFailure) -> Status {
+    if let Some(status) = error
+        .status()
+        .filter(|status| status.code() == tonic::Code::ResourceExhausted)
+    {
+        return status.clone();
+    }
+    internal_error(error)
+}
+
 fn timestamp(value: Option<i64>) -> Result<i64, Status> {
     value.filter(|value| *value >= 0).ok_or_else(|| {
         Status::invalid_argument("timestamp is required and must be nonnegative Unix microseconds")
@@ -121,7 +131,7 @@ impl Service {
                 consistent: !inconsistent,
             })
             .await
-            .map_err(internal_error)?;
+            .map_err(write_error)?;
         Ok(Response::new(proto::Empty {}))
     }
 }
@@ -182,7 +192,7 @@ impl DataPlane for Service {
                 timestamp: timestamp(request.timestamp)?,
             })
             .await
-            .map_err(internal_error)?;
+            .map_err(write_error)?;
         Ok(Response::new(proto::Count { count }))
     }
 
@@ -215,7 +225,7 @@ impl DataPlane for Service {
                 partition_key: request.partition_key,
             })
             .await
-            .map_err(internal_error)?;
+            .map_err(write_error)?;
         Ok(Response::new(proto::Count { count }))
     }
 
@@ -252,7 +262,7 @@ impl DataPlane for Service {
                 upper_bound: request.upper_bound,
             })
             .await
-            .map_err(internal_error)?;
+            .map_err(write_error)?;
         Ok(Response::new(proto::Count { count }))
     }
 
@@ -302,7 +312,7 @@ impl DataPlane for Service {
                 table_id: request.into_inner().table_id,
             })
             .await
-            .map_err(internal_error)?;
+            .map_err(write_error)?;
         Ok(Response::new(proto::Count { count }))
     }
 
