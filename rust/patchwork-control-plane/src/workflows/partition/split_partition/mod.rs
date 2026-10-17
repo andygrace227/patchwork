@@ -44,6 +44,7 @@ struct Run {
     keys: Vec<i64>,
     lease_end: i64,
     replicas: Vec<i64>,
+    partition_id: String,
 }
 
 workflow_steps! {
@@ -72,6 +73,7 @@ impl SplitPartition {
             keys: Vec::new(),
             lease_end: 0,
             replicas: Vec::new(),
+            partition_id: format!("{:032x}", rand::random::<u128>()),
         }
         .execute()
         .await

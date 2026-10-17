@@ -55,12 +55,37 @@ impl AccessStatsActor {
         let mut schema = Schema::new(db.get_database_backend()).create_table_from_entity(Entity);
         schema.if_not_exists();
         db.execute(&schema).await?;
+        let columns = db
+            .query_all_raw(sea_orm::Statement::from_string(
+                sea_orm::DbBackend::Sqlite,
+                "PRAGMA table_info(access_statistics)",
+            ))
+            .await?;
+        if !columns
+            .iter()
+            .any(|column| column.try_get::<String>("", "name").as_deref() == Ok("partition_id"))
+        {
+            db.execute_unprepared(
+                "ALTER TABLE access_statistics ADD COLUMN partition_id TEXT NULL",
+            )
+            .await?;
+        }
         db.execute_unprepared(
             "CREATE INDEX IF NOT EXISTS access_statistics_end_ms ON access_statistics (end_ms)",
         )
         .await?;
+        // Old history keeps its optional partition label; future samples use IDs only.
+        if columns
+            .iter()
+            .any(|column| column.try_get::<String>("", "name").as_deref() == Ok("hash_start"))
+        {
+            db.execute_unprepared("DROP INDEX IF EXISTS access_statistics_key_time")
+                .await?;
+            db.execute_unprepared("ALTER TABLE access_statistics DROP COLUMN hash_start")
+                .await?;
+        }
         db.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS access_statistics_key_time ON access_statistics (table_id, hash_start, start_ms)",
+            "CREATE INDEX IF NOT EXISTS access_statistics_partition_time ON access_statistics (table_id, partition_id, start_ms)",
         ).await?;
         Ok(Self {
             db,
@@ -111,11 +136,11 @@ impl AccessStatsActor {
         &mut self,
         table_id: i64,
         partition_key: i64,
-        secondary_key: i64,
         is_write: bool,
+        partition_id: Option<String>,
     ) {
         self.cache
-            .inc(table_id, partition_key, secondary_key, is_write);
+            .inc(table_id, partition_key, is_write, partition_id);
     }
 
     /// Append this sample and prune expired history in one transaction.
@@ -157,13 +182,13 @@ impl AccessStatsActor {
     }
 
     #[message]
-    pub async fn get_telemetry_for_table(&self, table_id: i64) -> Result<HashMap<i64, Model>> {
+    pub async fn get_telemetry_for_table(&self, table_id: i64) -> Result<HashMap<String, Model>> {
         Ok(self
             .get_telemetry()
             .await?
             .into_iter()
             .filter(|row| row.table_id == table_id)
-            .map(|row| (row.partition_key, row))
+            .map(|row| (row.partition_id.clone(), row))
             .collect())
     }
 
@@ -172,14 +197,14 @@ impl AccessStatsActor {
     pub async fn get_history(
         &self,
         table_id: i64,
-        hash_start: i64,
+        partition_id: String,
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Vec<access_stats::Model>> {
         anyhow::ensure!(start_ms < end_ms, "start_ms must be less than end_ms");
         Ok(Entity::find()
             .filter(access_stats::Column::TableId.eq(table_id))
-            .filter(access_stats::Column::HashStart.eq(hash_start))
+            .filter(access_stats::Column::PartitionId.eq(partition_id))
             .filter(access_stats::Column::EndMs.gte(start_ms))
             .filter(access_stats::Column::StartMs.lt(end_ms))
             .filter(

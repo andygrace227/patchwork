@@ -19,11 +19,13 @@ pub(super) async fn copy_range(
     sources: &[i64],
     targets: &[i64],
     lease_end: i64,
+    partition_id: &str,
 ) -> Result<()> {
     check_lease(lease_end)?;
     ensure!(!targets.is_empty(), "Copy has no destinations");
     let records = FetchRange::from_replicas(client, node, &ctx, sources).await?;
-    for record in records {
+    for mut record in records {
+        record.partition_id = Some(partition_id.to_owned());
         check_lease(lease_end)?;
         PutOneConsistent::to_replicas(client, node, &record, targets).await?;
     }

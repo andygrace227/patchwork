@@ -339,3 +339,68 @@ async fn encryption_stub_only_passes_through_unencrypted_bytes() {
     assert!(client.encrypt(Some(7), data.clone()).await.is_err());
     assert!(client.decrypt(Some(7), data).await.is_err());
 }
+
+#[tokio::test]
+async fn split_test_api_is_opt_in_and_uses_existing_auth_and_workflow_errors() {
+    let app = App::new().await;
+    let path = "/test/tables/1/split";
+    let body = json!({"new_partition": 0});
+    if cfg!(feature = "test-api") {
+        assert_eq!(
+            app.request("POST", path, None, body.clone()).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.request("POST", path, Some(&signed(&claims())), body.clone())
+                .await
+                .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            app.request("POST", path, Some(INTERNAL), body.clone())
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        let table = table::ActiveModel {
+            table_name: Set("split-test".into()),
+            owner: Set(1),
+            partition_key_name: Set("p".into()),
+            sort_key_name: Set("s".into()),
+            is_ready: Set(false),
+            ..Default::default()
+        }
+        .insert(&app.db)
+        .await
+        .unwrap();
+        let path = format!("/test/tables/{}/split", table.table_id);
+        assert_eq!(
+            app.request("POST", &path, Some(INTERNAL), body.clone())
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        app.table
+            .ask(
+                patchwork_control_plane::actors::crud::Update::<table::Entity> {
+                    data: table::Model {
+                        is_ready: true,
+                        ..table
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        // An empty partition ring fails inside the submitted split workflow.
+        assert_eq!(
+            app.request("POST", &path, Some(INTERNAL), body).await.0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    } else {
+        assert_eq!(
+            app.request("POST", path, Some(INTERNAL), body).await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
+    app.stop().await;
+}

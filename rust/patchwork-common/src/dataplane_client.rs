@@ -21,6 +21,9 @@ use tonic::{
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Record {
     pub table_id: i64,
+    /// Reporting label supplied by the control plane; absent on legacy records.
+    #[serde(default)]
+    pub partition_id: Option<String>,
     pub partition_key: i64,
     pub secondary_key: i64,
     pub data: Vec<u8>,
@@ -32,7 +35,7 @@ pub struct Record {
 pub struct AccessStatistics {
     pub reads_per_second: f64,
     pub writes_per_second: f64,
-    /// Reporting nodes; merge each node once per partition key.
+    /// Reporting nodes; merge each node once per partition ID.
     pub contributing_nodes: u64,
     pub average_write_position: Option<i64>,
     // Upper middle key for an even number of writes; always an observed key.
@@ -91,7 +94,7 @@ impl AccessStatistics {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Telemetry {
     pub table_id: i64,
-    pub partition_key: i64,
+    pub partition_id: String,
     #[serde(flatten)]
     pub statistics: AccessStatistics,
 }
@@ -105,6 +108,35 @@ pub struct Client {
 impl Client {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Carry the control plane's partition identity through local and replica writes.
+    pub async fn write_partition_record(
+        &self,
+        url: &str,
+        record: &Record,
+        replicas: &[String],
+        consistent: bool,
+    ) -> Result<(), Status> {
+        let mut request = write_request(
+            record.table_id,
+            record.partition_key,
+            record.secondary_key,
+            &record.data,
+            record.timestamp,
+            record.deleted,
+            replicas,
+        )?;
+        request.partition_id = record.partition_id.clone();
+        let mut grpc = self.grpc(url)?;
+        if !consistent {
+            rpc(grpc.write_with_replicas_inconsistent(request), 30).await?;
+        } else if replicas.is_empty() {
+            rpc(grpc.write_record(request), 30).await?;
+        } else {
+            rpc(grpc.write_with_replicas(request), 60).await?;
+        }
+        Ok(())
     }
 
     /// Save on this node and all supplied replica URLs (excluding this node).
@@ -239,7 +271,7 @@ impl Client {
         }))
     }
 
-    /// Recent local accesses, grouped by table and partition key.
+    /// Recent local accesses, grouped by table and partition ID.
     pub async fn get_telemetry(&self, url: &str) -> Result<Vec<Telemetry>, Status> {
         rpc(self.grpc(url)?.get_telemetry(proto::Empty {}), 30)
             .await?
@@ -249,12 +281,12 @@ impl Client {
             .collect()
     }
 
-    /// Recent local accesses for one table, keyed by partition key.
+    /// Recent local accesses for one table, keyed by partition ID.
     pub async fn get_telemetry_for_table(
         &self,
         url: &str,
         table_id: i64,
-    ) -> Result<HashMap<i64, Telemetry>, Status> {
+    ) -> Result<HashMap<String, Telemetry>, Status> {
         rpc(
             self.grpc(url)?
                 .get_telemetry_for_table(proto::TableRequest { table_id }),
@@ -265,7 +297,7 @@ impl Client {
         .into_iter()
         .map(|entry| {
             let entry: Telemetry = entry.try_into()?;
-            Ok((entry.partition_key, entry))
+            Ok((entry.partition_id.clone(), entry))
         })
         .collect()
     }
@@ -613,6 +645,7 @@ fn write_request(
         timestamp: Some(timestamp),
         deleted,
         replicas: replicas.to_vec(),
+        partition_id: None,
     })
 }
 

@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 default-run = "patchwork-control-plane"
 
+[features]
+test-api = []
+
 [dependencies]
 bytes = "1"
 kameo = "0.22.2"

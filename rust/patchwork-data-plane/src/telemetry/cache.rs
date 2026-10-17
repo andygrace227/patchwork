@@ -8,7 +8,7 @@ use super::Access;
 pub const BUFFER_SIZE: usize = 4096;
 
 pub struct TelemetryCache {
-    bins: BTreeMap<(i64, i64), AllocRingBuffer<Access>>,
+    bins: BTreeMap<(i64, String), AllocRingBuffer<Access>>,
     start: Instant,
     start_ms: i64,
 }
@@ -28,25 +28,34 @@ impl TelemetryCache {
         }
     }
 
-    pub fn inc(&mut self, table_id: i64, primary_key: i64, secondary_key: i64, is_write: bool) {
+    pub fn inc(
+        &mut self,
+        table_id: i64,
+        partition_key: i64,
+        is_write: bool,
+        partition_id: Option<String>,
+    ) {
+        let Some(partition_id) = partition_id.filter(|id| !id.is_empty()) else {
+            return;
+        };
         let entry = self
             .bins
-            .entry((table_id, primary_key))
+            .entry((table_id, partition_id))
             .or_insert_with(|| AllocRingBuffer::new(BUFFER_SIZE));
         entry.enqueue(Access {
-            secondary_key,
+            partition_key,
             time: Instant::now(),
             is_write,
         });
     }
 
-    /// A bounded sample per key, with its own observation window when full.
+    /// A bounded sample per partition ID, with its own observation window when full.
     pub fn stats(&self) -> Vec<Model> {
         let now = Instant::now();
         let end_ms = self.start_ms + now.duration_since(self.start).as_millis() as i64;
         self.bins
             .iter()
-            .map(|(&(table_id, hash_start), accesses)| {
+            .map(|((table_id, partition_id), accesses)| {
                 let start = if accesses.len() == BUFFER_SIZE {
                     accesses.front().unwrap().time
                 } else {
@@ -58,8 +67,8 @@ impl TelemetryCache {
                 let mut sum: i128 = 0;
                 for access in accesses {
                     if access.is_write {
-                        writes.push(access.secondary_key);
-                        sum += access.secondary_key as i128;
+                        writes.push(access.partition_key);
+                        sum += access.partition_key as i128;
                     } else {
                         read_count += 1;
                     }
@@ -72,8 +81,8 @@ impl TelemetryCache {
                 };
                 Model {
                     id: 0,
-                    table_id,
-                    hash_start,
+                    table_id: *table_id,
+                    partition_id: Some(partition_id.clone()),
                     start_ms: self.start_ms + start.duration_since(self.start).as_millis() as i64,
                     end_ms,
                     reads_per_second: if window_seconds > 0.0 {

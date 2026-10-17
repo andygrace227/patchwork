@@ -32,15 +32,7 @@ impl ReplicaWriter {
                 let record = record.clone();
                 requests.spawn(async move {
                     client
-                        .write_record(
-                            &url,
-                            record.table_id,
-                            record.partition_key,
-                            record.secondary_key,
-                            &record.data,
-                            record.timestamp,
-                            record.deleted,
-                        )
+                        .write_partition_record(&url, &record, &[], true)
                         .await
                         .map_err(|error| {
                             anyhow::Error::new(error).context(format!("Replica {url}"))

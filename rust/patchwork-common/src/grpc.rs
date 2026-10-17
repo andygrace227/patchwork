@@ -15,6 +15,7 @@ impl TryFrom<proto::Record> for Record {
     fn try_from(record: proto::Record) -> Result<Self, Status> {
         Ok(Self {
             table_id: record.table_id,
+            partition_id: record.partition_id,
             partition_key: record.partition_key,
             secondary_key: record.secondary_key,
             data: record.data_bin,
@@ -29,7 +30,7 @@ impl From<Telemetry> for proto::Telemetry {
         let stats = entry.statistics;
         Self {
             table_id: entry.table_id,
-            partition_key: entry.partition_key,
+            partition_id: Some(entry.partition_id),
             reads_per_second: stats.reads_per_second,
             writes_per_second: stats.writes_per_second,
             contributing_nodes: stats.contributing_nodes,
@@ -49,7 +50,10 @@ impl TryFrom<proto::Telemetry> for Telemetry {
     fn try_from(entry: proto::Telemetry) -> Result<Self, Status> {
         Ok(Self {
             table_id: entry.table_id,
-            partition_key: entry.partition_key,
+            partition_id: entry
+                .partition_id
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| Status::data_loss("Telemetry has no partition ID"))?,
             statistics: AccessStatistics {
                 reads_per_second: entry.reads_per_second,
                 writes_per_second: entry.writes_per_second,

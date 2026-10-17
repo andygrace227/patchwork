@@ -97,6 +97,7 @@ fn validate_range(range: &proto::RangeRequest) -> Result<(), Status> {
 fn record(record: data::Model) -> Result<proto::Record, Status> {
     Ok(proto::Record {
         table_id: record.table_id,
+        partition_id: record.partition_id,
         partition_key: record.partition_key,
         secondary_key: record.secondary_key,
         data_bin: record.data,
@@ -129,6 +130,7 @@ impl Service {
             .ask(write_handler::WriteRecord {
                 record: Record {
                     table_id: request.table_id,
+                    partition_id: request.partition_id,
                     partition_key: request.partition_key,
                     secondary_key: request.secondary_key,
                     data,

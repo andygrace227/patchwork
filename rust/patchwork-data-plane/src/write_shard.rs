@@ -48,6 +48,7 @@ impl WriteShard {
         data: &[u8],
         timestamp: i64,
         deleted: bool,
+        partition_id: Option<&str>,
     ) -> Result<Statement> {
         Ok(Self::write_statement(Vec::from(Self::write_values(
             table_id,
@@ -56,6 +57,7 @@ impl WriteShard {
             data,
             timestamp,
             deleted,
+            partition_id,
         )?)))
     }
 
@@ -66,7 +68,8 @@ impl WriteShard {
         data: &[u8],
         timestamp: i64,
         deleted: bool,
-    ) -> Result<[Value; 6]> {
+        partition_id: Option<&str>,
+    ) -> Result<[Value; 7]> {
         anyhow::ensure!(timestamp >= 0, "timestamp must be nonnegative");
         let data = if deleted { Vec::new() } else { data.to_vec() };
         Ok([
@@ -76,22 +79,28 @@ impl WriteShard {
             data.into(),
             timestamp.into(),
             deleted.into(),
+            partition_id.map(str::to_owned).into(),
         ])
     }
 
     fn write_statement(values: Vec<Value>) -> Statement {
-        let rows = vec!["(?, ?, ?, ?, ?, ?)"; values.len() / 6].join(", ");
-        // Keep the same timestamp, tombstone, and JSON tie ordering for every row.
-        Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            format!("INSERT INTO data (table_id, partition_key, secondary_key, data, timestamp, deleted)
-             VALUES {rows}
-             ON CONFLICT (table_id, partition_key, secondary_key) DO UPDATE
-             SET data = excluded.data, timestamp = excluded.timestamp, deleted = excluded.deleted
-             WHERE excluded.timestamp > data.timestamp
+        let rows = vec!["(?, ?, ?, ?, ?, ?, ?)"; values.len() / 7].join(", ");
+        let wins = "excluded.timestamp > data.timestamp
                 OR (excluded.timestamp = data.timestamp
                     AND (excluded.deleted > data.deleted
-                         OR (excluded.deleted = data.deleted AND CAST(excluded.data AS BLOB) > CAST(data.data AS BLOB))))"),
+                         OR (excluded.deleted = data.deleted AND CAST(excluded.data AS BLOB) > CAST(data.data AS BLOB))))";
+        // Keep the same timestamp, tombstone, and payload tie ordering for every row.
+        // A copy may relabel ownership even when this node already has newer data.
+        Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            format!("INSERT INTO data (table_id, partition_key, secondary_key, data, timestamp, deleted, partition_id)
+             VALUES {rows}
+             ON CONFLICT (table_id, partition_key, secondary_key) DO UPDATE
+             SET partition_id = COALESCE(excluded.partition_id, data.partition_id),
+                 data = CASE WHEN {wins} THEN excluded.data ELSE data.data END,
+                 deleted = CASE WHEN {wins} THEN excluded.deleted ELSE data.deleted END,
+                 timestamp = MAX(excluded.timestamp, data.timestamp)
+             WHERE {wins} OR (excluded.partition_id IS NOT NULL AND excluded.partition_id IS NOT data.partition_id)"),
             values,
         )
     }
@@ -108,8 +117,9 @@ impl WriteShard {
                     &record.data,
                     record.timestamp,
                     record.deleted,
+                    record.partition_id.as_deref(),
                 )?);
-                if values.len() == SQL_WRITE_BATCH_SIZE * 6 {
+                if values.len() == SQL_WRITE_BATCH_SIZE * 7 {
                     statements.push(Self::write_statement(std::mem::take(&mut values)));
                 }
             } else {
@@ -156,6 +166,7 @@ impl WriteShard {
                 &record.data,
                 record.timestamp,
                 record.deleted,
+                record.partition_id.as_deref(),
             )?,
             Mutation::DeleteTable { table_id } => Self::delete_table_statement(*table_id),
             Mutation::DeletePartitionKey {
@@ -216,8 +227,8 @@ impl WriteShard {
                     .tell(TrackAccess {
                         table_id: record.table_id,
                         partition_key: record.partition_key,
-                        secondary_key: record.secondary_key,
                         is_write: true,
+                        partition_id: record.partition_id.clone(),
                     })
                     .await
                 {
@@ -244,7 +255,7 @@ impl WriteShard {
         }
     }
 
-    /// Current unflushed host accesses, grouped by table and partition key.
+    /// Current unflushed host accesses, grouped by table and partition ID.
     #[message]
     pub async fn get_telemetry(&mut self) -> Result<Vec<telemetry::Model>> {
         self.access_stats
@@ -257,7 +268,7 @@ impl WriteShard {
     pub async fn get_telemetry_for_table(
         &mut self,
         table_id: i64,
-    ) -> Result<HashMap<i64, telemetry::Model>> {
+    ) -> Result<HashMap<String, telemetry::Model>> {
         self.access_stats
             .ask(GetAccessTelemetryForTable { table_id })
             .await
@@ -310,6 +321,7 @@ impl WriteShard {
                 &data,
                 timestamp,
                 deleted,
+                None,
             )?)
             .await?;
         if let Err(error) = self
@@ -317,8 +329,8 @@ impl WriteShard {
             .tell(TrackAccess {
                 table_id,
                 partition_key,
-                secondary_key,
                 is_write: true,
+                partition_id: None,
             })
             .await
         {

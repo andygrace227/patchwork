@@ -14,7 +14,7 @@ pub struct WriteBacklog {
 }
 
 pub struct Access {
-    pub secondary_key: i64,
+    pub partition_key: i64,
     pub time: Instant,
     pub is_write: bool,
 }

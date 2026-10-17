@@ -48,6 +48,7 @@ message WriteRequest {
   optional int64 timestamp = 5;
   bool deleted = 6;
   repeated string replicas = 7;
+  optional string partition_id = 8;
 }
 message DeleteRequest {
   int64 table_id = 1;
@@ -62,6 +63,7 @@ message Record {
   bytes data_bin = 4;
   int64 timestamp = 5;
   bool deleted = 6;
+  optional string partition_id = 7;
 }
 message Records { repeated Record records = 1; }
 message Count { uint64 count = 1; }
@@ -74,7 +76,7 @@ message WriteBacklog {
 message TelemetryEntries { repeated Telemetry entries = 1; }
 message Telemetry {
   int64 table_id = 1;
-  int64 partition_key = 2;
+  reserved 2; // Former per-key telemetry identity.
   double reads_per_second = 3;
   double writes_per_second = 4;
   uint64 contributing_nodes = 5;
@@ -85,4 +87,5 @@ message Telemetry {
   // Exact i128 sum, carried as decimal text.
   string write_position_sum = 10;
   double window_seconds = 11;
+  optional string partition_id = 12;
 }

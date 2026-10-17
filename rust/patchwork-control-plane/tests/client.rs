@@ -51,7 +51,23 @@ async fn client_calls_all_shard_operations() {
     assert_eq!(size, json!({"size_bytes": actual}));
     assert!(client.get_telemetry(&url).await.unwrap().is_empty());
     let payload = json!({"name": "example", "nested": [1, true]});
-    client.upsert(&url, 1, 10, -42, &payload, 1).await.unwrap();
+    client
+        .write_partition_record(
+            &url,
+            &patchwork_common::dataplane_client::Record {
+                table_id: 1,
+                partition_id: Some("partition-a".into()),
+                partition_key: 10,
+                secondary_key: -42,
+                data: serde_json::to_vec(&payload).unwrap(),
+                timestamp: 1,
+                deleted: false,
+            },
+            &[],
+            true,
+        )
+        .await
+        .unwrap();
     let record = client.get(&url, 1, 10, -42).await.unwrap();
     assert_eq!(record.data, payload);
     assert_eq!(record.timestamp, 1);
@@ -61,9 +77,9 @@ async fn client_calls_all_shard_operations() {
         .unwrap();
     assert_eq!(telemetry.len(), 1);
     assert_eq!(telemetry[0].table_id, 1);
-    assert_eq!(telemetry[0].partition_key, 10);
-    assert_eq!(telemetry[0].statistics.average_write_position, Some(-42));
-    assert_eq!(telemetry[0].statistics.median_write_position, Some(-42));
+    assert_eq!(telemetry[0].partition_id, "partition-a");
+    assert_eq!(telemetry[0].statistics.average_write_position, Some(10));
+    assert_eq!(telemetry[0].statistics.median_write_position, Some(10));
     assert!(telemetry[0].statistics.reads_per_second > 0.0);
     assert!(telemetry[0].statistics.writes_per_second > 0.0);
     assert_eq!(telemetry[0].statistics.read_count, 1);
@@ -71,8 +87,10 @@ async fn client_calls_all_shard_operations() {
     let table_telemetry = client.get_telemetry_for_table(&url, 1).await.unwrap();
     assert_eq!(table_telemetry.len(), 1);
     assert_eq!(
-        table_telemetry[&10].statistics.median_write_position,
-        Some(-42)
+        table_telemetry["partition-a"]
+            .statistics
+            .median_write_position,
+        Some(10)
     );
     assert!(
         client
@@ -128,11 +146,8 @@ async fn client_calls_all_shard_operations() {
         .get_telemetry_for_table(url.trim_end_matches('/'), 7)
         .await
         .unwrap();
-    assert_eq!(table_telemetry.len(), 3);
-    for key in [i64::MIN, 0, i64::MAX] {
-        assert_eq!(table_telemetry[&key].table_id, 7);
-        assert_eq!(table_telemetry[&key].partition_key, key);
-    }
+    // Legacy writes have no partition ID and are not included in telemetry.
+    assert!(table_telemetry.is_empty());
     assert_eq!(
         client.delete_table(&url, 7).await.unwrap(),
         json!({"deleted": 3})

@@ -7,7 +7,7 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i64,
     pub table_id: i64,
-    pub hash_start: i64,
+    pub partition_id: Option<String>,
     pub start_ms: i64,
     pub end_ms: i64,
     pub reads_per_second: f64,
@@ -24,12 +24,12 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn into_telemetry(
-        self,
-    ) -> Result<crate::dataplane_client::Telemetry, std::num::ParseIntError> {
+    pub fn into_telemetry(self) -> Result<crate::dataplane_client::Telemetry, anyhow::Error> {
         Ok(crate::dataplane_client::Telemetry {
             table_id: self.table_id,
-            partition_key: self.hash_start,
+            partition_id: self
+                .partition_id
+                .ok_or_else(|| anyhow::anyhow!("Sample has no partition ID"))?,
             statistics: crate::dataplane_client::AccessStatistics {
                 reads_per_second: self.reads_per_second,
                 writes_per_second: self.writes_per_second,

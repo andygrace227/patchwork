@@ -83,9 +83,10 @@ async fn setup() -> (tempfile::TempDir, WriteHandler, DatabaseConnection) {
 fn record(table_id: i64, partition_key: i64, timestamp: i64) -> Record {
     Record {
         table_id,
+        partition_id: None,
         partition_key,
         secondary_key: 1,
-        data: json!({"value": timestamp}),
+        data: serde_json::to_vec(&json!({"value": timestamp})).unwrap(),
         timestamp,
         deleted: false,
     }
@@ -123,7 +124,7 @@ async fn mixed_mutations_wait_for_flush_and_keep_queue_order() {
     let deleted = rows.iter().find(|row| row.table_id == 2).unwrap();
     assert!(deleted.deleted);
     assert_eq!(deleted.timestamp, 4);
-    assert_eq!(deleted.data, serde_json::Value::Null);
+    assert!(deleted.data.is_empty());
     assert_eq!(
         rows.iter()
             .find(|row| row.table_id == 3)
@@ -258,10 +259,10 @@ async fn cleanup_keeps_uncommitted_commands_and_startup_replays_them_in_order() 
     let deleted = rows.iter().find(|row| row.table_id == 3).unwrap();
     assert!(deleted.deleted);
     assert_eq!(deleted.timestamp, 5);
-    assert_eq!(deleted.data, serde_json::Value::Null);
+    assert!(deleted.data.is_empty());
     assert_eq!(
         rows.iter().find(|row| row.table_id == 4).unwrap().data,
-        json!({"value": 6})
+        serde_json::to_vec(&json!({"value": 6})).unwrap()
     );
 
     actor.stop_gracefully().await.unwrap();
@@ -426,11 +427,12 @@ async fn full_backlog_rejects_writes_and_deletes_before_appending_to_wal() {
     let mut client = DataPlaneClient::connect(url).await.unwrap();
     let error = client
         .write_record(proto::WriteRequest {
+            partition_id: None,
             table_id: 1,
             partition_key: 1,
             secondary_key: 1,
             timestamp: Some(99999),
-            data_json: b"{}".to_vec(),
+            data_bin: b"{}".to_vec(),
             ..Default::default()
         })
         .await

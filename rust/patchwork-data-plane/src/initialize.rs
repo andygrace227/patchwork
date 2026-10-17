@@ -44,6 +44,21 @@ pub async fn shard_with_access_stats(
         Schema::new(db.get_database_backend()).create_table_from_entity(data::Entity);
     statement.if_not_exists();
     db.execute(&statement).await?;
+    let columns = db
+        .query_all_raw(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "PRAGMA table_info(data)",
+        ))
+        .await?;
+    if !columns
+        .iter()
+        .any(|column| column.try_get::<String>("", "name").as_deref() == Ok("partition_id"))
+    {
+        db.execute_unprepared("ALTER TABLE data ADD COLUMN partition_id TEXT NULL")
+            .await?;
+    }
+    db.execute_unprepared("CREATE INDEX IF NOT EXISTS data_partition_id ON data (partition_id)")
+        .await?;
     Ok(WriteShard::new(
         db,
         std::fs::canonicalize(path)?,

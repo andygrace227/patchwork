@@ -3,7 +3,6 @@ use crate::{actors::crud::Create, datamodels::node, dataplane_client::Client};
 use kameo::actor::Spawn;
 use patchwork_data_plane::{grpc, write_shard::WriteShard};
 use sea_orm::{ActiveValue::Set, ConnectionTrait, Database, Schema};
-use serde_json::json;
 
 #[tokio::test]
 async fn copy_reads_all_sources_preserves_deletes_and_newer_destination_writes() {
@@ -58,34 +57,35 @@ async fn copy_reads_all_sources_preserves_deletes_and_newer_destination_writes()
         urls.push(url);
     }
     client
-        .upsert(&urls[0], 1, 10, 1, &json!("old"), 1)
+        .upsert(&urls[0], 1, 10, 1, &b"old".to_vec(), 1)
         .await
         .unwrap();
     client
-        .upsert(&urls[1], 1, 10, 1, &json!("new"), 2)
+        .upsert(&urls[1], 1, 10, 1, &b"new".to_vec(), 2)
         .await
         .unwrap();
     client
-        .upsert(&urls[0], 1, 10, 2, &json!("live"), 3)
+        .upsert(&urls[0], 1, 10, 2, &b"live".to_vec(), 3)
         .await
         .unwrap();
     client.delete(&urls[1], 1, 10, 2, 3).await.unwrap();
     client
-        .upsert(&urls[1], 1, 10, 3, &json!("only second source"), 4)
+        .upsert(&urls[1], 1, 10, 3, &b"only second source".to_vec(), 4)
         .await
         .unwrap();
     client
-        .upsert(&urls[2], 1, 10, 1, &json!("newer destination"), 10)
+        .upsert(&urls[2], 1, 10, 1, &b"newer destination".to_vec(), 10)
         .await
         .unwrap();
     client
-        .upsert(&urls[1], 2, 10, 1, &json!("other table"), 5)
+        .upsert(&urls[1], 2, 10, 1, &b"other table".to_vec(), 5)
         .await
         .unwrap();
     client
-        .upsert(&urls[1], 1, 20, 1, &json!("outside range"), 5)
+        .upsert(&urls[1], 1, 20, 1, &b"outside range".to_vec(), 5)
         .await
         .unwrap();
+    wait_for_writes(&client, &urls).await;
     let lease_end = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -100,18 +100,35 @@ async fn copy_reads_all_sources_preserves_deletes_and_newer_destination_writes()
             upper_bound: 20,
         },
         &ids[..2],
-        &ids[2..],
+        &ids[1..], // Include an existing replica: its rows also need relabelling.
         lease_end,
+        "destination-partition",
     )
     .await
     .unwrap();
+    wait_for_writes(&client, &urls).await;
     assert_eq!(client.get(&urls[2], 1, 10, 1).await.unwrap().timestamp, 10);
     assert_eq!(client.get(&urls[3], 1, 10, 1).await.unwrap().timestamp, 2);
-    for url in &urls[2..] {
+    for url in &urls[1..] {
         let deleted = client.get_including_deleted(url, 1, 10, 2).await.unwrap();
         assert!(deleted.deleted);
         assert_eq!(deleted.timestamp, 3);
+        assert_eq!(
+            deleted.partition_id.as_deref(),
+            Some("destination-partition")
+        );
+        assert_eq!(
+            client
+                .get(url, 1, 10, 1)
+                .await
+                .unwrap()
+                .partition_id
+                .as_deref(),
+            Some("destination-partition")
+        );
         assert_eq!(client.get(url, 1, 10, 3).await.unwrap().timestamp, 4);
+    }
+    for url in &urls[2..] {
         assert_eq!(
             client
                 .get_range_including_deleted(url, 1, 21, 10)
@@ -135,4 +152,16 @@ async fn copy_reads_all_sources_preserves_deletes_and_newer_destination_writes()
     nodes.stop_gracefully().await.unwrap();
     nodes.wait_for_shutdown().await;
     db.close().await.unwrap();
+}
+
+async fn wait_for_writes(client: &Client, urls: &[String]) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        for url in urls {
+            while client.get_write_backlog(url).await.unwrap()["total"] != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+    })
+    .await
+    .unwrap();
 }

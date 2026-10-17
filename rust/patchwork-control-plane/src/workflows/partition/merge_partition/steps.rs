@@ -126,6 +126,7 @@ impl Run {
             &source.replicas.0,
             &previous.replicas.0,
             lease_end,
+            &previous.partition_id,
         )
         .await?;
         Ok(State::Metadata)

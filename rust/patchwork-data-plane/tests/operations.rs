@@ -83,7 +83,27 @@ async fn telemetry_tracks_accesses_and_preserves_history_after_cleanup_and_resta
         (2, 10, 30),
     ] {
         client
-            .upsert(url, table, partition, key, &json!(key), 1)
+            .write_partition_record(
+                url,
+                &patchwork_common::dataplane_client::Record {
+                    table_id: table,
+                    partition_id: Some(
+                        if partition == 20 {
+                            "partition-b"
+                        } else {
+                            "partition-a"
+                        }
+                        .into(),
+                    ),
+                    partition_key: partition,
+                    secondary_key: key,
+                    data: serde_json::to_vec(&json!(key)).unwrap(),
+                    timestamp: 1,
+                    deleted: false,
+                },
+                &[],
+                true,
+            )
             .await
             .unwrap();
     }
@@ -100,14 +120,14 @@ async fn telemetry_tracks_accesses_and_preserves_history_after_cleanup_and_resta
     assert_eq!(entries.len(), 3);
     let table = client.get_telemetry_for_table(url, 1).await.unwrap();
     assert_eq!(table.len(), 2);
-    let sample = &table[&10].statistics;
+    let sample = &table["partition-a"].statistics;
     assert_eq!(sample.contributing_nodes, 1);
-    assert_eq!(sample.average_write_position, Some(340));
+    assert_eq!(sample.average_write_position, Some(10));
     assert_eq!(sample.median_write_position, Some(10));
-    assert_eq!(sample.read_count, 3);
+    assert_eq!(sample.read_count, 2);
     assert_eq!(sample.write_count, 3);
-    assert!((sample.reads_per_second / sample.writes_per_second - 1.0).abs() < 1e-9);
-    assert!(table[&20].statistics.reads_per_second > 0.0);
+    assert!((sample.reads_per_second / sample.writes_per_second - 2.0 / 3.0).abs() < 1e-9);
+    assert!(table["partition-b"].statistics.reads_per_second > 0.0);
     assert_eq!(
         entries
             .iter()
@@ -115,7 +135,7 @@ async fn telemetry_tracks_accesses_and_preserves_history_after_cleanup_and_resta
             .unwrap()
             .statistics
             .median_write_position,
-        Some(30)
+        Some(10)
     );
     assert!(
         client
@@ -137,14 +157,14 @@ async fn telemetry_tracks_accesses_and_preserves_history_after_cleanup_and_resta
     let history = stats
         .ask(GetHistory {
             table_id: 1,
-            hash_start: 10,
+            partition_id: "partition-a".into(),
             start_ms: 0,
             end_ms: i64::MAX,
         })
         .await
         .unwrap();
     assert_eq!(history[0].write_count, 3);
-    assert_eq!(history[0].read_count, 3);
+    assert_eq!(history[0].read_count, 2);
     stats.stop_gracefully().await.unwrap();
     stats.wait_for_shutdown().await;
     let stats = AccessStatsActor::spawn(AccessStatsActor::new(&stats_path).await.unwrap());
@@ -152,7 +172,7 @@ async fn telemetry_tracks_accesses_and_preserves_history_after_cleanup_and_resta
         stats
             .ask(GetHistory {
                 table_id: 1,
-                hash_start: 10,
+                partition_id: "partition-a".into(),
                 start_ms: 0,
                 end_ms: i64::MAX
             })
@@ -170,14 +190,17 @@ async fn telemetry_tracks_accesses_and_preserves_history_after_cleanup_and_resta
             .unwrap()
             .is_empty()
     );
-    let _ = node.client.get(&node.url, 2, 10, 99).await;
+    let _ = node
+        .client
+        .get_including_deleted(&node.url, 2, 10, 30)
+        .await;
     let table = node
         .client
         .get_telemetry_for_table(&node.url, 2)
         .await
         .unwrap();
-    assert_eq!(table[&10].statistics.average_write_position, None);
-    assert_eq!(table[&10].statistics.median_write_position, None);
+    assert_eq!(table["partition-a"].statistics.average_write_position, None);
+    assert_eq!(table["partition-a"].statistics.median_write_position, None);
     node.client.delete_table(&node.url, 2).await.unwrap();
     node.flush().await;
     assert_eq!(node.client.get_telemetry(&node.url).await.unwrap().len(), 1);

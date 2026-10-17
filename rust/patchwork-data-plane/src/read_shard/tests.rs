@@ -19,7 +19,10 @@ async fn point_reads_preserve_keys_payload_and_tombstone_filtering() {
     let mut shard = crate::initialize::shard(dir.path().join("shard.sqlite").display().to_string())
         .await
         .unwrap();
-    let payload = json!({"text": "quotes: ' and unicode: 🔧", "nested": [true, null, 42]});
+    let payload = serde_json::to_vec(
+        &json!({"text": "quotes: ' and unicode: 🔧", "nested": [true, null, 42]}),
+    )
+    .unwrap();
     for (table_id, partition_key, secondary_key) in
         [(1, -10, 42), (2, -10, 42), (1, -9, 42), (1, -10, 43)]
     {
@@ -44,6 +47,7 @@ async fn point_reads_preserve_keys_payload_and_tombstone_filtering() {
             record,
             data::Model {
                 table_id: 1,
+                partition_id: None,
                 partition_key: -10,
                 secondary_key: 42,
                 data: payload.clone(),
@@ -89,7 +93,7 @@ async fn point_reads_preserve_keys_payload_and_tombstone_filtering() {
         .unwrap();
     assert_eq!(tombstone.timestamp, 124);
     assert!(tombstone.deleted);
-    assert_eq!(tombstone.data, serde_json::Value::Null);
+    assert!(tombstone.data.is_empty());
     readers.stop_gracefully().await.unwrap();
     readers.wait_for_shutdown().await;
 }
@@ -150,7 +154,7 @@ async fn kameo_pool_uses_another_reader_while_one_is_busy() {
             table_id: 1,
             partition_key: 10,
             secondary_key: 42,
-            data: json!("new"),
+            data: b"new".to_vec(),
             timestamp: 2,
         }),
     )

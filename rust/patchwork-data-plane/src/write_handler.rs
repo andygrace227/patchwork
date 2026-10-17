@@ -407,6 +407,7 @@ impl WriteHandler {
     ) -> Result<u64> {
         self.enqueue_record(&Record {
             table_id,
+            partition_id: None,
             partition_key,
             secondary_key,
             timestamp,

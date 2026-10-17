@@ -10,6 +10,10 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub hash_start: i64,
 
+    /// Stable identity, independent of boundaries and the metadata storage backend.
+    #[sea_orm(unique, column_type = "String(StringLen::N(32))")]
+    pub partition_id: String,
+
     /// Another partition's hash_start in this table. Reads use its replicas;
     /// writes use both replica lists until copying finishes.
     pub forward_to: Option<i64>,

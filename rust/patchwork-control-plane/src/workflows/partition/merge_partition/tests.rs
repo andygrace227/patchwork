@@ -8,6 +8,7 @@ fn merge_selects_previous_and_next_and_keeps_last_partition() {
         .map(|hash_start| Model {
             table_id: 1,
             hash_start,
+            partition_id: format!("partition-{hash_start}"),
 
             forward_to: None,
             replicas: ReplicaNodes(vec![1]),

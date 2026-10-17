@@ -60,6 +60,7 @@ impl PutOneConsistent {
                 .await?;
         }
         let partition = partition.context("Table has no partitions")?;
+        let partition_id = partition.partition_id.clone();
         drop(partition_timing);
 
         let replicas = time(
@@ -72,6 +73,7 @@ impl PutOneConsistent {
             &self.node,
             &Record {
                 table_id: ctx.table_id,
+                partition_id: Some(partition_id),
                 partition_key: ctx.primary_key,
                 secondary_key: ctx.secondary_key,
                 data: ctx.data,
@@ -109,16 +111,7 @@ impl PutOneConsistent {
         let (url, replicas) = urls.split_first().context("Partition has no replicas")?;
         time(
             "replica_grpc",
-            client.write_with_replicas(
-                url,
-                record.table_id,
-                record.partition_key,
-                record.secondary_key,
-                &record.data,
-                replicas,
-                record.timestamp,
-                record.deleted,
-            ),
+            client.write_partition_record(url, record, replicas, true),
         )
         .await?;
         Ok(())

@@ -3,6 +3,12 @@ use super::*;
 #[test]
 fn initial_ring_has_even_ranges_and_three_copies() {
     let partitions = initial_partitions(42, [7, 11, 19]);
+    let ids: std::collections::HashSet<_> = partitions
+        .iter()
+        .map(|partition| partition.partition_id.as_ref())
+        .collect();
+    assert_eq!(ids.len(), 3);
+    assert!(ids.iter().all(|id| id.len() == 32));
     let starts: Vec<_> = partitions
         .iter()
         .map(|p| *p.hash_start.as_ref() as i128)

@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub table_id: i64,
+    #[serde(default)]
+    pub partition_id: Option<String>,
     #[sea_orm(primary_key, auto_increment = false)]
     pub partition_key: i64,
     #[sea_orm(primary_key, auto_increment = false)]

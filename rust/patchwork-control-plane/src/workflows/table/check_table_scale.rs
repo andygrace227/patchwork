@@ -33,7 +33,7 @@ struct ScaleCheck {
     workflow: CheckTableScale,
     ctx: CheckTableScaleContext,
     partitions: Vec<crate::datamodels::partition::Model>,
-    global_telemetry: HashMap<i64, AccessStatistics>,
+    global_telemetry: HashMap<String, AccessStatistics>,
 }
 
 workflow_steps! {
@@ -105,11 +105,11 @@ impl ScaleCheck {
         Ok(State::Decide)
     }
     async fn decide(&mut self) -> Result<State> {
-        let partition_lookup_map: HashMap<i64, usize> = self
+        let partition_lookup_map: HashMap<&str, usize> = self
             .partitions
             .iter()
             .enumerate()
-            .map(|(idx, p)| (p.hash_start, idx))
+            .map(|(idx, p)| (p.partition_id.as_str(), idx))
             .collect();
 
         let mut partitions_to_split: Vec<i64> = Vec::new();
@@ -117,7 +117,11 @@ impl ScaleCheck {
         let mut partitions_to_replicate: Vec<i64> = Vec::new();
         let mut partitions_to_consolidate: Vec<i64> = Vec::new();
 
-        for (partition_start, stats) in self.global_telemetry.drain() {
+        for (partition_id, stats) in self.global_telemetry.drain() {
+            let Some(&index) = partition_lookup_map.get(partition_id.as_str()) else {
+                continue;
+            };
+            let partition_start = self.partitions[index].hash_start;
             let reads_per_second_per_node =
                 stats.reads_per_second / stats.contributing_nodes as f64;
             let writes_per_second_per_node =

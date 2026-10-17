@@ -186,11 +186,14 @@ class Cluster:
 
         print(f"Run directory: {self.directory}", flush=True)
         if not self.args.no_build:
-            subprocess.run([
+            command = [
                 "cargo", "build", "--release", "--manifest-path", str(ROOT / "rust" / "Cargo.toml"),
                 "--target-dir", str(TARGET.parent), "--workspace", "--bins",
                 "--example", "init_local_cluster",
-            ], cwd=ROOT, check=True)
+            ]
+            if self.args.test_api:
+                command.extend(["--features", "patchwork-control-plane/test-api"])
+            subprocess.run(command, cwd=ROOT, check=True)
 
         print("Preparing an isolated database...", flush=True)
         datadir = self.directory / "mysql"
@@ -245,6 +248,7 @@ class Cluster:
             "database_url": self.database_url,
             "dashboard_url": None if self.args.no_web else f"http://127.0.0.1:{self.args.web_port}",
             "lan_host": self.args.lan_host,
+            "test_api": self.args.test_api,
             "processes": {name: process.pid for name, process in self.processes},
         }
         (self.directory / "cluster.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -391,6 +395,7 @@ def main():
     parser.add_argument("--no-web", action="store_true", help="run without the Flask dashboard")
     parser.add_argument("--open-browser", action="store_true", help="open the dashboard after startup")
     parser.add_argument("--no-build", action="store_true", help="reuse the last optimized release build")
+    parser.add_argument("--test-api", action="store_true", help="build test-only control APIs and show them in the dashboard")
     parser.add_argument("--smoke-test", action="store_true", help="test the cluster, then stop and exit")
     args = parser.parse_args()
     if args.lan_host and (urlsplit("http://" + args.lan_host).hostname != args.lan_host or any(c in args.lan_host for c in "/:@ ")):

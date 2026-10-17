@@ -123,6 +123,7 @@ async fn executor_limits_jobs_keeps_tables_separate_and_recovers_after_failure()
                 data: partition::ActiveModel {
                     table_id: Set(table_id),
                     hash_start: Set(0),
+                    partition_id: Set(format!("{}:{}", table_id, 0)),
                     forward_to: Set(None),
                     replicas: Set(partition::ReplicaNodes(vec![replica.node_id])),
                 },

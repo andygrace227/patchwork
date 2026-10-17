@@ -98,6 +98,7 @@ async fn routes_invoke_record_workflows_and_report_table_job_results() {
             data: partition::ActiveModel {
                 table_id: Set(1),
                 hash_start: Set(i64::MIN),
+                partition_id: Set(format!("{}:{}", 1, i64::MIN)),
                 forward_to: Set(None),
                 replicas: Set(partition::ReplicaNodes(replicas)),
             },

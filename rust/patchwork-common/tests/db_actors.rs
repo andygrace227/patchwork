@@ -134,6 +134,7 @@ async fn all_models_support_crud_and_overlapping_requests() {
             data: partition::ActiveModel {
                 table_id: Set(1),
                 hash_start: Set(0),
+                partition_id: Set(format!("{}:{}", 1, 0)),
                 forward_to: Set(None),
                 replicas: Set(partition::ReplicaNodes(vec![node.node_id])),
                 ..Default::default()
@@ -160,6 +161,7 @@ async fn all_models_support_crud_and_overlapping_requests() {
                 data: partition::ActiveModel {
                     table_id: Set(table_id),
                     hash_start: Set(hash_start),
+                    partition_id: Set(format!("{}:{}", table_id, hash_start)),
                     replicas: Set(partition::ReplicaNodes(vec![node.node_id])),
                     forward_to: Set(None),
                     ..Default::default()
@@ -343,6 +345,7 @@ async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
             data: partition::ActiveModel {
                 table_id: Set(1),
                 hash_start: Set(i64::MIN),
+                partition_id: Set(format!("{}:{}", 1, i64::MIN)),
                 forward_to: Set(None),
                 replicas: Set(partition::ReplicaNodes(vec![1, 2])),
             },
@@ -425,7 +428,7 @@ async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
             .is_empty()
     );
     db.execute_unprepared(
-        "INSERT INTO `partition` (table_id, hash_start, replicas) VALUES (1, 0, '[1]')",
+        "INSERT INTO `partition` (table_id, hash_start, partition_id, replicas) VALUES (1, 0, 'new-partition', '[1]')",
     )
     .await
     .unwrap();

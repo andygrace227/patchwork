@@ -55,14 +55,14 @@ impl Actor for ReadShard {
 }
 
 impl ReadShard {
-    async fn track_access(&self, table_id: i64, partition_key: i64, secondary_key: i64) {
+    async fn track_access(&self, table_id: i64, partition_key: i64, partition_id: Option<String>) {
         if let Err(error) = self
             .access_stats
             .tell(TrackAccess {
                 table_id,
                 partition_key,
-                secondary_key,
                 is_write: false,
+                partition_id,
             })
             .await
         {
@@ -130,10 +130,10 @@ impl ReadShard {
         include_deleted: bool,
     ) -> Result<Option<data::Model>> {
         let sql = if include_deleted {
-            "SELECT table_id, partition_key, secondary_key, data, timestamp, deleted
+            "SELECT table_id, partition_id, partition_key, secondary_key, data, timestamp, deleted
              FROM data WHERE table_id = ? AND partition_key = ? AND secondary_key = ?"
         } else {
-            "SELECT table_id, partition_key, secondary_key, data, timestamp, deleted
+            "SELECT table_id, partition_id, partition_key, secondary_key, data, timestamp, deleted
              FROM data WHERE table_id = ? AND partition_key = ? AND secondary_key = ? AND deleted = 0"
         };
         let record = data::Model::find_by_statement(Statement::from_sql_and_values(
@@ -143,8 +143,12 @@ impl ReadShard {
         ))
         .one(&self.db)
         .await?;
-        self.track_access(table_id, partition_key, secondary_key)
-            .await;
+        self.track_access(
+            table_id,
+            partition_key,
+            record.as_ref().and_then(|row| row.partition_id.clone()),
+        )
+        .await;
         Ok(record)
     }
 
@@ -167,8 +171,12 @@ impl ReadShard {
             .all(&self.db)
             .await?;
         for record in &records {
-            self.track_access(record.table_id, record.partition_key, record.secondary_key)
-                .await;
+            self.track_access(
+                record.table_id,
+                record.partition_key,
+                record.partition_id.clone(),
+            )
+            .await;
         }
         Ok(records)
     }
@@ -196,8 +204,12 @@ impl ReadShard {
             .all(&self.db)
             .await?;
         for record in &records {
-            self.track_access(record.table_id, record.partition_key, record.secondary_key)
-                .await;
+            self.track_access(
+                record.table_id,
+                record.partition_key,
+                record.partition_id.clone(),
+            )
+            .await;
         }
         Ok(records)
     }

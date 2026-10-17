@@ -9,6 +9,8 @@ pub enum Action {
     Write,
     ReadTelemetry,
     ResetTelemetry,
+    #[cfg(feature = "test-api")]
+    SplitPartition,
 }
 
 pub enum Resource {

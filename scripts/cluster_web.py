@@ -33,7 +33,7 @@ def create_app(cluster, send_request):
     def partitions():
         result = rows("""
             SELECT JSON_OBJECT('table_id', CAST(table_id AS CHAR),
-                'hash_start', CAST(hash_start AS CHAR), 'forward_to', CAST(forward_to AS CHAR),
+                'hash_start', CAST(hash_start AS CHAR), 'partition_id', partition_id, 'forward_to', CAST(forward_to AS CHAR),
                 'replicas', replicas) FROM `partition` ORDER BY table_id, hash_start
         """)
         for row in result:
@@ -47,6 +47,7 @@ def create_app(cluster, send_request):
         if not ring:
             raise ValueError("This table has no partitions")
         partition = next((p for p in reversed(ring) if int(p["hash_start"]) <= partition_key), ring[-1])
+        partition_id = partition["partition_id"]
         replicas, visited = set(), set()
         while True:
             boundary = partition["hash_start"]
@@ -69,7 +70,7 @@ def create_app(cluster, send_request):
         result = [urls[node_id] for node_id in sorted(replicas)]
         if any(url not in cluster.data_urls for url in result):
             raise ValueError("A replica points outside this local cluster")
-        return result
+        return partition_id, result
 
     @app.before_request
     def same_origin_requests():
@@ -103,6 +104,7 @@ def create_app(cluster, send_request):
         try:
             processes = dict(cluster.processes)
             return jsonify(
+                test_api=cluster.args.test_api,
                 nodes=[{
                     "name": name, "url": url, "kind": name.split("-")[0],
                     "pid": processes[name].pid, "running": processes[name].poll() is None,
@@ -153,7 +155,7 @@ def create_app(cluster, send_request):
                     if not 0 <= fields["timestamp"] <= (1 << 63) - 1:
                         raise ValueError("Timestamp must be nonnegative Unix microseconds within a signed 64-bit integer")
                     if values.get("replicate"):
-                        replicas = table_replicas(fields["table_id"], fields["partition_key"])
+                        fields["partition_id"], replicas = table_replicas(fields["table_id"], fields["partition_key"])
                         if url not in replicas:
                             url = replicas[0]
                         fields["replicas"] = [replica for replica in replicas if replica != url]
@@ -167,7 +169,8 @@ def create_app(cluster, send_request):
                 return jsonify(**result, url=f"{url}/patchwork.dataplane.DataPlane/{operation}", method="gRPC",
                                timestamp=timestamp, replicas=replicas, elapsed_ms=round((time.monotonic() - started) * 1000))
             method, path = values["method"], values["path"]
-            if method not in ("GET", "POST", "PUT", "DELETE") or not path.startswith(("/tables", "/telemetry")):
+            test_split = cluster.args.test_api and method == "POST" and re.fullmatch(r"/test/tables/\d+/split", path)
+            if method not in ("GET", "POST", "PUT", "DELETE") or not (path.startswith(("/tables", "/telemetry")) or test_split):
                 raise ValueError("Choose a supported method and a /tables or /telemetry path")
             raw_body = values.get("body", "")
             body = json.loads(raw_body) if raw_body.strip() else None
@@ -202,7 +205,7 @@ def create_app(cluster, send_request):
             if name.startswith("data-"):
                 # Keep signed 64-bit keys exact when the browser parses JSON.
                 for row in data:
-                    for key in ("table_id", "partition_key", "average_write_position", "median_write_position"):
+                    for key in ("table_id", "average_write_position", "median_write_position"):
                         if row.get(key) is not None:
                             row[key] = str(row[key])
             result["telemetry"] = data

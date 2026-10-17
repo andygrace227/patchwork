@@ -12,6 +12,7 @@ const actions = {
     { id: "inconsistent", name: "Read record · inconsistent", method: "GET", path: recordPath + "?consistent=false" },
     { id: "control-range", name: "Read a range", method: "GET", path: rangePath },
     { id: "delete-table", name: "Delete a table", method: "DELETE", path: "/tables/{table}" },
+    { id: "split", name: "Test: split partition", method: "POST", path: "/test/tables/{table}/split", body: { new_partition: 0 }, testOnly: true },
   ],
   data: [
     { id: "write", name: "Write a record", method: "gRPC", path: "WriteRecord", scope: "record", body: { name: "local test" }, write: true },
@@ -80,8 +81,8 @@ function updateForm(resetBody = false) {
 function selectNode(name) {
   $("node").value = name;
   const previous = $("action").value;
-  $("action").replaceChildren(...actions[node().kind].map((a) => option(a.name, a.id)));
-  if (actions[node().kind].some((a) => a.id === previous)) $("action").value = previous;
+  $("action").replaceChildren(...actions[node().kind].filter((a) => !a.testOnly || cluster.test_api).map((a) => option(a.name, a.id)));
+  if (actions[node().kind].some((a) => a.id === previous && (!a.testOnly || cluster.test_api))) $("action").value = previous;
   document.querySelectorAll(".node").forEach((button) => {
     const selected = button.dataset.node === name;
     button.classList.toggle("active", selected);
@@ -142,10 +143,10 @@ async function refresh() {
     $("partitions").replaceChildren();
     for (const partition of cluster.partitions) {
       const row = $("partitions").insertRow();
-      cell(row, partition.table_id); cell(row, partition.hash_start).style.fontFamily = "ui-monospace, monospace";
+      cell(row, partition.table_id); cell(row, partition.partition_id); cell(row, partition.hash_start).style.fontFamily = "ui-monospace, monospace";
       cell(row, partition.replicas.map((id) => `data-${id}`).join(", ")); cell(row, partition.forward_to ?? "—");
     }
-    if (!cluster.partitions.length) emptyRow($("partitions"), 4, "Partition placement will appear when you create a table.");
+    if (!cluster.partitions.length) emptyRow($("partitions"), 5, "Partition placement will appear when you create a table.");
     $("locks").textContent = JSON.stringify(cluster.locks, null, 2);
     $("lease-summary").textContent = cluster.locks.length ? `${cluster.locks.length} lease(s)` : "No locks held";
     $("connection").className = "connection";
@@ -285,9 +286,9 @@ function accessStatisticsRows(nodes, combine) {
   if (!combine) return rows;
   const combined = new Map();
   for (const stats of rows) {
-    const key = JSON.stringify([stats.table_id, stats.partition_key]);
+    const key = JSON.stringify([stats.table_id, stats.partition_id]);
     if (!combined.has(key)) combined.set(key, {
-      table_id: stats.table_id, partition_key: stats.partition_key,
+      table_id: stats.table_id, partition_id: stats.partition_id,
       reads_per_second: 0, writes_per_second: 0, read_count: 0, write_count: 0,
       write_position_sum: 0n, window_seconds: 0, contributing_nodes: 0,
       median_write_position: null, writing_nodes: 0,
@@ -344,7 +345,7 @@ function renderTelemetry(result) {
   const rows = accessStatisticsRows(dataNodes, combine).sort((a, b) => (b.reads_per_second + b.writes_per_second) - (a.reads_per_second + a.writes_per_second)).slice(0, 100);
   for (const stats of rows) {
     const row = $("data-telemetry-rows").insertRow();
-    for (const value of [stats.name, stats.table_id, stats.partition_key, stats.reads_per_second.toFixed(1), stats.writes_per_second.toFixed(1), `${stats.read_count} / ${stats.write_count}`, stats.window_seconds.toFixed(2), stats.average_write_position ?? "—", stats.median_write_position ?? "—"]) cell(row, value);
+    for (const value of [stats.name, stats.table_id, stats.partition_id, stats.reads_per_second.toFixed(1), stats.writes_per_second.toFixed(1), `${stats.read_count} / ${stats.write_count}`, stats.window_seconds.toFixed(2), stats.average_write_position ?? "—", stats.median_write_position ?? "—"]) cell(row, value);
   }
   if (!$("operation-timings").rows.length) emptyRow($("operation-timings"), 9, "Enable fetch / put measurement above to collect timings.");
   if (!$("data-telemetry-rows").rows.length) emptyRow($("data-telemetry-rows"), 9, "No recent data-node accesses.");

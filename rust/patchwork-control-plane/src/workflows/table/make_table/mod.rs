@@ -39,6 +39,7 @@ fn initial_partitions(table_id: i64, nodes: [i64; 3]) -> Vec<partition::ActiveMo
             partition::ActiveModel {
                 table_id: Set(table_id),
                 hash_start: Set(hash_start),
+                partition_id: Set(format!("{:032x}", rand::random::<u128>())),
                 forward_to: Set(None),
                 replicas: Set(partition::ReplicaNodes(replicas)),
             }

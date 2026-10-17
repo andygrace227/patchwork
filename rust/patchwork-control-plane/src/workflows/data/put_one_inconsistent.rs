@@ -58,6 +58,7 @@ impl PutOneInconsistent {
                 .await?;
         }
         let partition = partition.context("Table has no partitions")?;
+        let partition_id = partition.partition_id.clone();
         drop(partition_timing);
 
         let mut replicas = time(
@@ -85,14 +86,19 @@ impl PutOneInconsistent {
         );
         time(
             "replica_grpc",
-            self.client.put_with_replicas_inconsistent(
+            self.client.write_partition_record(
                 url,
-                ctx.table_id,
-                ctx.primary_key,
-                ctx.secondary_key,
-                &ctx.data,
+                &patchwork_common::dataplane_client::Record {
+                    table_id: ctx.table_id,
+                    partition_id: Some(partition_id),
+                    partition_key: ctx.primary_key,
+                    secondary_key: ctx.secondary_key,
+                    data: ctx.data,
+                    timestamp: ctx.timestamp,
+                    deleted: false,
+                },
                 replicas,
-                ctx.timestamp,
+                false,
             ),
         )
         .await?;

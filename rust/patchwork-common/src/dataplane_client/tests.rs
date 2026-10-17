@@ -101,7 +101,7 @@ fn large_key_sums_survive_json_and_merge_without_losing_precision() {
         serde_json::from_slice(&serde_json::to_vec(&large).unwrap()).unwrap();
     let telemetry = Telemetry {
         table_id: 1,
-        partition_key: 10,
+        partition_id: "partition-a".into(),
         statistics: large,
     };
     let decoded: Telemetry =

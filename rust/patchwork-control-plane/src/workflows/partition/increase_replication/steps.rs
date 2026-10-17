@@ -128,6 +128,7 @@ impl Run {
             &source.replicas.0,
             &self.targets,
             lease_end,
+            &source.partition_id,
         )
         .await?;
         Ok(State::Metadata)

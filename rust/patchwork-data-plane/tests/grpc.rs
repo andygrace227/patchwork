@@ -37,6 +37,7 @@ async fn grpc_validates_writes_and_carries_large_payloads_and_exact_telemetry() 
     assert_eq!(response.headers()["content-type"], "application/grpc");
     let mut raw = DataPlaneClient::connect(url.clone()).await.unwrap();
     let mut request = proto::WriteRequest {
+        partition_id: None,
         table_id: 1,
         partition_key: 10,
         secondary_key: 42,
@@ -94,13 +95,26 @@ async fn grpc_validates_writes_and_carries_large_payloads_and_exact_telemetry() 
     );
     for key in [i64::MAX - 2, i64::MAX - 1, i64::MAX] {
         client
-            .upsert(&url, 3, i64::MIN, key, &json!(true), 1)
+            .write_partition_record(
+                &url,
+                &patchwork_common::dataplane_client::Record {
+                    table_id: 3,
+                    partition_id: Some("partition-a".into()),
+                    partition_key: key,
+                    secondary_key: 1,
+                    data: b"true".to_vec(),
+                    timestamp: 1,
+                    deleted: false,
+                },
+                &[],
+                true,
+            )
             .await
             .unwrap();
     }
     node.flush().await;
     let telemetry = client.get_telemetry_for_table(&url, 3).await.unwrap();
-    let stats = &telemetry[&i64::MIN].statistics;
+    let stats = &telemetry["partition-a"].statistics;
     assert_eq!(stats.write_position_sum, i64::MAX as i128 * 3 - 3);
     assert_eq!(stats.average_write_position, Some(i64::MAX - 1));
     assert_eq!(stats.median_write_position, Some(i64::MAX - 1));
@@ -161,6 +175,7 @@ async fn consistent_writes_to_each_other_do_not_block_replica_admission() {
         nodes[index].0.ask(WriteRecord {
             record: Record {
                 table_id: 1,
+                partition_id: None,
                 partition_key: index as i64,
                 secondary_key: 1,
                 timestamp: 1,

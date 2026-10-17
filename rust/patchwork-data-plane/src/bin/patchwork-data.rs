@@ -6,6 +6,7 @@ use tonic::Status;
 
 #[derive(Deserialize)]
 struct Call {
+    partition_id: Option<String>,
     url: String,
     operation: String,
     table_id: Option<i64>,
@@ -71,7 +72,8 @@ async fn call(request: Call) -> Result<Value, Status> {
         _ => {}
     }
     let key = required(request.secondary_key, "secondary_key")?;
-    let data = serde_json::to_vec(&request.data).map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let data = serde_json::to_vec(&request.data)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
     match request.operation.as_str() {
         "GetRecord" if request.include_deleted => Ok(json!(
             client
@@ -92,49 +94,26 @@ async fn call(request: Call) -> Result<Value, Status> {
         }
         "WriteRecord" | "WriteWithReplicas" | "WriteWithReplicasInconsistent" => {
             let timestamp = required(request.timestamp, "timestamp")?;
-            match request.operation.as_str() {
-                "WriteRecord" => {
-                    client
-                        .write_record(
-                            url,
-                            table,
-                            partition,
-                            key,
-                            &data,
-                            timestamp,
-                            request.deleted,
-                        )
-                        .await?
-                }
-                "WriteWithReplicas" => {
-                    client
-                        .write_with_replicas(
-                            url,
-                            table,
-                            partition,
-                            key,
-                            &data,
-                            &request.replicas,
-                            timestamp,
-                            request.deleted,
-                        )
-                        .await?
-                }
-                _ => {
-                    client
-                        .write_with_replicas_inconsistent(
-                            url,
-                            table,
-                            partition,
-                            key,
-                            &data,
-                            &request.replicas,
-                            timestamp,
-                            request.deleted,
-                        )
-                        .await?
-                }
-            }
+            client
+                .write_partition_record(
+                    url,
+                    &patchwork_common::dataplane_client::Record {
+                        table_id: table,
+                        partition_id: request.partition_id,
+                        partition_key: partition,
+                        secondary_key: key,
+                        data,
+                        timestamp,
+                        deleted: request.deleted,
+                    },
+                    if request.operation == "WriteRecord" {
+                        &[]
+                    } else {
+                        &request.replicas
+                    },
+                    request.operation != "WriteWithReplicasInconsistent",
+                )
+                .await?;
             Ok(Value::Null)
         }
         _ => Err(Status::invalid_argument("Unknown data-plane operation")),

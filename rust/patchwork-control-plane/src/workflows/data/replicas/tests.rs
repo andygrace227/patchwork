@@ -25,6 +25,7 @@ async fn forwarding_uses_exact_same_table_boundaries_and_detects_loops() {
                 data: partition::ActiveModel {
                     table_id: Set(table_id),
                     hash_start: Set(hash_start),
+                    partition_id: Set(format!("{}:{}", table_id, hash_start)),
                     forward_to: Set(forward_to),
                     replicas: Set(ReplicaNodes(replicas)),
                 },
@@ -35,6 +36,7 @@ async fn forwarding_uses_exact_same_table_boundaries_and_detects_loops() {
     let mut source = Model {
         table_id: 1,
         hash_start: 10,
+        partition_id: "test-partition".into(),
         forward_to: Some(0),
         replicas: ReplicaNodes(vec![1, 2]),
     };

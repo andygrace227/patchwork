@@ -172,6 +172,7 @@ impl Run {
         let proposed_partition = partition::ActiveModel {
             table_id: Set(ctx.table_id),
             hash_start: Set(ctx.new_partition),
+            partition_id: Set(self.partition_id.clone()),
             forward_to: Set(Some(split_p.hash_start)), // Reads use the source partition until copying finishes.
             replicas: Set(partition::ReplicaNodes(self.replicas.clone())), // Preserve the old partition's number of copies.
         };
@@ -204,6 +205,7 @@ impl Run {
             &split_p.replicas.0,
             &self.replicas,
             lease_end,
+            &self.partition_id,
         )
         .await?;
         Ok(State::Activate)

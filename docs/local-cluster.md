@@ -68,6 +68,28 @@ the action menu. Errors from nodes appear in the response panel.
 The dashboard forwards requests only to this run's nodes. Stopping the launcher
 also stops Flask. The Flask debugger and auto-reloader are not enabled.
 
+## Manual split testing
+
+Start the rig with the optional test API:
+
+```sh
+python scripts/local_cluster.py --test-api --open-browser
+```
+
+Create a table, write records at partition keys `-10` and `10`, and wait for the
+write backlog to reach zero. Select **Test: split partition** on a control node,
+keep `{"new_partition": 0}` in the request body, and send it. The endpoint is
+`POST /test/tables/{table_id}/split`; it uses the existing bearer authentication
+and workflow queue, and returns `204` after the split workflow finishes. Wait for
+the write backlog to drain before checking the copied records. The partition
+placement table should show a new ID at `0`, while both records remain readable.
+Fresh accesses should produce telemetry for the old and new partition IDs.
+
+The route is compiled only with the `patchwork-control-plane/test-api` Cargo
+feature. Normal builds omit it. If using `--no-build`, the existing binaries must
+already have been built with that feature. Splits crossing the ring boundary
+remain unsupported.
+
 ## TPS load generator
 
 Use the dashboard's **Load generator** panel with a ready table. Set target HTTP

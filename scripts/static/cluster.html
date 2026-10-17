@@ -99,8 +99,8 @@
       <p class="telemetry-note hint">Backlog refreshes every second. Queued writes await the next batch; committing writes are in the batch sent to the shard, awaiting completion. Replica copies count on each node. Requests still waiting for admission and background replication are excluded.</p>
       <div class="table-wrap"><table><thead><tr><th>Data node</th><th>Queued writes</th><th>Committing writes</th><th>Total write backlog</th></tr></thead><tbody id="write-backlog-rows"></tbody></table></div>
       <p id="write-backlog-error" class="telemetry-note" role="status"></p>
-      <p class="telemetry-note hint">Access statistics refresh every 5 seconds. Top 100 active partition keys. Combined rates and sample counts add across nodes, including replicas. Window shows the shortest observation period; medians across multiple writing nodes are unavailable.</p>
-      <div class="table-wrap"><table><thead><tr><th>Data node</th><th>Table</th><th>Partition key</th><th>Reads / s</th><th>Writes / s</th><th>Read / write samples</th><th>Window (s)</th><th>Average write key</th><th>Median write key</th></tr></thead><tbody id="data-telemetry-rows"></tbody></table></div>
+      <p class="telemetry-note hint">Access statistics refresh every 5 seconds. Top 100 active partition IDs. Combined rates and sample counts add across nodes, including replicas. Window shows the shortest observation period; medians across multiple writing nodes are unavailable.</p>
+      <div class="table-wrap"><table><thead><tr><th>Data node</th><th>Table</th><th>Partition ID</th><th>Reads / s</th><th>Writes / s</th><th>Read / write samples</th><th>Window (s)</th><th>Average write key</th><th>Median write key</th></tr></thead><tbody id="data-telemetry-rows"></tbody></table></div>
       <p id="telemetry-error" class="telemetry-note" role="status"></p>
     </section>
     <section class="panel metadata">
@@ -109,7 +109,7 @@
     </section>
     <section class="panel metadata">
       <div class="panel-heading"><h2>Partition placement</h2><span class="hint">Signed 64-bit boundaries</span></div>
-      <div class="table-wrap"><table><thead><tr><th>Table</th><th>Starts at</th><th>Data node replicas</th><th>Forwards to</th></tr></thead><tbody id="partitions"></tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>Table</th><th>Partition ID</th><th>Starts at</th><th>Data node replicas</th><th>Forwards to</th></tr></thead><tbody id="partitions"></tbody></table></div>
     </section>
     <details class="panel leases"><summary>Partition leases <span id="lease-summary" class="hint">No locks held</span></summary><pre id="locks">[]</pre></details>
     <footer>Patchwork / local development <span id="updated"></span></footer>

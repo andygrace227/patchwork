@@ -18,9 +18,10 @@ async fn grouped_writes_match_ordered_single_writes_across_deletes_and_ties() {
     for i in 0..SQL_WRITE_BATCH_SIZE * 3 + 7 {
         mutations.push(Mutation::Write(Record {
             table_id: 1 + (i % 2) as i64,
+            partition_id: None,
             partition_key: (i % 3) as i64,
             secondary_key: (i % 19) as i64,
-            data: json!({"value": i % 5}),
+            data: serde_json::to_vec(&json!({"value": i % 5})).unwrap(),
             timestamp: (i % 7) as i64,
             deleted: i % 11 == 0,
         }));
@@ -73,9 +74,10 @@ async fn failure_in_a_later_sql_group_rolls_back_the_whole_batch() {
         .map(|i| {
             Mutation::Write(Record {
                 table_id: 1,
+                partition_id: None,
                 partition_key: 1,
                 secondary_key: i as i64,
-                data: json!(i),
+                data: serde_json::to_vec(&json!(i)).unwrap(),
                 timestamp: 1,
                 deleted: false,
             })
@@ -143,10 +145,7 @@ async fn auto_vacuum_handles_new_and_existing_shards() {
                 .unwrap();
             assert_eq!(row.try_get::<String>("", "value").unwrap(), "preserved");
         }
-        shard
-            .upsert(1, 1, 1, serde_json::json!("x".repeat(100_000)), 1)
-            .await
-            .unwrap();
+        shard.upsert(1, 1, 1, vec![b'x'; 100_000], 1).await.unwrap();
         let before = pragma(&shard.db, "page_count").await;
         shard.delete(1, 1, 1, 2).await.unwrap();
         assert!(pragma(&shard.db, "page_count").await < before);

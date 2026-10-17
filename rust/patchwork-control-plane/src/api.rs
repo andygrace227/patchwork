@@ -54,7 +54,7 @@ pub fn router(
     executor: ActorRef<LongRunningWorkflowExecutor>,
     auth: Auth,
 ) -> Router {
-    Router::new()
+    let router = Router::new()
         .route(
             "/telemetry",
             get(operation_telemetry).delete(reset_telemetry),
@@ -65,7 +65,10 @@ pub fn router(
             "/tables/{table_id}/partition-keys/{partition_key}/records/{secondary_key}",
             get(get_record).put(put_record),
         )
-        .route("/tables/{table_id}/range", get(get_range))
+        .route("/tables/{table_id}/range", get(get_range));
+    #[cfg(feature = "test-api")]
+    let router = router.route("/test/tables/{table_id}/split", post(split_partition));
+    router
         .route_layer(middleware::from_fn_with_state(
             Arc::new(auth),
             crate::auth::authenticate,
@@ -284,6 +287,54 @@ async fn delete_table(
             table: state.table.clone(),
         },
         DeleteTableContext { table_id },
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(feature = "test-api")]
+#[derive(Deserialize)]
+struct SplitPartitionRequest {
+    new_partition: i64,
+}
+
+#[cfg(feature = "test-api")]
+async fn split_partition(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(table_id): Path<i64>,
+    Json(request): Json<SplitPartitionRequest>,
+) -> Result<StatusCode, ApiError> {
+    use crate::workflows::partition::split_partition::{SplitPartition, SplitPartitionContext};
+
+    authorize(
+        &state,
+        &principal,
+        Action::SplitPartition,
+        Resource::Table(table_id),
+    )
+    .await?;
+    let table = state
+        .table
+        .ask(GetCached { id: table_id })
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "table not found"))?;
+    if !table.is_ready {
+        return Err(api_error(StatusCode::CONFLICT, "table is not ready"));
+    }
+    submit(
+        &state,
+        SplitPartition {
+            client: state.client.clone(),
+            node: state.node.clone(),
+            partition: state.partition.clone(),
+            table: state.table.clone(),
+        },
+        SplitPartitionContext {
+            table_id,
+            new_partition: request.new_partition,
+        },
     )
     .await?;
     Ok(StatusCode::NO_CONTENT)
