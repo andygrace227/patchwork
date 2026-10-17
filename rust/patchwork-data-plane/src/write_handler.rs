@@ -411,7 +411,7 @@ impl WriteHandler {
             secondary_key,
             timestamp,
             deleted: true,
-            data: serde_json::Value::Null,
+            data: Vec::new(),
         })?;
         Ok(0)
     }

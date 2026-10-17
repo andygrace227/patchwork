@@ -83,7 +83,7 @@ impl GetOneConsistent {
                 (rep_record.timestamp, rep_record.deleted) > (accepted.timestamp, accepted.deleted)
                     || ((rep_record.timestamp, rep_record.deleted)
                         == (accepted.timestamp, accepted.deleted)
-                        && rep_record.data.to_string() > accepted.data.to_string())
+                        && rep_record.data > accepted.data)
             }) {
                 accepted_record = Some(rep_record);
             }

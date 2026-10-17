@@ -104,7 +104,7 @@ impl ReadShard {
             .await
     }
 
-    /// Stored JSON payload bytes, excluding keys, indexes and SQLite overhead.
+    /// Stored payload bytes, excluding keys, indexes and SQLite overhead.
     #[message]
     pub async fn get_range_size(
         &mut self,

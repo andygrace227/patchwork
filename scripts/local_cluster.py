@@ -42,6 +42,31 @@ def request(url, method="GET", body=None, headers=None, expected=200):
         return json.loads(content) if content else None
 
 
+def internal_service_token():
+    token = os.environ.get("ATGS_INTERNAL_SERVICE_TOKEN")
+    if token is None:
+        path = ROOT / "rust" / ".env"
+        if path.is_file():
+            for line in path.read_text().splitlines():
+                key, separator, value = line.partition("=")
+                if separator and key.strip() == "ATGS_INTERNAL_SERVICE_TOKEN":
+                    token = value.strip().strip("\"'")
+    if not token:
+        raise RuntimeError("Set ATGS_INTERNAL_SERVICE_TOKEN in rust/.env or the environment")
+    return token
+
+
+def control_requests(urls, token):
+    def send(url, method="GET", body=None, headers=None, expected=200):
+        parts = urlsplit(url)
+        origin = urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+        headers = dict(headers or {})
+        if origin in urls:
+            headers["Authorization"] = "Bearer " + token
+        return request(url, method, body, headers, expected)
+    return send
+
+
 def require(name):
     path = shutil.which(name)
     if path is None:
@@ -107,6 +132,8 @@ class Cluster:
         self.processes = []
         self.control_urls = [f"http://127.0.0.1:{args.control_port + i}" for i in range(args.control_nodes)]
         self.data_urls = [f"http://127.0.0.1:{args.data_port + i}" for i in range(args.data_nodes)]
+        self.internal_token = internal_service_token()
+        self.request = control_requests(self.control_urls, self.internal_token)
         self.database_url = f"mysql://patchwork:patchwork@127.0.0.1:{args.mysql_port}/patchwork"
         self.mysql = require("mysql")
         self.mysqld = require("mysqld")
@@ -208,6 +235,7 @@ class Cluster:
             self.wait_ready(lambda: data_request(url, "GetSize"), url)
         for i, url in enumerate(self.control_urls):
             self.start_process(f"control-{i + 1}", [str(TARGET / "patchwork-control-plane")], {
+                "ATGS_INTERNAL_SERVICE_TOKEN": self.internal_token,
                 "BIND_ADDR": ("0.0.0.0:" + urlsplit(url).netloc.rsplit(":", 1)[1]) if self.args.lan_host else url.removeprefix("http://"), "DATABASE_URL": self.database_url,
             })
         for url in self.control_urls:
@@ -225,7 +253,7 @@ class Cluster:
 
     def smoke_test(self):
         print("Testing table creation, replicas, control reads, tombstones, and cleanup...", flush=True)
-        table = request(self.control_urls[0] + "/tables", "POST", {
+        table = self.request(self.control_urls[0] + "/tables", "POST", {
             "table_name": "local_smoke", "table_owner": 1,
             "partition_key_name": "account", "sort_key_name": "id",
         }, expected=201)
@@ -252,17 +280,17 @@ class Cluster:
                     raise RuntimeError(f"Wrong record from {url}: {record}")
             self.wait_ready(check_record, url)
         for url in self.control_urls:
-            record = request(url + record_path)
+            record = self.request(url + record_path)
             if record["data"] != payload or record["timestamp"] != timestamp:
                 raise RuntimeError(f"Wrong record from {url}: {record}")
         for url in self.control_urls:
-            records = request(url + f"/tables/{table_id}/range?lower_bound=0&upper_bound=100")
+            records = self.request(url + f"/tables/{table_id}/range?lower_bound=0&upper_bound=100")
             if len(records) != 1 or records[0]["data"] != payload:
                 raise RuntimeError(f"Wrong range from {url}: {records}")
         # A newer tombstone on one replica must beat older live copies.
         data_request(replicas[0], "DeleteRecord", {**fields, "timestamp": timestamp + 1})
         for url in self.control_urls:
-            self.wait_ready(lambda: request(url + record_path, expected=404), url)
+            self.wait_ready(lambda: self.request(url + record_path, expected=404), url)
 
         # Block the second boundary so failed deletion must release its first lock.
         boundary = int(self.sql(
@@ -273,7 +301,7 @@ class Cluster:
             "INSERT INTO partition_lock (table_id, hash_start, lease_end, lock_token) "
             f"VALUES ({table_id}, {boundary}, UNIX_TIMESTAMP() + 300, 'local-smoke-held')"
         )
-        request(self.control_urls[-1] + f"/tables/{table_id}", "DELETE", expected=500)
+        self.request(self.control_urls[-1] + f"/tables/{table_id}", "DELETE", expected=500)
         remaining = self.sql(f"SELECT lock_token FROM partition_lock WHERE table_id = {table_id}")
         if remaining != "local-smoke-held":
             raise RuntimeError(f"Failed deletion did not preserve/release the correct locks: {remaining}")
@@ -281,7 +309,7 @@ class Cluster:
             f"UPDATE partition_lock SET lease_end = UNIX_TIMESTAMP() - 1 WHERE table_id = {table_id}"
         )
         # Retrying must replace the expired lease and finish cleanup.
-        request(self.control_urls[-1] + f"/tables/{table_id}", "DELETE", expected=204)
+        self.request(self.control_urls[-1] + f"/tables/{table_id}", "DELETE", expected=204)
         for url in self.data_urls:
             self.wait_ready(lambda: data_request(url, "GetRecord", {**fields, "include_deleted": True}, expected="NotFound"), url)
         counts = self.sql(
@@ -315,6 +343,8 @@ class RemoteCluster:
         nodes = self.metadata()["nodes"]
         self.control_urls = [node["url"] for node in nodes if node["kind"] == "control"]
         self.data_urls = [node["url"] for node in nodes if node["kind"] == "data"]
+        self.internal_token = internal_service_token()
+        self.request = control_requests(self.control_urls, self.internal_token)
         if not self.control_urls:
             raise RuntimeError("Remote dashboard returned no control nodes")
         for url in self.control_urls:
@@ -393,7 +423,7 @@ def main():
         cluster = RemoteCluster(args) if args.remote else Cluster(args)
         cluster.start()
         if not args.no_web:
-            web_app = create_app(cluster, request)
+            web_app = create_app(cluster, cluster.request)
             server = make_server("0.0.0.0", args.web_port, web_app, threaded=True)
             threading.Thread(target=server.serve_forever, daemon=True).start()
             web_url = f"http://127.0.0.1:{args.web_port}"

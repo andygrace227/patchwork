@@ -20,6 +20,7 @@ pub struct MakeTableContext {
     pub table_owner: i64,
     pub partition_key_name: String,
     pub sort_key_name: String,
+    pub secret_key_id: Option<i64>,
 }
 
 #[derive(Clone)]

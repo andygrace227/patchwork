@@ -43,7 +43,7 @@ message WriteRequest {
   int64 table_id = 1;
   int64 partition_key = 2;
   int64 secondary_key = 3;
-  bytes data_json = 4;
+  bytes data_bin = 4;
   // Required even for timestamp zero; never minted by a data node.
   optional int64 timestamp = 5;
   bool deleted = 6;
@@ -59,7 +59,7 @@ message Record {
   int64 table_id = 1;
   int64 partition_key = 2;
   int64 secondary_key = 3;
-  bytes data_json = 4;
+  bytes data_bin = 4;
   int64 timestamp = 5;
   bool deleted = 6;
 }

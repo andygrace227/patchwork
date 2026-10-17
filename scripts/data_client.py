@@ -22,6 +22,14 @@ def data_request(url, operation, fields=None, expected="OK"):
     if process.returncode:
         raise RuntimeError(process.stderr.strip() or "Rust data client exited without a response")
     result = json.loads(process.stdout)
+    if result["status"] == "OK" and operation in ("GetRecord", "GetRange", "GetPartitionKey"):
+        records = result["body"] if isinstance(result["body"], list) else [result["body"]]
+        for record in records:
+            # Dashboard requests use JSON payloads; leave other binary data as bytes arrays.
+            try:
+                record["data"] = json.loads(bytes(record["data"]).decode())
+            except (ValueError, TypeError):
+                pass
     if expected is None:
         return {"status": result["status"], "body": json.dumps(result["body"]), "protocol": "gRPC"}
     if result["status"] != expected:

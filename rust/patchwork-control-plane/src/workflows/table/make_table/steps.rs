@@ -38,6 +38,7 @@ impl Run {
                     owner: Set(ctx.table_owner),
                     partition_key_name: Set(ctx.partition_key_name.clone()),
                     sort_key_name: Set(ctx.sort_key_name.clone()),
+                    secret_key_id: Set(ctx.secret_key_id),
                     is_ready: Set(false),
                     ..Default::default()
                 },

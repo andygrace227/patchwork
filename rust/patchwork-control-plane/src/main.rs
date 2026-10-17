@@ -3,6 +3,7 @@ use kameo::actor::Spawn;
 use patchwork_control_plane::{
     actors::{NodeActor, PartitionActor, TableActor},
     api,
+    auth::Auth,
     workflows::executor::LongRunningWorkflowExecutor,
 };
 use sea_orm::Database;
@@ -14,6 +15,7 @@ async fn main() -> Result<()> {
         Err(dotenvy::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("Could not load .env"),
     }
+    let auth = Auth::from_env()?;
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3001".into());
     let database_url =
         std::env::var("DATABASE_URL").context("Set DATABASE_URL in .env or the environment")?;
@@ -34,7 +36,7 @@ async fn main() -> Result<()> {
     );
     let result = axum::serve(
         listener,
-        api::router(node, partition, table, executor.clone()),
+        api::router(node, partition, table, executor.clone(), auth),
     )
     .with_graceful_shutdown(async {
         let _ = tokio::signal::ctrl_c().await;

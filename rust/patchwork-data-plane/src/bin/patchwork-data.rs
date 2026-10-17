@@ -71,6 +71,7 @@ async fn call(request: Call) -> Result<Value, Status> {
         _ => {}
     }
     let key = required(request.secondary_key, "secondary_key")?;
+    let data = serde_json::to_vec(&request.data).map_err(|error| Status::invalid_argument(error.to_string()))?;
     match request.operation.as_str() {
         "GetRecord" if request.include_deleted => Ok(json!(
             client
@@ -99,7 +100,7 @@ async fn call(request: Call) -> Result<Value, Status> {
                             table,
                             partition,
                             key,
-                            &request.data,
+                            &data,
                             timestamp,
                             request.deleted,
                         )
@@ -112,7 +113,7 @@ async fn call(request: Call) -> Result<Value, Status> {
                             table,
                             partition,
                             key,
-                            &request.data,
+                            &data,
                             &request.replicas,
                             timestamp,
                             request.deleted,
@@ -126,7 +127,7 @@ async fn call(request: Call) -> Result<Value, Status> {
                             table,
                             partition,
                             key,
-                            &request.data,
+                            &data,
                             &request.replicas,
                             timestamp,
                             request.deleted,

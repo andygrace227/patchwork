@@ -162,3 +162,9 @@ The [control plane README](../rust/patchwork-control-plane/README.md) describes
 table creation/deletion and record reads/writes. For direct data node requests,
 see the [data plane README](../rust/patchwork-data-plane/README.md). The rig runs the
 existing background scale checks, whose split/merge scheduling is still unfinished.
+
+Control nodes now require the internal bearer token. Set
+`ATGS_INTERNAL_SERVICE_TOKEN` in `rust/.env` or the launcher's environment. The
+launcher passes it to the control nodes, dashboard requests, and load worker.
+For remote load generation, configure the same token on the second PC. Tokens
+are not included in browser metadata or downloaded load reports.

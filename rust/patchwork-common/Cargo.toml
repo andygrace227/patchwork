@@ -14,6 +14,7 @@ tokio = { version = "1", features = ["time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ttl_cache = "0.5"
+aes-gcm = { version = "0.11.1", features = ["getrandom"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

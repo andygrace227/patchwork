@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
+    middleware,
     response::Response,
     routing::{delete, get, post},
 };
@@ -11,9 +12,12 @@ use kameo::actor::ActorRef;
 use serde::Deserialize;
 
 use crate::{
-    actors::{NodeActor, PartitionActor, TableActor},
+    actors::{NodeActor, PartitionActor, TableActor, crud::GetCached},
+    auth::{Auth, Principal},
     datamodels::table,
     dataplane_client::Client,
+    encryption_client::EncryptionClient,
+    permission_client::{Action, PermissionClient, Resource},
     workflows::{
         Workflow,
         data::{
@@ -34,6 +38,8 @@ use crate::{
 #[derive(Clone)]
 struct AppState {
     client: Client,
+    permissions: PermissionClient,
+    encryption: EncryptionClient,
     node: ActorRef<NodeActor>,
     partition: ActorRef<PartitionActor>,
     table: ActorRef<TableActor>,
@@ -46,6 +52,7 @@ pub fn router(
     partition: ActorRef<PartitionActor>,
     table: ActorRef<TableActor>,
     executor: ActorRef<LongRunningWorkflowExecutor>,
+    auth: Auth,
 ) -> Router {
     Router::new()
         .route(
@@ -59,8 +66,14 @@ pub fn router(
             get(get_record).put(put_record),
         )
         .route("/tables/{table_id}/range", get(get_range))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::new(auth),
+            crate::auth::authenticate,
+        ))
         .with_state(AppState {
             client: Client::new(),
+            permissions: PermissionClient,
+            encryption: EncryptionClient,
             node,
             partition,
             table,
@@ -69,13 +82,27 @@ pub fn router(
         })
 }
 
-async fn operation_telemetry(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(state.telemetry.snapshot())
+async fn operation_telemetry(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&state, &principal, Action::ReadTelemetry, Resource::Cluster).await?;
+    Ok(Json(state.telemetry.snapshot()))
 }
 
-async fn reset_telemetry(State(state): State<AppState>) -> StatusCode {
+async fn reset_telemetry(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<StatusCode, ApiError> {
+    authorize(
+        &state,
+        &principal,
+        Action::ResetTelemetry,
+        Resource::Cluster,
+    )
+    .await?;
     state.telemetry.reset();
-    StatusCode::NO_CONTENT
+    Ok(StatusCode::NO_CONTENT)
 }
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
@@ -100,6 +127,60 @@ fn write_error(error: anyhow::Error) -> ApiError {
         return api_error(StatusCode::SERVICE_UNAVAILABLE, status.message());
     }
     internal_error(error)
+}
+
+async fn authorize(
+    state: &AppState,
+    principal: &Principal,
+    action: Action,
+    resource: Resource,
+) -> Result<(), ApiError> {
+    state
+        .permissions
+        .check(principal, action, resource)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "permission service is not configured",
+            )
+        })
+}
+
+async fn secret_key_id(state: &AppState, table_id: i64) -> Result<Option<i64>, ApiError> {
+    state
+        .table
+        .ask(GetCached { id: table_id })
+        .await
+        .map_err(internal_error)?
+        .map(|table| table.secret_key_id)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "table not found"))
+}
+
+async fn record_json(
+    state: &AppState,
+    key_id: Option<i64>,
+    record: crate::dataplane_client::Record,
+) -> Result<serde_json::Value, ApiError> {
+    let data = state
+        .encryption
+        .decrypt(key_id, record.data)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "encryption service is not configured",
+            )
+        })?;
+    let data: serde_json::Value = serde_json::from_slice(&data).map_err(internal_error)?;
+    Ok(serde_json::json!({
+        "table_id": record.table_id,
+        "partition_key": record.partition_key,
+        "secondary_key": record.secondary_key,
+        "data": data,
+        "timestamp": record.timestamp,
+        "deleted": record.deleted,
+    }))
 }
 
 // Keep table changes in the executor's queue and reply only after completion.
@@ -129,12 +210,27 @@ struct MakeTableRequest {
     table_owner: i64,
     partition_key_name: String,
     sort_key_name: String,
+    secret_key_id: Option<i64>,
 }
 
 async fn make_table(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Json(request): Json<MakeTableRequest>,
 ) -> Result<(StatusCode, Json<table::Model>), ApiError> {
+    authorize(
+        &state,
+        &principal,
+        Action::CreateTable,
+        Resource::Account(request.table_owner),
+    )
+    .await?;
+    if request.secret_key_id.is_some_and(|id| id <= 0) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "secret_key_id must be positive",
+        ));
+    }
     if [
         &request.table_name,
         &request.partition_key_name,
@@ -160,6 +256,7 @@ async fn make_table(
             table_owner: request.table_owner,
             partition_key_name: request.partition_key_name,
             sort_key_name: request.sort_key_name,
+            secret_key_id: request.secret_key_id,
         },
     )
     .await?;
@@ -168,8 +265,16 @@ async fn make_table(
 
 async fn delete_table(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(table_id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
+    authorize(
+        &state,
+        &principal,
+        Action::DeleteTable,
+        Resource::Table(table_id),
+    )
+    .await?;
     submit(
         &state,
         DeleteTable {
@@ -198,6 +303,7 @@ fn consistent_by_default() -> bool {
 
 async fn get_record(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path((table_id, primary_key, secondary_key)): Path<(i64, i64, i64)>,
     Query(options): Query<RecordOptions>,
 ) -> Response {
@@ -211,12 +317,14 @@ async fn get_record(
             },
             options.telemetry,
             async move {
+                authorize(&state, &principal, Action::Read, Resource::Table(table_id)).await?;
+                let key_id = secret_key_id(&state, table_id).await?;
                 let record = if options.consistent {
                     GetOneConsistent {
                         client: state.client.clone(),
-                        node: state.node,
-                        partition: state.partition,
-                        table: state.table,
+                        node: state.node.clone(),
+                        partition: state.partition.clone(),
+                        table: state.table.clone(),
                     }
                     .run(GetOneConsistentCtx {
                         table_id,
@@ -227,9 +335,9 @@ async fn get_record(
                 } else {
                     GetOneInconsistent {
                         client: state.client.clone(),
-                        node: state.node,
-                        partition: state.partition,
-                        table: state.table,
+                        node: state.node.clone(),
+                        partition: state.partition.clone(),
+                        table: state.table.clone(),
                     }
                     .run(GetOneInconsistentCtx {
                         table_id,
@@ -239,9 +347,9 @@ async fn get_record(
                     .await
                 }
                 .map_err(internal_error)?;
-                record
-                    .map(Json)
-                    .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "record not found"))
+                let record =
+                    record.ok_or_else(|| api_error(StatusCode::NOT_FOUND, "record not found"))?;
+                record_json(&state, key_id, record).await.map(Json)
             },
         )
         .await
@@ -249,6 +357,7 @@ async fn get_record(
 
 async fn put_record(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path((table_id, primary_key, secondary_key)): Path<(i64, i64, i64)>,
     Query(options): Query<RecordOptions>,
     headers: HeaderMap,
@@ -264,17 +373,29 @@ async fn put_record(
             },
             options.telemetry,
             async move {
+                authorize(&state, &principal, Action::Write, Resource::Table(table_id)).await?;
                 let timestamp = headers
-        .get("x-patchwork-timestamp")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<i64>().ok())
-        .filter(|value| *value >= 0)
-        .ok_or_else(|| {
-            api_error(
-                StatusCode::BAD_REQUEST,
-                "x-patchwork-timestamp is required and must be nonnegative Unix microseconds",
-            )
-        })?;
+                    .get("x-patchwork-timestamp")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .filter(|value| *value >= 0)
+                    .ok_or_else(|| {
+                        api_error(
+                            StatusCode::BAD_REQUEST,
+                            "x-patchwork-timestamp is required and must be nonnegative Unix microseconds",
+                        )
+                    })?;
+                let key_id = secret_key_id(&state, table_id).await?;
+                let data = state
+                    .encryption
+                    .encrypt(key_id, serde_json::to_vec(&data).map_err(internal_error)?)
+                    .await
+                    .map_err(|_| {
+                        api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "encryption service is not configured",
+                        )
+                    })?;
                 if options.consistent {
                     PutOneConsistent {
                         client: state.client.clone(),
@@ -323,23 +444,26 @@ struct Range {
 
 async fn get_range(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(table_id): Path<i64>,
     Query(range): Query<Range>,
 ) -> Response {
     let timings = state.telemetry.clone();
     timings
         .run("fetch_range", range.telemetry, async move {
+            authorize(&state, &principal, Action::Read, Resource::Table(table_id)).await?;
+            let key_id = secret_key_id(&state, table_id).await?;
             if range.lower_bound > range.upper_bound {
                 return Err(api_error(
                     StatusCode::BAD_REQUEST,
                     "range bounds are reversed",
                 ));
             }
-            FetchRange {
+            let records = FetchRange {
                 client: state.client.clone(),
-                node: state.node,
-                partition: state.partition,
-                table: state.table,
+                node: state.node.clone(),
+                partition: state.partition.clone(),
+                table: state.table.clone(),
             }
             .run(FetchRangeCtx {
                 table_id,
@@ -347,8 +471,12 @@ async fn get_range(
                 upper_bound: range.upper_bound,
             })
             .await
-            .map(Json)
-            .map_err(internal_error)
+            .map_err(internal_error)?;
+            let mut result = Vec::with_capacity(records.len());
+            for record in records {
+                result.push(record_json(&state, key_id, record).await?);
+            }
+            Ok::<_, ApiError>(Json(result))
         })
         .await
 }

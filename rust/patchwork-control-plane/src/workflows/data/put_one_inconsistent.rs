@@ -2,7 +2,6 @@ use crate::telemetry::{measure, time};
 use anyhow::{Context, Result, ensure};
 use kameo::actor::ActorRef;
 use rand::seq::SliceRandom;
-use serde_json::Value;
 
 use crate::{
     actors::{
@@ -23,7 +22,7 @@ pub struct PutOneInconsistentCtx {
     pub table_id: i64,
     pub primary_key: i64,
     pub secondary_key: i64,
-    pub data: Value,
+    pub data: Vec<u8>,
     // Caller-supplied Unix microseconds; preserve on retries.
     pub timestamp: i64,
 }

@@ -55,7 +55,7 @@ on `BIND_ADDR`; REST routes have been removed. Node URLs still use `http://` or
 Restart all data nodes with this version before starting the updated control plane.
 
 The service definition is `patchwork-common/proto/dataplane.proto`. Keys, timestamps,
-deletion flags, and telemetry use protobuf fields; record payloads remain JSON bytes.
+deletion flags, and telemetry use protobuf fields; record payloads are raw bytes. The control-plane API serializes JSON before storage.
 Write timestamps must be present (including zero) and are preserved
 through replication and copying. Client errors are `tonic::Status`, including
 `NotFound` for missing records and `InvalidArgument` for invalid requests.
@@ -97,7 +97,7 @@ A failed request can leave some copies saved.
 Reads return the contacted node's copy; they do not reconcile multiple replicas.
 
 `DeleteRecord` requires a timestamp and queues a tombstone (`deleted: true`,
-`data: null`), even for a key not yet present. An older or equal timestamp cannot
+empty data bytes), even for a key not yet present. An older or equal timestamp cannot
 resurrect it. A strictly newer write can. Delete RPC counts currently return zero
 because mutations are queued before SQLite applies them.
 

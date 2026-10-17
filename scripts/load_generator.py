@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -12,9 +13,10 @@ BINARY = Path(__file__).resolve().parents[1] / "rust" / "target" / "release" / (
 
 
 class LoadGenerator:
-    def __init__(self, control_urls, directory):
+    def __init__(self, control_urls, directory, token=None):
         self.control_urls = control_urls
         self.directory = directory
+        self.token = token
         self.lock = threading.Lock()
         self.process = self.thread = None
         self.closed = False
@@ -37,7 +39,8 @@ class LoadGenerator:
                 command.extend(["--control-url", url])
             with (self.directory / "load-worker.log").open("w") as log:
                 process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                           stderr=log, text=True, bufsize=1)
+                                           stderr=log, text=True, bufsize=1,
+                                           env={**os.environ, "ATGS_INTERNAL_SERVICE_TOKEN": self.token} if self.token else None)
             try:
                 process.stdin.write(json.dumps(values) + "\n")
                 process.stdin.flush()

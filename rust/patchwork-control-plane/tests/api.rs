@@ -117,9 +117,19 @@ async fn routes_invoke_record_workflows_and_report_table_job_results() {
         )
         .unwrap(),
     );
-    let (url, server) = serve(api::router(node, partition, table, executor.clone())).await;
+    let token = "test-internal-service-token";
+    let auth = patchwork_control_plane::auth::Auth::new(token.into(), None).unwrap();
+    let (url, server) = serve(api::router(node, partition, table, executor.clone(), auth)).await;
     servers.push(server);
-    let http = reqwest::Client::new();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    let http = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap();
     let record_url = format!("{url}/tables/1/partition-keys/10/records/42");
     let record: Record = http
         .get(&record_url)

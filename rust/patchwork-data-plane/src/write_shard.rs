@@ -45,7 +45,7 @@ impl WriteShard {
         table_id: i64,
         partition_key: i64,
         secondary_key: i64,
-        data: &serde_json::Value,
+        data: &[u8],
         timestamp: i64,
         deleted: bool,
     ) -> Result<Statement> {
@@ -63,21 +63,17 @@ impl WriteShard {
         table_id: i64,
         partition_key: i64,
         secondary_key: i64,
-        data: &serde_json::Value,
+        data: &[u8],
         timestamp: i64,
         deleted: bool,
     ) -> Result<[Value; 6]> {
         anyhow::ensure!(timestamp >= 0, "timestamp must be nonnegative");
-        let data = if deleted {
-            &serde_json::Value::Null
-        } else {
-            data
-        };
+        let data = if deleted { Vec::new() } else { data.to_vec() };
         Ok([
             table_id.into(),
             partition_key.into(),
             secondary_key.into(),
-            serde_json::to_string(data)?.into(),
+            data.into(),
             timestamp.into(),
             deleted.into(),
         ])
@@ -280,7 +276,7 @@ impl WriteShard {
         table_id: i64,
         partition_key: i64,
         secondary_key: i64,
-        data: serde_json::Value,
+        data: Vec<u8>,
         timestamp: i64,
     ) -> Result<()> {
         self.write_record(
@@ -301,7 +297,7 @@ impl WriteShard {
         table_id: i64,
         partition_key: i64,
         secondary_key: i64,
-        data: serde_json::Value,
+        data: Vec<u8>,
         timestamp: i64,
         deleted: bool,
     ) -> Result<u64> {
@@ -353,7 +349,7 @@ impl WriteShard {
             table_id,
             partition_key,
             secondary_key,
-            serde_json::Value::Null,
+            Vec::new(),
             timestamp,
             true,
         )

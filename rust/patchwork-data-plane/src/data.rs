@@ -10,7 +10,7 @@ pub struct Model {
     pub partition_key: i64,
     #[sea_orm(primary_key, auto_increment = false)]
     pub secondary_key: i64,
-    pub data: Json,
+    pub data: Vec<u8>,
     pub timestamp: i64,
     pub deleted: bool,
 }

@@ -7,6 +7,41 @@ DATABASE_URL=mysql://user:password@127.0.0.1/patchwork BIND_ADDR=127.0.0.1:3001 
   cargo run -p patchwork-control-plane
 ```
 
+Every API request requires `Authorization: Bearer <token>`. Set
+`ATGS_INTERNAL_SERVICE_TOKEN` in `.env` or the environment before starting the
+control plane. That token identifies `AtgsInternalService` and skips the permission
+service lookup. It is a trusted bootstrap credential for the internal services.
+
+Customer and service JWTs can be verified with an RSA public key. Configure
+`JWT_PUBLIC_KEY_PATH`, `JWT_ISSUER`, and `JWT_AUDIENCE` together; only RS256 is
+accepted. The control plane checks the signature, expiration, optional not-before
+time, issuer, audience, and a nonempty `sub`. `account_id` is optional, and
+`principal_type` supports `User` (the default), `Service`, `Container`, and
+`Function`. JWTs cannot claim the `AtgsInternalService` bootstrap exception.
+Token issuance belongs to the future auth service; no login endpoint is added here.
+
+The permission client is currently a stub: verified JWT callers receive `503`
+until it is connected to the permission service. Missing or invalid credentials
+receive `401`. The internal token works without that service or JWT configuration.
+The dashboard and load generator send the internal token from `rust/.env` or the
+environment; set the same token on a remote load PC.
+
+Tables have an optional `secret_key_id`. Omit it or send `null` for unencrypted
+JSON bytes, or supply a positive key ID for encryption. The control plane calls
+the encryption client before writes and after reads, including range reads.
+The encryption client is also a stub: tables with a key ID return `503` when
+an encryption/decryption call is needed. The internal token does not override
+this setting. The data plane stores raw bytes and does not handle keys.
+
+Existing MySQL metadata databases need this migration before running the new
+control plane (fresh databases made by the local rig include the column):
+
+```sql
+ALTER TABLE `table` ADD COLUMN secret_key_id BIGINT NULL;
+```
+
+The same statement is in `migrations/20261015_add_secret_key_id.sql`.
+
 Startup loads `.env`; exported variables take precedence. `DATABASE_URL` is
 required. `BIND_ADDR` defaults to `127.0.0.1:3001`; set it explicitly if your
 shared `.env` contains the data plane's address. Startup expects the existing
@@ -27,7 +62,7 @@ Independent requests can use different threads. Each data node keeps one write
 connection in its shard actor and uses Kameo's actor pool for read connections.
 
 - `POST /tables` invokes `MakeTable` and returns `201` with the ready table.
-  Send `{"table_name":"accounts","table_owner":1,"partition_key_name":"account","sort_key_name":"id"}`.
+  Send `{"table_name":"accounts","table_owner":1,"partition_key_name":"account","sort_key_name":"id","secret_key_id":null}`.
 - `DELETE /tables/{table_id}` invokes `DeleteTable` and returns `204` after cleanup.
   An already absent table also returns `204`.
 - `GET /tables/{table_id}/partition-keys/{partition_key}/records/{secondary_key}`

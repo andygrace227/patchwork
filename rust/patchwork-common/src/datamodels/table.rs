@@ -14,6 +14,7 @@ pub struct Model {
     pub backup_control_node: i64,
     pub partition_key_name: String,
     pub sort_key_name: String,
+    pub secret_key_id: Option<i64>,
     pub is_ready: bool,
 }
 

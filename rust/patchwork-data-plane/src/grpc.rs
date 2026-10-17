@@ -99,7 +99,7 @@ fn record(record: data::Model) -> Result<proto::Record, Status> {
         table_id: record.table_id,
         partition_key: record.partition_key,
         secondary_key: record.secondary_key,
-        data_json: serde_json::to_vec(&record.data).map_err(internal_error)?,
+        data_bin: record.data,
         timestamp: record.timestamp,
         deleted: record.deleted,
     })
@@ -124,8 +124,7 @@ impl Service {
                 "at least one remote replica is required",
             ));
         }
-        let data = serde_json::from_slice(&request.data_json)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let data = request.data_bin;
         self.handler
             .ask(write_handler::WriteRecord {
                 record: Record {

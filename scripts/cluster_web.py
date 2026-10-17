@@ -24,7 +24,7 @@ def create_app(cluster, send_request):
         **{f"control-{i + 1}": url for i, url in enumerate(cluster.control_urls)},
         **{f"data-{i + 1}": url for i, url in enumerate(cluster.data_urls)},
     }
-    load = LoadGenerator({name: url for name, url in node_urls.items() if name.startswith("control-")}, cluster.directory)
+    load = LoadGenerator({name: url for name, url in node_urls.items() if name.startswith("control-")}, cluster.directory, token=cluster.internal_token)
     app.extensions["load_generator"] = load
 
     def rows(query):

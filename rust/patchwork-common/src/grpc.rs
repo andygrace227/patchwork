@@ -1,4 +1,4 @@
-//! Shared gRPC messages and conversions. Only record payloads contain JSON.
+//! Shared gRPC messages and conversions. Record payloads are opaque bytes.
 use crate::dataplane_client::{AccessStatistics, Record, Telemetry};
 use tonic::Status;
 
@@ -17,8 +17,7 @@ impl TryFrom<proto::Record> for Record {
             table_id: record.table_id,
             partition_key: record.partition_key,
             secondary_key: record.secondary_key,
-            data: serde_json::from_slice(&record.data_json)
-                .map_err(|error| Status::data_loss(error.to_string()))?,
+            data: record.data_bin,
             timestamp: record.timestamp,
             deleted: record.deleted,
         })

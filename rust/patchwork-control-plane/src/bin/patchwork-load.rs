@@ -326,7 +326,15 @@ async fn run(config: Config, mut cancel: watch::Receiver<bool>, report_dir: Path
         "Load generator using {} Tokio worker threads",
         tokio::runtime::Handle::current().metrics().num_workers(),
     );
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Ok(token) = std::env::var("ATGS_INTERNAL_SERVICE_TOKEN") {
+        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .context("Invalid ATGS_INTERNAL_SERVICE_TOKEN")?;
+        value.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+    }
     let client = Client::builder()
+        .default_headers(headers)
         .no_proxy()
         .tcp_nodelay(true)
         .pool_max_idle_per_host(config.workers)
@@ -446,6 +454,12 @@ async fn main() {
 }
 
 async fn main_result() -> Result<()> {
+    match dotenvy::dotenv() {
+        Ok(_) => {}
+        Err(dotenvy::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("Could not load .env"),
+    }
+
     let mut args = std::env::args().skip(1);
     let mut urls = Vec::new();
     let mut file = None;
