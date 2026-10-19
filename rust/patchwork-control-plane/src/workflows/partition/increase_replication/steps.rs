@@ -1,4 +1,5 @@
 use super::*;
+use kameo_actors::pool::Dispatch;
 
 impl Run {
     pub(super) async fn prepare(&mut self) -> Result<State> {
@@ -7,9 +8,9 @@ impl Run {
         // Fetch the hash ring. The next boundary marks the end of this partition.
         let partitions = workflow
             .partition
-            .ask(GetTablePartitions {
+            .ask(Dispatch(GetTablePartitions {
                 table_id: ctx.table_id,
-            })
+            }))
             .await?;
         let (source, next) = boundaries(&partitions, ctx.hash_start)?;
         ensure!(
@@ -60,11 +61,11 @@ impl Run {
             locks.push(
                 workflow
                     .partition
-                    .ask(AttemptLock {
+                    .ask(Dispatch(AttemptLock {
                         table_id: ctx.table_id,
                         hash_start,
                         lease_end,
-                    })
+                    }))
                     .await?
                     .context("Partition is already locked; retry the replication change")?,
             );
@@ -72,9 +73,9 @@ impl Run {
         // Another operation may have finished while we were taking the locks.
         let current = workflow
             .partition
-            .ask(GetTablePartitions {
+            .ask(Dispatch(GetTablePartitions {
                 table_id: ctx.table_id,
-            })
+            }))
             .await?;
         ensure!(
             boundaries(&current, ctx.hash_start)? == (source, next),
@@ -101,9 +102,9 @@ impl Run {
         while replicas.len() < ctx.replication_factor {
             let node = workflow
                 .node
-                .ask(GetNodeExcluding {
+                .ask(Dispatch(GetNodeExcluding {
                     node_ids: replicas.clone(),
-                })
+                }))
                 .await?
                 .context("Not enough nodes to reach the requested replication factor")?;
             replicas.push(node.node_id);
@@ -142,7 +143,7 @@ impl Run {
 
         workflow
             .partition
-            .ask(UpdateLockedPartition {
+            .ask(Dispatch(UpdateLockedPartition {
                 data: partition::ActiveModel {
                     table_id: Set(ctx.table_id),
                     hash_start: Set(ctx.hash_start),
@@ -150,7 +151,7 @@ impl Run {
                     ..Default::default()
                 },
                 locks: locks.clone(),
-            })
+            }))
             .await?;
         Ok(State::Unlock)
     }

@@ -1848,6 +1848,7 @@ dependencies = [
  "dotenvy",
  "jsonwebtoken",
  "kameo",
+ "kameo_actors",
  "patchwork-common",
  "patchwork-data-plane",
  "prost",

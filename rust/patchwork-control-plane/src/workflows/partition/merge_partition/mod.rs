@@ -3,11 +3,11 @@ use crate::workflows::data::fetch_range::FetchRangeCtx;
 use crate::workflows::stages::{unlock, workflow_steps};
 use anyhow::{Context, Result, ensure};
 use kameo::actor::ActorRef;
+use kameo_actors::pool::ActorPool;
 
 use crate::{
     actors::{
         NodeActor, PartitionActor,
-        crud::Get,
         parition_lock::AttemptLock,
         partition::{DeleteLockedPartition, GetTablePartitionsUncached as GetTablePartitions},
     },
@@ -25,8 +25,8 @@ pub struct MergePartitionContext {
 #[derive(Clone)]
 pub struct MergePartition {
     pub client: Client,
-    pub node: ActorRef<NodeActor>,
-    pub partition: ActorRef<PartitionActor>,
+    pub node: ActorRef<ActorPool<NodeActor>>,
+    pub partition: ActorRef<ActorPool<PartitionActor>>,
 }
 
 mod steps;

@@ -169,8 +169,8 @@ def create_app(cluster, send_request):
                 return jsonify(**result, url=f"{url}/patchwork.dataplane.DataPlane/{operation}", method="gRPC",
                                timestamp=timestamp, replicas=replicas, elapsed_ms=round((time.monotonic() - started) * 1000))
             method, path = values["method"], values["path"]
-            test_split = cluster.args.test_api and method == "POST" and re.fullmatch(r"/test/tables/\d+/split", path)
-            if method not in ("GET", "POST", "PUT", "DELETE") or not (path.startswith(("/tables", "/telemetry")) or test_split):
+            test_operation = cluster.args.test_api and method == "POST" and re.fullmatch(r"/test/tables/\d+/(split|increase-replication)", path)
+            if method not in ("GET", "POST", "PUT", "DELETE") or not (path.startswith(("/tables", "/telemetry")) or test_operation):
                 raise ValueError("Choose a supported method and a /tables or /telemetry path")
             raw_body = values.get("body", "")
             body = json.loads(raw_body) if raw_body.strip() else None

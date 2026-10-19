@@ -1,11 +1,13 @@
+use crate::actors::{node::GetNodeCached, table::GetTableCached};
 use crate::telemetry::{measure, time};
 use anyhow::{Context, Result, ensure};
 use kameo::actor::ActorRef;
+use kameo_actors::pool::{ActorPool, Dispatch};
 use rand::seq::SliceRandom;
 
 use crate::{
     actors::{
-        NodeActor, PartitionActor, TableActor, crud::GetCached as Get,
+        NodeActor, PartitionActor, TableActor,
         partition::GetPartitionAtOrBeforeCached as GetPartitionAtOrBefore,
     },
     dataplane_client::Client,
@@ -13,9 +15,9 @@ use crate::{
 
 pub struct PutOneInconsistent {
     pub client: Client,
-    pub partition: ActorRef<PartitionActor>,
-    pub node: ActorRef<NodeActor>,
-    pub table: ActorRef<TableActor>,
+    pub partition: ActorRef<ActorPool<PartitionActor>>,
+    pub node: ActorRef<ActorPool<NodeActor>>,
+    pub table: ActorRef<ActorPool<TableActor>>,
 }
 
 pub struct PutOneInconsistentCtx {
@@ -33,7 +35,7 @@ impl PutOneInconsistent {
         let table_timing = measure("table_lookup");
         let table = self
             .table
-            .ask(Get { id: ctx.table_id })
+            .ask(Dispatch(GetTableCached { id: ctx.table_id }))
             .await?
             .context("Table is not alive.")?;
         ensure!(table.is_ready, "Table is not ready.");
@@ -42,19 +44,19 @@ impl PutOneInconsistent {
         let partition_timing = measure("partition_lookup");
         let mut partition = self
             .partition
-            .ask(GetPartitionAtOrBefore {
+            .ask(Dispatch(GetPartitionAtOrBefore {
                 table_id: ctx.table_id,
                 hash_start: ctx.primary_key,
-            })
+            }))
             .await?;
         // Keys before the first boundary wrap to the last partition.
         if partition.is_none() {
             partition = self
                 .partition
-                .ask(GetPartitionAtOrBefore {
+                .ask(Dispatch(GetPartitionAtOrBefore {
                     table_id: ctx.table_id,
                     hash_start: i64::MAX,
-                })
+                }))
                 .await?;
         }
         let partition = partition.context("Table has no partitions")?;
@@ -71,9 +73,12 @@ impl PutOneInconsistent {
         // Resolve every destination before starting the write.
         let mut urls = Vec::new();
         for replica in replicas {
-            let node = time("replica_lookup", self.node.ask(Get { id: replica }))
-                .await?
-                .context("Replica node no longer exists")?;
+            let node = time(
+                "replica_lookup",
+                self.node.ask(Dispatch(GetNodeCached { id: replica })),
+            )
+            .await?
+            .context("Replica node no longer exists")?;
             let url = node.url.trim_end_matches('/').to_owned();
             if !urls.contains(&url) {
                 urls.push(url);

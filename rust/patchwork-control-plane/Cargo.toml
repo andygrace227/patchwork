@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 default-run = "patchwork-control-plane"
 
+[profile.release]
+debug = true
+
 [features]
 test-api = []
 
@@ -24,6 +27,7 @@ patchwork-common = { workspace = true }
 tonic = "0.14"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync"] }
 cano = "=0.15.2"
+kameo_actors = "0.8.1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

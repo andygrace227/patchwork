@@ -26,6 +26,7 @@ use kameo::{
     error::{ActorStopReason, Infallible},
     message::{Context, Message},
 };
+use kameo_actors::pool::ActorPool;
 use tokio::task::JoinHandle;
 
 use super::job::JobCompletion;
@@ -64,9 +65,9 @@ impl Default for ExecutorConfig {
 }
 
 pub struct LongRunningWorkflowExecutor {
-    node: ActorRef<NodeActor>,
-    partition: ActorRef<PartitionActor>,
-    table: ActorRef<TableActor>,
+    node: ActorRef<ActorPool<NodeActor>>,
+    partition: ActorRef<ActorPool<PartitionActor>>,
+    table: ActorRef<ActorPool<TableActor>>,
     config: ExecutorConfig,
     queued: VecDeque<QueuedJob>,
     running: HashMap<String, Option<i64>>,
@@ -79,18 +80,18 @@ pub struct LongRunningWorkflowExecutor {
 impl LongRunningWorkflowExecutor {
     /// Spawning this actor also starts random background scaling checks.
     pub fn new(
-        node: ActorRef<NodeActor>,
-        partition: ActorRef<PartitionActor>,
-        table: ActorRef<TableActor>,
+        node: ActorRef<ActorPool<NodeActor>>,
+        partition: ActorRef<ActorPool<PartitionActor>>,
+        table: ActorRef<ActorPool<TableActor>>,
     ) -> Self {
         Self::with_config(node, partition, table, ExecutorConfig::default())
             .expect("valid default configuration")
     }
 
     pub fn with_config(
-        node: ActorRef<NodeActor>,
-        partition: ActorRef<PartitionActor>,
-        table: ActorRef<TableActor>,
+        node: ActorRef<ActorPool<NodeActor>>,
+        partition: ActorRef<ActorPool<PartitionActor>>,
+        table: ActorRef<ActorPool<TableActor>>,
         config: ExecutorConfig,
     ) -> Result<Self> {
         ensure!(

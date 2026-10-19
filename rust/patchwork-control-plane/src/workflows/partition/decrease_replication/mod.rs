@@ -3,12 +3,12 @@ use crate::workflows::data::fetch_range::FetchRangeCtx;
 use crate::workflows::stages::{unlock, workflow_steps};
 use anyhow::{Context, Result, ensure};
 use kameo::actor::ActorRef;
+use kameo_actors::pool::ActorPool;
 use sea_orm::ActiveValue::Set;
 
 use crate::{
     actors::{
         NodeActor, PartitionActor,
-        crud::Get,
         parition_lock::AttemptLock,
         partition::{GetTablePartitionsUncached as GetTablePartitions, UpdateLockedPartition},
     },
@@ -27,8 +27,8 @@ pub struct DecreaseReplicationContext {
 #[derive(Clone)]
 pub struct DecreaseReplication {
     pub client: Client,
-    pub node: ActorRef<NodeActor>,
-    pub partition: ActorRef<PartitionActor>,
+    pub node: ActorRef<ActorPool<NodeActor>>,
+    pub partition: ActorRef<ActorPool<PartitionActor>>,
 }
 
 mod steps;

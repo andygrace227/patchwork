@@ -11,6 +11,8 @@ pub enum Action {
     ResetTelemetry,
     #[cfg(feature = "test-api")]
     SplitPartition,
+    #[cfg(feature = "test-api")]
+    IncreaseReplication,
 }
 
 pub enum Resource {

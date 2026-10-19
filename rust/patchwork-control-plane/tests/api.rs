@@ -1,8 +1,12 @@
+use kameo_actors::pool::{ActorPool, Dispatch};
+use patchwork_control_plane::actors::{
+    node::CreateNode, partition::CreatePartition, table::CreateTable,
+};
 use std::time::Duration;
 
 use kameo::actor::Spawn;
 use patchwork_control_plane::{
-    actors::{NodeActor, PartitionActor, TableActor, crud::Create},
+    actors::{NodeActor, PartitionActor, TableActor},
     api,
     datamodels::{node, partition, table},
     dataplane_client::{Client, Record},
@@ -32,9 +36,18 @@ async fn routes_invoke_record_workflows_and_report_table_job_results() {
     ] {
         db.execute(&statement).await.unwrap();
     }
-    let node = NodeActor::spawn(NodeActor::new(db.clone()));
-    let partition = PartitionActor::spawn(PartitionActor::new(db.clone()));
-    let table = TableActor::spawn(TableActor::new(db));
+    let node = ActorPool::spawn(ActorPool::new(2, {
+        let db = db.clone();
+        move || NodeActor::spawn(NodeActor::new(db.clone()))
+    }));
+    let partition = ActorPool::spawn(ActorPool::new(2, {
+        let db = db.clone();
+        move || PartitionActor::spawn(PartitionActor::new(db.clone()))
+    }));
+    let table = ActorPool::spawn(ActorPool::new(2, {
+        let db = db.clone();
+        move || TableActor::spawn(TableActor::new(db.clone()))
+    }));
     let dir = tempfile::tempdir().unwrap();
     let mut shards = Vec::new();
     let mut servers = Vec::new();
@@ -66,12 +79,12 @@ async fn routes_invoke_record_workflows_and_report_table_job_results() {
             .await
             .unwrap();
         let replica = node
-            .ask(Create::<node::Entity> {
+            .ask(Dispatch(CreateNode {
                 data: node::ActiveModel {
                     url: Set(url.clone()),
                     ..Default::default()
                 },
-            })
+            }))
             .await
             .unwrap();
         replicas.push(replica.node_id);
@@ -80,7 +93,7 @@ async fn routes_invoke_record_workflows_and_report_table_job_results() {
         urls.push(url);
     }
     table
-        .ask(Create::<table::Entity> {
+        .ask(Dispatch(CreateTable {
             data: table::ActiveModel {
                 table_id: Set(1),
                 table_name: Set("accounts".into()),
@@ -90,11 +103,11 @@ async fn routes_invoke_record_workflows_and_report_table_job_results() {
                 is_ready: Set(true),
                 ..Default::default()
             },
-        })
+        }))
         .await
         .unwrap();
     partition
-        .ask(Create::<partition::Entity> {
+        .ask(Dispatch(CreatePartition {
             data: partition::ActiveModel {
                 table_id: Set(1),
                 hash_start: Set(i64::MIN),
@@ -102,7 +115,7 @@ async fn routes_invoke_record_workflows_and_report_table_job_results() {
                 forward_to: Set(None),
                 replicas: Set(partition::ReplicaNodes(replicas)),
             },
-        })
+        }))
         .await
         .unwrap();
     let executor = LongRunningWorkflowExecutor::spawn(

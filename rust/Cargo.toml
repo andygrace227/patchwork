@@ -4,3 +4,6 @@ members = ["patchwork-common", "patchwork-control-plane","patchwork-data-plane"]
 
 [workspace.dependencies]
 patchwork-common = { path = "patchwork-common" }
+
+[profile.release]
+debug = true

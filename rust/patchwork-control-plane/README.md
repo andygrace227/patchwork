@@ -48,6 +48,13 @@ shared `.env` contains the data plane's address. Startup expects the existing
 `node`, `table`, `partition`, and `partition_lock` tables. It does not create or
 migrate metadata. Register at least three distinct data nodes before creating a table.
 
+Node, partition, and table metadata requests use separate Kameo actor pools.
+`METADATA_ACTOR_POOL_SIZE` sets the workers in each pool (default `2`). All workers
+share one SeaORM/SQLx database connection pool, with one connection kept open and
+up to `METADATA_DB_MAX_CONNECTIONS` connections (default `16`) per control process.
+Both settings must be positive integers and can be set in `.env` or the environment.
+Startup logs the selected sizes so load runs can be compared.
+
 The server starts the existing workflow executor, including its random background
 scale checks. Table changes go through that executor; HTTP responses wait for
 completion. Ctrl-C drains HTTP requests before stopping the executor.

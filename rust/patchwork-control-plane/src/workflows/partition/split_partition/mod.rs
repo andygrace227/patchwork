@@ -1,7 +1,7 @@
 use super::copy_range::copy_range;
+use crate::dataplane_client::Client;
 use crate::workflows::data::fetch_range::FetchRangeCtx;
 use crate::workflows::stages::{unlock, workflow_steps};
-use crate::{actors::crud::Get, dataplane_client::Client};
 use crate::{
     actors::{
         NodeActor, PartitionActor, TableActor,
@@ -17,6 +17,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use kameo::actor::ActorRef;
+use kameo_actors::pool::ActorPool;
 use sea_orm::ActiveValue::Set;
 
 /// Split the existing partition containing `new_partition` at that hash boundary.
@@ -29,9 +30,9 @@ pub struct SplitPartitionContext {
 #[derive(Clone)]
 pub struct SplitPartition {
     pub client: Client,
-    pub node: ActorRef<NodeActor>,
-    pub partition: ActorRef<PartitionActor>,
-    pub table: ActorRef<TableActor>,
+    pub node: ActorRef<ActorPool<NodeActor>>,
+    pub partition: ActorRef<ActorPool<PartitionActor>>,
+    pub table: ActorRef<ActorPool<TableActor>>,
 }
 
 mod steps;

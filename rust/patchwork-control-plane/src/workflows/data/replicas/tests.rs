@@ -1,9 +1,8 @@
 use super::*;
-use crate::{
-    actors::crud::Create,
-    datamodels::partition::{self, ReplicaNodes},
-};
+use crate::actors::partition::CreatePartition;
+use crate::datamodels::partition::{self, ReplicaNodes};
 use kameo::actor::Spawn;
+use kameo_actors::pool::{ActorPool, Dispatch};
 use sea_orm::{ActiveValue::Set, ConnectionTrait, Database, Schema};
 
 #[tokio::test]
@@ -13,7 +12,10 @@ async fn forwarding_uses_exact_same_table_boundaries_and_detects_loops() {
     db.execute(&schema.create_table_from_entity(partition::Entity))
         .await
         .unwrap();
-    let actor = PartitionActor::spawn(PartitionActor::new(db.clone()));
+    let actor = ActorPool::spawn(ActorPool::new(2, {
+        let db = db.clone();
+        move || PartitionActor::spawn(PartitionActor::new(db.clone()))
+    }));
     for (table_id, hash_start, forward_to, replicas) in [
         (1, 0, None, vec![2, 3]),
         (2, 0, None, vec![99]),
@@ -21,7 +23,7 @@ async fn forwarding_uses_exact_same_table_boundaries_and_detects_loops() {
         (1, 30, Some(20), vec![5]),
     ] {
         actor
-            .ask(Create::<partition::Entity> {
+            .ask(Dispatch(CreatePartition {
                 data: partition::ActiveModel {
                     table_id: Set(table_id),
                     hash_start: Set(hash_start),
@@ -29,7 +31,7 @@ async fn forwarding_uses_exact_same_table_boundaries_and_detects_loops() {
                     forward_to: Set(forward_to),
                     replicas: Set(ReplicaNodes(replicas)),
                 },
-            })
+            }))
             .await
             .unwrap();
     }

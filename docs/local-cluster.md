@@ -73,7 +73,7 @@ also stops Flask. The Flask debugger and auto-reloader are not enabled.
 Start the rig with the optional test API:
 
 ```sh
-python scripts/local_cluster.py --test-api --open-browser
+python scripts/local_cluster.py --test-api --data-nodes 4 --open-browser
 ```
 
 Create a table, write records at partition keys `-10` and `10`, and wait for the
@@ -89,6 +89,19 @@ The route is compiled only with the `patchwork-control-plane/test-api` Cargo
 feature. Normal builds omit it. If using `--no-build`, the existing binaries must
 already have been built with that feature. Splits crossing the ring boundary
 remain unsupported.
+
+To add a replica, select **Test: increase replication** on a control node. Use
+the partition's exact **Starts at** value from the placement table:
+
+```json
+{"hash_start": 0, "replication_factor": 4}
+```
+
+The factor is the desired total number of copies. The endpoint is
+`POST /test/tables/{table_id}/increase-replication`, and returns `204` after the
+workflow finishes. The rig needs at least that many data nodes. After draining
+the write backlog, the added replica should contain the same records, tombstones,
+and partition ID. The `0` boundary above exists after the example split.
 
 ## TPS load generator
 

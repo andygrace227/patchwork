@@ -1,8 +1,12 @@
 use kameo::actor::Spawn;
+use patchwork_common::actors::{
+    node::{CreateNode, DeleteNode, GetNode, GetNodeCached, UpdateNode},
+    partition::{CreatePartition, DeletePartition, GetPartition, UpdatePartition},
+    table::{CreateTable, DeleteTable, GetTable, GetTableCached, UpdateTable},
+};
 use patchwork_common::{
     actors::{
         NodeActor, PartitionActor, TableActor,
-        crud::{Create, Delete, Get, GetCached, Update},
         node::GetRandomNodes,
         partition::{GetPartitionAtOrBeforeCached, GetTablePartitions, GetTablePartitionsUncached},
     },
@@ -19,7 +23,7 @@ async fn node_cache_reuses_reads_expires_and_invalidates_on_writes() {
         .unwrap();
     let nodes = NodeActor::spawn(NodeActor::new(db.clone()));
     let mut row = nodes
-        .ask(Create::<node::Entity> {
+        .ask(CreateNode {
             data: node::ActiveModel {
                 url: Set("http://original".into()),
                 ..Default::default()
@@ -28,7 +32,7 @@ async fn node_cache_reuses_reads_expires_and_invalidates_on_writes() {
         .await
         .unwrap();
     assert_eq!(
-        nodes.ask(Get { id: row.node_id }).await.unwrap(),
+        nodes.ask(GetNode { id: row.node_id }).await.unwrap(),
         Some(row.clone())
     );
     db.execute_unprepared("UPDATE node SET url = 'http://external'")
@@ -36,14 +40,14 @@ async fn node_cache_reuses_reads_expires_and_invalidates_on_writes() {
         .unwrap();
     // An external change is hidden until TTL expiry; both read messages share the cache.
     assert_eq!(
-        nodes.ask(GetCached { id: row.node_id }).await.unwrap(),
+        nodes.ask(GetNodeCached { id: row.node_id }).await.unwrap(),
         Some(row.clone())
     );
 
     let expiring = NodeActor::spawn(NodeActor::with_cache_ttl(db.clone(), Duration::ZERO));
     assert_eq!(
         expiring
-            .ask(Get { id: row.node_id })
+            .ask(GetNode { id: row.node_id })
             .await
             .unwrap()
             .unwrap()
@@ -55,7 +59,7 @@ async fn node_cache_reuses_reads_expires_and_invalidates_on_writes() {
         .unwrap();
     assert_eq!(
         expiring
-            .ask(GetCached { id: row.node_id })
+            .ask(GetNodeCached { id: row.node_id })
             .await
             .unwrap()
             .unwrap()
@@ -64,22 +68,19 @@ async fn node_cache_reuses_reads_expires_and_invalidates_on_writes() {
     );
 
     row.url = "http://actor-update".into();
-    nodes
-        .ask(Update::<node::Entity> { data: row.clone() })
-        .await
-        .unwrap();
+    nodes.ask(UpdateNode { data: row.clone() }).await.unwrap();
     assert_eq!(
-        nodes.ask(Get { id: row.node_id }).await.unwrap(),
+        nodes.ask(GetNode { id: row.node_id }).await.unwrap(),
         Some(row.clone())
     );
-    nodes.ask(Delete { id: row.node_id }).await.unwrap();
+    nodes.ask(DeleteNode { id: row.node_id }).await.unwrap();
     assert_eq!(
-        nodes.ask(GetCached { id: row.node_id }).await.unwrap(),
+        nodes.ask(GetNodeCached { id: row.node_id }).await.unwrap(),
         None
     );
     // Missing nodes aren't cached, so registering that ID is immediately visible.
     nodes
-        .ask(Create::<node::Entity> {
+        .ask(CreateNode {
             data: node::ActiveModel {
                 node_id: Set(row.node_id),
                 url: Set(row.url.clone()),
@@ -87,7 +88,10 @@ async fn node_cache_reuses_reads_expires_and_invalidates_on_writes() {
         })
         .await
         .unwrap();
-    assert_eq!(nodes.ask(Get { id: row.node_id }).await.unwrap(), Some(row));
+    assert_eq!(
+        nodes.ask(GetNode { id: row.node_id }).await.unwrap(),
+        Some(row)
+    );
     for actor in [nodes, expiring] {
         actor.stop_gracefully().await.unwrap();
         actor.wait_for_shutdown().await;
@@ -121,7 +125,7 @@ async fn all_models_support_crud_and_overlapping_requests() {
 
     // Nodes and tables use generated keys; partitions use explicit composite keys.
     let mut node = nodes
-        .ask(Create::<node::Entity> {
+        .ask(CreateNode {
             data: node::ActiveModel {
                 url: Set("http://localhost:3000".into()),
                 ..Default::default()
@@ -130,7 +134,7 @@ async fn all_models_support_crud_and_overlapping_requests() {
         .await
         .unwrap();
     let mut partition = partitions
-        .ask(Create::<partition::Entity> {
+        .ask(CreatePartition {
             data: partition::ActiveModel {
                 table_id: Set(1),
                 hash_start: Set(0),
@@ -143,7 +147,7 @@ async fn all_models_support_crud_and_overlapping_requests() {
         .await
         .unwrap();
     let mut table = tables
-        .ask(Create::<table::Entity> {
+        .ask(CreateTable {
             data: table::ActiveModel {
                 table_name: Set("accounts".into()),
                 is_ready: Set(false),
@@ -157,7 +161,7 @@ async fn all_models_support_crud_and_overlapping_requests() {
         .unwrap();
     for (table_id, hash_start) in [(1, 200), (2, 50), (1, 100)] {
         partitions
-            .ask(Create::<partition::Entity> {
+            .ask(CreatePartition {
                 data: partition::ActiveModel {
                     table_id: Set(table_id),
                     hash_start: Set(hash_start),
@@ -191,15 +195,12 @@ async fn all_models_support_crud_and_overlapping_requests() {
     assert_eq!(partition.replication_factor(), 1);
     table.owner = 3;
     assert_eq!(
-        nodes
-            .ask(Update::<node::Entity> { data: node.clone() })
-            .await
-            .unwrap(),
+        nodes.ask(UpdateNode { data: node.clone() }).await.unwrap(),
         node
     );
     assert_eq!(
         partitions
-            .ask(Update::<partition::Entity> {
+            .ask(UpdatePartition {
                 data: partition.clone()
             })
             .await
@@ -208,7 +209,7 @@ async fn all_models_support_crud_and_overlapping_requests() {
     );
     assert_eq!(
         tables
-            .ask(Update::<table::Entity> {
+            .ask(UpdateTable {
                 data: table.clone()
             })
             .await
@@ -216,12 +217,12 @@ async fn all_models_support_crud_and_overlapping_requests() {
         table
     );
     let (a, b, c, d) = tokio::join!(
-        nodes.ask(Get { id: node.node_id }),
-        nodes.ask(Get { id: node.node_id }),
-        partitions.ask(Get {
+        nodes.ask(GetNode { id: node.node_id }),
+        nodes.ask(GetNode { id: node.node_id }),
+        partitions.ask(GetPartition {
             id: (partition.table_id, partition.hash_start)
         }),
-        tables.ask(Get { id: table.table_id }),
+        tables.ask(GetTable { id: table.table_id }),
     );
     assert_eq!(a.unwrap(), Some(node.clone()));
     assert_eq!(b.unwrap(), Some(node.clone()));
@@ -234,7 +235,7 @@ async fn all_models_support_crud_and_overlapping_requests() {
     );
     for idx in 0..4 {
         nodes
-            .ask(Create::<node::Entity> {
+            .ask(CreateNode {
                 data: node::ActiveModel {
                     url: Set(format!("http://localhost:{}", 4000 + idx)),
                     ..Default::default()
@@ -249,26 +250,37 @@ async fn all_models_support_crud_and_overlapping_requests() {
     assert_eq!(unique.len(), 3);
 
     macro_rules! delete_and_check {
-        ($actor:expr, $entity:ty, $model:expr, $id:expr) => {
-            assert_eq!($actor.ask(Delete { id: $id }).await.unwrap(), 1);
-            assert_eq!($actor.ask(Get { id: $id }).await.unwrap(), None);
-            assert_eq!($actor.ask(Delete { id: $id }).await.unwrap(), 0);
-            assert!(
-                $actor
-                    .ask(Update::<$entity> { data: $model })
-                    .await
-                    .is_err()
-            );
+        ($actor:expr, $delete:ident, $get:ident, $update:ident, $model:expr, $id:expr) => {
+            assert_eq!($actor.ask($delete { id: $id }).await.unwrap(), 1);
+            assert_eq!($actor.ask($get { id: $id }).await.unwrap(), None);
+            assert_eq!($actor.ask($delete { id: $id }).await.unwrap(), 0);
+            assert!($actor.ask($update { data: $model }).await.is_err());
         };
     }
-    delete_and_check!(nodes, node::Entity, node.clone(), node.node_id);
+    delete_and_check!(
+        nodes,
+        DeleteNode,
+        GetNode,
+        UpdateNode,
+        node.clone(),
+        node.node_id
+    );
     delete_and_check!(
         partitions,
-        partition::Entity,
+        DeletePartition,
+        GetPartition,
+        UpdatePartition,
         partition.clone(),
         (partition.table_id, partition.hash_start)
     );
-    delete_and_check!(tables, table::Entity, table.clone(), table.table_id);
+    delete_and_check!(
+        tables,
+        DeleteTable,
+        GetTable,
+        UpdateTable,
+        table.clone(),
+        table.table_id
+    );
     nodes.stop_gracefully().await.unwrap();
     partitions.stop_gracefully().await.unwrap();
     tables.stop_gracefully().await.unwrap();
@@ -282,7 +294,11 @@ async fn all_models_support_crud_and_overlapping_requests() {
 async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
     use std::time::Duration;
     assert_eq!(
-        patchwork_common::actors::crud::CACHE_TTL,
+        patchwork_common::actors::table::CACHE_TTL,
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        patchwork_common::actors::partition::CACHE_TTL,
         Duration::from_secs(5)
     );
     let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -296,7 +312,7 @@ async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
     let tables = TableActor::spawn(TableActor::new(db.clone()));
     let partitions = PartitionActor::spawn(PartitionActor::new(db.clone()));
     let mut row = tables
-        .ask(Create::<table::Entity> {
+        .ask(CreateTable {
             data: table::ActiveModel {
                 table_id: Set(1),
                 table_name: Set("original".into()),
@@ -310,28 +326,39 @@ async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
         .await
         .unwrap();
     assert_eq!(
-        tables.ask(GetCached { id: 1 }).await.unwrap(),
+        tables.ask(GetTableCached { id: 1 }).await.unwrap(),
         Some(row.clone())
     );
     db.execute_unprepared("UPDATE `table` SET table_name = 'external' WHERE table_id = 1")
         .await
         .unwrap();
     assert_eq!(
-        tables.ask(GetCached { id: 1 }).await.unwrap(),
+        tables.ask(GetTableCached { id: 1 }).await.unwrap(),
         Some(row.clone())
     );
     assert_eq!(
-        tables.ask(Get { id: 1 }).await.unwrap().unwrap().table_name,
+        tables
+            .ask(GetTable { id: 1 })
+            .await
+            .unwrap()
+            .unwrap()
+            .table_name,
         "external"
     );
     row.table_name = "actor update".into();
-    tables
-        .ask(Update::<table::Entity> { data: row.clone() })
-        .await
-        .unwrap();
-    assert_eq!(tables.ask(GetCached { id: 1 }).await.unwrap(), Some(row));
-    tables.ask(Delete { id: 1 }).await.unwrap();
-    assert!(tables.ask(GetCached { id: 1 }).await.unwrap().is_none());
+    tables.ask(UpdateTable { data: row.clone() }).await.unwrap();
+    assert_eq!(
+        tables.ask(GetTableCached { id: 1 }).await.unwrap(),
+        Some(row)
+    );
+    tables.ask(DeleteTable { id: 1 }).await.unwrap();
+    assert!(
+        tables
+            .ask(GetTableCached { id: 1 })
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     assert!(
         partitions
@@ -341,7 +368,7 @@ async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
             .is_empty()
     );
     let mut boundary = partitions
-        .ask(Create::<partition::Entity> {
+        .ask(CreatePartition {
             data: partition::ActiveModel {
                 table_id: Set(1),
                 hash_start: Set(i64::MIN),
@@ -389,7 +416,7 @@ async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
     );
     boundary.replicas = partition::ReplicaNodes(vec![2, 3]);
     partitions
-        .ask(Update::<partition::Entity> {
+        .ask(UpdatePartition {
             data: boundary.clone(),
         })
         .await
@@ -402,7 +429,7 @@ async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
         vec![boundary]
     );
     partitions
-        .ask(Delete {
+        .ask(DeletePartition {
             id: (1i64, i64::MIN),
         })
         .await
@@ -443,7 +470,7 @@ async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
     );
     let expiring_tables = TableActor::spawn(TableActor::with_cache_ttl(db.clone(), Duration::ZERO));
     let created = tables
-        .ask(Create::<table::Entity> {
+        .ask(CreateTable {
             data: table::ActiveModel {
                 table_id: Set(1),
                 table_name: Set("before".into()),
@@ -457,7 +484,7 @@ async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
         .await
         .unwrap();
     assert_eq!(
-        expiring_tables.ask(GetCached { id: 1 }).await.unwrap(),
+        expiring_tables.ask(GetTableCached { id: 1 }).await.unwrap(),
         Some(created)
     );
     db.execute_unprepared("UPDATE `table` SET table_name = 'after' WHERE table_id = 1")
@@ -465,7 +492,7 @@ async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
         .unwrap();
     assert_eq!(
         expiring_tables
-            .ask(GetCached { id: 1 })
+            .ask(GetTableCached { id: 1 })
             .await
             .unwrap()
             .unwrap()

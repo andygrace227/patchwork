@@ -1,3 +1,7 @@
+use kameo_actors::pool::{ActorPool, Dispatch};
+use patchwork_control_plane::actors::{
+    node::CreateNode, partition::CreatePartition, table::CreateTable,
+};
 use std::{sync::Arc, time::Duration};
 
 use axum::{
@@ -7,7 +11,7 @@ use axum::{
 };
 use kameo::actor::{ActorRef, Spawn};
 use patchwork_control_plane::{
-    actors::{NodeActor, PartitionActor, TableActor, crud::Create, table::GetRandomReadyTable},
+    actors::{NodeActor, PartitionActor, TableActor, table::GetRandomReadyTable},
     datamodels::{node, partition, table},
     workflows::{
         executor::{
@@ -23,9 +27,9 @@ use sea_orm::{ActiveValue::Set, ConnectionTrait, Database, Schema};
 use tokio::sync::{Semaphore, mpsc};
 
 async fn actors() -> (
-    ActorRef<NodeActor>,
-    ActorRef<PartitionActor>,
-    ActorRef<TableActor>,
+    ActorRef<ActorPool<NodeActor>>,
+    ActorRef<ActorPool<PartitionActor>>,
+    ActorRef<ActorPool<TableActor>>,
 ) {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     let schema = Schema::new(db.get_database_backend());
@@ -37,17 +41,26 @@ async fn actors() -> (
         db.execute(&statement).await.unwrap();
     }
     (
-        NodeActor::spawn(NodeActor::new(db.clone())),
-        PartitionActor::spawn(PartitionActor::new(db.clone())),
-        TableActor::spawn(TableActor::new(db)),
+        ActorPool::spawn(ActorPool::new(2, {
+            let db = db.clone();
+            move || NodeActor::spawn(NodeActor::new(db.clone()))
+        })),
+        ActorPool::spawn(ActorPool::new(2, {
+            let db = db.clone();
+            move || PartitionActor::spawn(PartitionActor::new(db.clone()))
+        })),
+        ActorPool::spawn(ActorPool::new(2, {
+            let db = db.clone();
+            move || TableActor::spawn(TableActor::new(db.clone()))
+        })),
     )
 }
 
 fn check(
     table_id: i64,
-    node: &ActorRef<NodeActor>,
-    partition: &ActorRef<PartitionActor>,
-    table: &ActorRef<TableActor>,
+    node: &ActorRef<ActorPool<NodeActor>>,
+    partition: &ActorRef<ActorPool<PartitionActor>>,
+    table: &ActorRef<ActorPool<TableActor>>,
     executor: &ActorRef<LongRunningWorkflowExecutor>,
 ) -> SubmitWorkflow<CheckTableScale> {
     SubmitWorkflow::new(
@@ -109,17 +122,17 @@ async fn executor_limits_jobs_keeps_tables_separate_and_recovers_after_failure()
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let replica = node
-        .ask(Create::<node::Entity> {
+        .ask(Dispatch(CreateNode {
             data: node::ActiveModel {
                 url: Set(url),
                 ..Default::default()
             },
-        })
+        }))
         .await
         .unwrap();
     for table_id in [1, 2] {
         partition
-            .ask(Create::<partition::Entity> {
+            .ask(Dispatch(CreatePartition {
                 data: partition::ActiveModel {
                     table_id: Set(table_id),
                     hash_start: Set(0),
@@ -127,7 +140,7 @@ async fn executor_limits_jobs_keeps_tables_separate_and_recovers_after_failure()
                     forward_to: Set(None),
                     replicas: Set(partition::ReplicaNodes(vec![replica.node_id])),
                 },
-            })
+            }))
             .await
             .unwrap();
     }
@@ -276,10 +289,16 @@ async fn executor_limits_jobs_keeps_tables_separate_and_recovers_after_failure()
 #[tokio::test]
 async fn random_checker_handles_empty_tables_and_submits_ready_tables() {
     let (node, partition, table) = actors().await;
-    assert!(table.ask(GetRandomReadyTable).await.unwrap().is_none());
+    assert!(
+        table
+            .ask(Dispatch(GetRandomReadyTable))
+            .await
+            .unwrap()
+            .is_none()
+    );
     for (table_id, ready) in [(1, false), (2, true)] {
         table
-            .ask(Create::<table::Entity> {
+            .ask(Dispatch(CreateTable {
                 data: table::ActiveModel {
                     table_id: Set(table_id),
                     table_name: Set(format!("table-{table_id}")),
@@ -288,16 +307,17 @@ async fn random_checker_handles_empty_tables_and_submits_ready_tables() {
                     backup_control_node: Set(0),
                     partition_key_name: Set("key".into()),
                     sort_key_name: Set("sort".into()),
+                    secret_key_id: Set(None),
                     is_ready: Set(ready),
                 },
-            })
+            }))
             .await
             .unwrap();
     }
     for _ in 0..3 {
         assert_eq!(
             table
-                .ask(GetRandomReadyTable)
+                .ask(Dispatch(GetRandomReadyTable))
                 .await
                 .unwrap()
                 .unwrap()

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use cano::{CancellationToken, CanoError, Workflow};
 use kameo::actor::ActorRef;
+use kameo_actors::pool::{ActorPool, Dispatch};
 use std::{fmt::Debug, future::Future, hash::Hash};
 use tokio::sync::Mutex;
 
@@ -105,17 +106,17 @@ pub(crate) use workflow_steps;
 
 /// Try every token in reverse order, including after a failed step.
 pub(crate) async fn unlock(
-    partition: &ActorRef<PartitionActor>,
+    partition: &ActorRef<ActorPool<PartitionActor>>,
     locks: &mut Vec<Model>,
 ) -> Result<()> {
     let mut errors = Vec::new();
     for lock in locks.drain(..).rev() {
         match partition
-            .ask(FreeLock {
+            .ask(Dispatch(FreeLock {
                 table_id: lock.table_id,
                 hash_start: lock.hash_start,
                 lock_token: lock.lock_token,
-            })
+            }))
             .await
         {
             Ok(true) => {}

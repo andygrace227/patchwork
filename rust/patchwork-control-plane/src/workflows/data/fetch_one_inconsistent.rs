@@ -1,13 +1,14 @@
+use crate::actors::{node::GetNode, table::GetTableCached};
 use crate::telemetry::{measure, time};
 use anyhow::{Context, Result, ensure};
 use kameo::actor::ActorRef;
+use kameo_actors::pool::{ActorPool, Dispatch};
 use patchwork_common::dataplane_client::Record;
 use rand::seq::SliceRandom;
 
 use crate::{
     actors::{
         NodeActor, PartitionActor, TableActor,
-        crud::{Get, GetCached},
         partition::GetPartitionAtOrBeforeCached as GetPartitionAtOrBefore,
     },
     dataplane_client::Client,
@@ -16,9 +17,9 @@ use crate::{
 // Inconsistent reads reuse the five-second partition cache.
 pub struct GetOneInconsistent {
     pub client: Client,
-    pub partition: ActorRef<PartitionActor>,
-    pub node: ActorRef<NodeActor>,
-    pub table: ActorRef<TableActor>,
+    pub partition: ActorRef<ActorPool<PartitionActor>>,
+    pub node: ActorRef<ActorPool<NodeActor>>,
+    pub table: ActorRef<ActorPool<TableActor>>,
 }
 
 pub struct GetOneInconsistentCtx {
@@ -32,7 +33,7 @@ impl GetOneInconsistent {
         let table_timing = measure("table_lookup");
         let table = self
             .table
-            .ask(GetCached { id: ctx.table_id })
+            .ask(Dispatch(GetTableCached { id: ctx.table_id }))
             .await?
             .context("Table is not alive.")?;
         ensure!(table.is_ready, "Table is not ready.");
@@ -41,10 +42,10 @@ impl GetOneInconsistent {
         let partition_timing = measure("partition_lookup");
         let partition = self
             .partition
-            .ask(GetPartitionAtOrBefore {
+            .ask(Dispatch(GetPartitionAtOrBefore {
                 table_id: ctx.table_id,
                 hash_start: ctx.primary_key,
-            })
+            }))
             .await?
             .context("Something is very wrong with partition creation")?;
         drop(partition_timing);
@@ -56,7 +57,11 @@ impl GetOneInconsistent {
         .await?;
         replicas.shuffle(&mut rand::rng());
         for replica in replicas {
-            let Ok(Some(node)) = time("replica_lookup", self.node.ask(Get { id: replica })).await
+            let Ok(Some(node)) = time(
+                "replica_lookup",
+                self.node.ask(Dispatch(GetNode { id: replica })),
+            )
+            .await
             else {
                 continue;
             };

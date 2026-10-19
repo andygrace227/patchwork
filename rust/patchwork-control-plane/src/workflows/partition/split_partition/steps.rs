@@ -1,4 +1,6 @@
 use super::*;
+use crate::actors::node::GetNode;
+use kameo_actors::pool::Dispatch;
 
 impl Run {
     pub(super) async fn prepare(&mut self) -> Result<State> {
@@ -7,9 +9,9 @@ impl Run {
         // Fetch the hash ring for the table.
         let partitions = workflow
             .partition
-            .ask(GetTablePartitions {
+            .ask(Dispatch(GetTablePartitions {
                 table_id: ctx.table_id,
-            })
+            }))
             .await?;
 
         if partitions.is_empty() {
@@ -70,11 +72,11 @@ impl Run {
         for hash_start in self.keys.clone() {
             let lock = workflow
                 .partition
-                .ask(AttemptLock {
+                .ask(Dispatch(AttemptLock {
                     table_id: ctx.table_id,
                     hash_start,
                     lease_end,
-                })
+                }))
                 .await?;
             let Some(lock) = lock else {
                 return Err(anyhow::anyhow!(
@@ -87,9 +89,9 @@ impl Run {
         // Another split may have finished while we were acquiring the locks.
         let current = workflow
             .partition
-            .ask(GetTablePartitions {
+            .ask(Dispatch(GetTablePartitions {
                 table_id: ctx.table_id,
-            })
+            }))
             .await?;
         let insertion_idx = match current.binary_search_by_key(&ctx.new_partition, |p| p.hash_start)
         {
@@ -146,9 +148,9 @@ impl Run {
             let node_id_copy = node_ids.clone();
             let node = workflow
                 .node
-                .ask(GetNodeExcluding {
+                .ask(Dispatch(GetNodeExcluding {
                     node_ids: node_id_copy,
-                })
+                }))
                 .await?;
             let Some(node) = node else {
                 return Err(anyhow::anyhow!("No node available outside the replica set"));
@@ -179,10 +181,10 @@ impl Run {
 
         workflow
             .partition
-            .ask(CreateLockedPartition {
+            .ask(Dispatch(CreateLockedPartition {
                 data: proposed_partition,
                 locks: locks.clone(),
-            })
+            }))
             .await?;
         Ok(State::Copy)
     }
@@ -217,7 +219,7 @@ impl Run {
         // Stage 4: Mark the new partition as live.
         workflow
             .partition
-            .ask(UpdateLockedPartition {
+            .ask(Dispatch(UpdateLockedPartition {
                 data: partition::ActiveModel {
                     table_id: Set(ctx.table_id),
                     hash_start: Set(ctx.new_partition),
@@ -225,7 +227,7 @@ impl Run {
                     ..Default::default()
                 },
                 locks: locks.clone(),
-            })
+            }))
             .await?;
         Ok(State::Cleanup)
     }
@@ -250,7 +252,7 @@ impl Run {
             }
             let node = workflow
                 .node
-                .ask(Get { id: *replica })
+                .ask(Dispatch(GetNode { id: *replica }))
                 .await?
                 .context("Old replica node no longer exists")?;
             self.workflow

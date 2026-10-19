@@ -1,23 +1,21 @@
+use crate::actors::{node::GetNode, table::GetTableCached};
 use crate::telemetry::{measure, time};
 use anyhow::{Context, Result, ensure};
 use kameo::actor::ActorRef;
+use kameo_actors::pool::{ActorPool, Dispatch};
 use patchwork_common::dataplane_client::Record;
 use rand::seq::SliceRandom;
 
 use crate::{
-    actors::{
-        NodeActor, PartitionActor, TableActor,
-        crud::{Get, GetCached},
-        partition::GetPartitionAtOrBefore,
-    },
+    actors::{NodeActor, PartitionActor, TableActor, partition::GetPartitionAtOrBefore},
     dataplane_client::Client,
 };
 
 pub struct PutOneConsistent {
     pub client: Client,
-    pub partition: ActorRef<PartitionActor>,
-    pub node: ActorRef<NodeActor>,
-    pub table: ActorRef<TableActor>,
+    pub partition: ActorRef<ActorPool<PartitionActor>>,
+    pub node: ActorRef<ActorPool<NodeActor>>,
+    pub table: ActorRef<ActorPool<TableActor>>,
 }
 
 pub struct PutOneConsistentCtx {
@@ -35,7 +33,7 @@ impl PutOneConsistent {
         let table_timing = measure("table_lookup");
         let table = self
             .table
-            .ask(GetCached { id: ctx.table_id })
+            .ask(Dispatch(GetTableCached { id: ctx.table_id }))
             .await?
             .context("Table is not alive.")?;
         ensure!(table.is_ready, "Table is not ready.");
@@ -44,19 +42,19 @@ impl PutOneConsistent {
         let partition_timing = measure("partition_lookup");
         let mut partition = self
             .partition
-            .ask(GetPartitionAtOrBefore {
+            .ask(Dispatch(GetPartitionAtOrBefore {
                 table_id: ctx.table_id,
                 hash_start: ctx.primary_key,
-            })
+            }))
             .await?;
         // Keys before the first boundary wrap to the last partition.
         if partition.is_none() {
             partition = self
                 .partition
-                .ask(GetPartitionAtOrBefore {
+                .ask(Dispatch(GetPartitionAtOrBefore {
                     table_id: ctx.table_id,
                     hash_start: i64::MAX,
-                })
+                }))
                 .await?;
         }
         let partition = partition.context("Table has no partitions")?;
@@ -89,7 +87,7 @@ impl PutOneConsistent {
     // Preserve the source timestamp and deletion marker on every replica.
     pub(crate) async fn to_replicas(
         client: &Client,
-        node_actor: &ActorRef<NodeActor>,
+        node_actor: &ActorRef<ActorPool<NodeActor>>,
         record: &Record,
         replicas: &[i64],
     ) -> Result<()> {
@@ -100,9 +98,12 @@ impl PutOneConsistent {
 
         let mut urls = Vec::new();
         for replica in replicas {
-            let node = time("replica_lookup", node_actor.ask(Get { id: replica }))
-                .await?
-                .context("Replica node no longer exists")?;
+            let node = time(
+                "replica_lookup",
+                node_actor.ask(Dispatch(GetNode { id: replica })),
+            )
+            .await?
+            .context("Replica node no longer exists")?;
             let url = node.url.trim_end_matches('/').to_owned();
             if !urls.contains(&url) {
                 urls.push(url);

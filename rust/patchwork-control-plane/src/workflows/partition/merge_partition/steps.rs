@@ -1,4 +1,6 @@
 use super::*;
+use crate::actors::node::GetNode;
+use kameo_actors::pool::Dispatch;
 
 impl Run {
     pub(super) async fn prepare(&mut self) -> Result<State> {
@@ -8,9 +10,9 @@ impl Run {
         // The source partition is going away. The previous partition takes its range.
         let partitions = workflow
             .partition
-            .ask(GetTablePartitions {
+            .ask(Dispatch(GetTablePartitions {
                 table_id: ctx.table_id,
-            })
+            }))
             .await?;
         let (previous, source, next) = neighbors(&partitions, ctx.hash_start)?;
         ensure!(
@@ -59,11 +61,11 @@ impl Run {
             locks.push(
                 workflow
                     .partition
-                    .ask(AttemptLock {
+                    .ask(Dispatch(AttemptLock {
                         table_id: ctx.table_id,
                         hash_start,
                         lease_end,
-                    })
+                    }))
                     .await?
                     .context("Partition is already locked; retry the merge")?,
             );
@@ -72,9 +74,9 @@ impl Run {
         // Check that these are still the same partitions before moving any data.
         let current = workflow
             .partition
-            .ask(GetTablePartitions {
+            .ask(Dispatch(GetTablePartitions {
                 table_id: ctx.table_id,
-            })
+            }))
             .await?;
         ensure!(
             neighbors(&current, ctx.hash_start)? == (previous, source, next),
@@ -100,7 +102,7 @@ impl Run {
                 obsolete.push(
                     workflow
                         .node
-                        .ask(Get { id: *id })
+                        .ask(Dispatch(GetNode { id: *id }))
                         .await?
                         .context("Source replica no longer exists")?,
                 );
@@ -140,11 +142,11 @@ impl Run {
         // Deletion checks that we still hold all the leases.
         workflow
             .partition
-            .ask(DeleteLockedPartition {
+            .ask(Dispatch(DeleteLockedPartition {
                 table_id: ctx.table_id,
                 hash_start: ctx.hash_start,
                 locks: locks.clone(),
-            })
+            }))
             .await?;
         Ok(State::Cleanup)
     }

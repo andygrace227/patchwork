@@ -1,5 +1,6 @@
 use anyhow::{Result, ensure};
 use kameo::actor::ActorRef;
+use kameo_actors::pool::ActorPool;
 
 use crate::{
     actors::NodeActor,
@@ -14,7 +15,7 @@ use crate::{
 // and tombstones. Destinations need not be published in the partition map yet.
 pub(super) async fn copy_range(
     client: &Client,
-    node: &ActorRef<NodeActor>,
+    node: &ActorRef<ActorPool<NodeActor>>,
     ctx: FetchRangeCtx,
     sources: &[i64],
     targets: &[i64],

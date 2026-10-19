@@ -1,18 +1,14 @@
+use crate::actors::partition::{GetPartition, GetPartitionCached};
 use anyhow::{Context, Result, ensure};
 use kameo::actor::ActorRef;
+use kameo_actors::pool::{ActorPool, Dispatch};
 
-use crate::{
-    actors::{
-        PartitionActor,
-        crud::{Get, GetCached},
-    },
-    datamodels::partition::Model,
-};
+use crate::{actors::PartitionActor, datamodels::partition::Model};
 
 // Resolve exact partition boundaries, not a second ownership lookup.
 // Reads use the final source; writes include each partition along the way.
 pub(super) async fn resolve(
-    actor: &ActorRef<PartitionActor>,
+    actor: &ActorRef<ActorPool<PartitionActor>>,
     mut partition: Model,
     writes: bool,
     cached: bool,
@@ -37,9 +33,9 @@ pub(super) async fn resolve(
         };
         let id = (partition.table_id, hash_start);
         partition = if cached {
-            actor.ask(GetCached { id }).await?
+            actor.ask(Dispatch(GetPartitionCached { id })).await?
         } else {
-            actor.ask(Get { id }).await?
+            actor.ask(Dispatch(GetPartition { id })).await?
         }
         .context("Forwarded partition no longer exists")?;
     }

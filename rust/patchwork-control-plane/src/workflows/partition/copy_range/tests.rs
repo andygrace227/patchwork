@@ -1,6 +1,8 @@
 use super::*;
-use crate::{actors::crud::Create, datamodels::node, dataplane_client::Client};
+use crate::actors::node::CreateNode;
+use crate::{datamodels::node, dataplane_client::Client};
 use kameo::actor::Spawn;
+use kameo_actors::pool::{ActorPool, Dispatch};
 use patchwork_data_plane::{grpc, write_shard::WriteShard};
 use sea_orm::{ActiveValue::Set, ConnectionTrait, Database, Schema};
 
@@ -13,7 +15,10 @@ async fn copy_reads_all_sources_preserves_deletes_and_newer_destination_writes()
     db.execute(&schema.create_table_from_entity(node::Entity))
         .await
         .unwrap();
-    let nodes = NodeActor::spawn(NodeActor::new(db.clone()));
+    let nodes = ActorPool::spawn(ActorPool::new(2, {
+        let db = db.clone();
+        move || NodeActor::spawn(NodeActor::new(db.clone()))
+    }));
     let mut servers = Vec::new();
     let mut shards = Vec::new();
     let mut urls = Vec::new();
@@ -44,12 +49,12 @@ async fn copy_reads_all_sources_preserves_deletes_and_newer_destination_writes()
         shards.push((shard, shard_readers));
         ids.push(
             nodes
-                .ask(Create::<node::Entity> {
+                .ask(Dispatch(CreateNode {
                     data: node::ActiveModel {
                         url: Set(url.clone()),
                         ..Default::default()
                     },
-                })
+                }))
                 .await
                 .unwrap()
                 .node_id,

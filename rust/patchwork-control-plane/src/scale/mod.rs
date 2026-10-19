@@ -1,3 +1,4 @@
+use kameo_actors::pool::{ActorPool, Dispatch};
 use std::time::Duration;
 
 use cano::{
@@ -16,9 +17,9 @@ use crate::{
 
 /// Each control node samples independently; partition workflows retain their DB locks.
 pub(crate) async fn run_random_scale_checks(
-    node: ActorRef<NodeActor>,
-    partition: ActorRef<PartitionActor>,
-    table: ActorRef<TableActor>,
+    node: ActorRef<ActorPool<NodeActor>>,
+    partition: ActorRef<ActorPool<PartitionActor>>,
+    table: ActorRef<ActorPool<TableActor>>,
     executor: WeakActorRef<LongRunningWorkflowExecutor>,
     min_interval: Duration,
     max_interval: Duration,
@@ -79,9 +80,9 @@ impl RandomDelay {
 
 struct SubmitRandomCheck {
     client: Client,
-    node: ActorRef<NodeActor>,
-    partition: ActorRef<PartitionActor>,
-    table: ActorRef<TableActor>,
+    node: ActorRef<ActorPool<NodeActor>>,
+    partition: ActorRef<ActorPool<PartitionActor>>,
+    table: ActorRef<ActorPool<TableActor>>,
     executor: WeakActorRef<LongRunningWorkflowExecutor>,
 }
 
@@ -95,7 +96,7 @@ impl SubmitRandomCheck {
         let Some(executor) = self.executor.upgrade() else {
             return Ok(TaskResult::Single(State::Done));
         };
-        match self.table.ask(GetRandomReadyTable).await {
+        match self.table.ask(Dispatch(GetRandomReadyTable)).await {
             Ok(Some(picked)) => {
                 if let Err(error) = executor
                     .ask(SubmitWorkflow::new(

@@ -13,6 +13,7 @@ const actions = {
     { id: "control-range", name: "Read a range", method: "GET", path: rangePath },
     { id: "delete-table", name: "Delete a table", method: "DELETE", path: "/tables/{table}" },
     { id: "split", name: "Test: split partition", method: "POST", path: "/test/tables/{table}/split", body: { new_partition: 0 }, testOnly: true },
+    { id: "increase-replication", name: "Test: increase replication", method: "POST", path: "/test/tables/{table}/increase-replication", body: { hash_start: 0, replication_factor: 4 }, testOnly: true },
   ],
   data: [
     { id: "write", name: "Write a record", method: "gRPC", path: "WriteRecord", scope: "record", body: { name: "local test" }, write: true },

@@ -1,3 +1,5 @@
+use crate::actors::table::GetTableCached;
+use kameo_actors::pool::{ActorPool, Dispatch};
 use std::sync::Arc;
 
 use axum::{
@@ -12,7 +14,7 @@ use kameo::actor::ActorRef;
 use serde::Deserialize;
 
 use crate::{
-    actors::{NodeActor, PartitionActor, TableActor, crud::GetCached},
+    actors::{NodeActor, PartitionActor, TableActor},
     auth::{Auth, Principal},
     datamodels::table,
     dataplane_client::Client,
@@ -40,17 +42,17 @@ struct AppState {
     client: Client,
     permissions: PermissionClient,
     encryption: EncryptionClient,
-    node: ActorRef<NodeActor>,
-    partition: ActorRef<PartitionActor>,
-    table: ActorRef<TableActor>,
+    node: ActorRef<ActorPool<NodeActor>>,
+    partition: ActorRef<ActorPool<PartitionActor>>,
+    table: ActorRef<ActorPool<TableActor>>,
     executor: ActorRef<LongRunningWorkflowExecutor>,
     telemetry: Arc<crate::telemetry::Timings>,
 }
 
 pub fn router(
-    node: ActorRef<NodeActor>,
-    partition: ActorRef<PartitionActor>,
-    table: ActorRef<TableActor>,
+    node: ActorRef<ActorPool<NodeActor>>,
+    partition: ActorRef<ActorPool<PartitionActor>>,
+    table: ActorRef<ActorPool<TableActor>>,
     executor: ActorRef<LongRunningWorkflowExecutor>,
     auth: Auth,
 ) -> Router {
@@ -67,7 +69,12 @@ pub fn router(
         )
         .route("/tables/{table_id}/range", get(get_range));
     #[cfg(feature = "test-api")]
-    let router = router.route("/test/tables/{table_id}/split", post(split_partition));
+    let router = router
+        .route("/test/tables/{table_id}/split", post(split_partition))
+        .route(
+            "/test/tables/{table_id}/increase-replication",
+            post(increase_replication),
+        );
     router
         .route_layer(middleware::from_fn_with_state(
             Arc::new(auth),
@@ -153,7 +160,7 @@ async fn authorize(
 async fn secret_key_id(state: &AppState, table_id: i64) -> Result<Option<i64>, ApiError> {
     state
         .table
-        .ask(GetCached { id: table_id })
+        .ask(Dispatch(GetTableCached { id: table_id }))
         .await
         .map_err(internal_error)?
         .map(|table| table.secret_key_id)
@@ -299,6 +306,20 @@ struct SplitPartitionRequest {
 }
 
 #[cfg(feature = "test-api")]
+async fn require_ready_table(state: &AppState, table_id: i64) -> Result<(), ApiError> {
+    let table = state
+        .table
+        .ask(Dispatch(GetTableCached { id: table_id }))
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "table not found"))?;
+    if !table.is_ready {
+        return Err(api_error(StatusCode::CONFLICT, "table is not ready"));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-api")]
 async fn split_partition(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -314,15 +335,7 @@ async fn split_partition(
         Resource::Table(table_id),
     )
     .await?;
-    let table = state
-        .table
-        .ask(GetCached { id: table_id })
-        .await
-        .map_err(internal_error)?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "table not found"))?;
-    if !table.is_ready {
-        return Err(api_error(StatusCode::CONFLICT, "table is not ready"));
-    }
+    require_ready_table(&state, table_id).await?;
     submit(
         &state,
         SplitPartition {
@@ -334,6 +347,49 @@ async fn split_partition(
         SplitPartitionContext {
             table_id,
             new_partition: request.new_partition,
+        },
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(feature = "test-api")]
+#[derive(Deserialize)]
+struct IncreaseReplicationRequest {
+    hash_start: i64,
+    replication_factor: usize,
+}
+
+#[cfg(feature = "test-api")]
+async fn increase_replication(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(table_id): Path<i64>,
+    Json(request): Json<IncreaseReplicationRequest>,
+) -> Result<StatusCode, ApiError> {
+    use crate::workflows::partition::increase_replication::{
+        IncreaseReplication, IncreaseReplicationContext,
+    };
+
+    authorize(
+        &state,
+        &principal,
+        Action::IncreaseReplication,
+        Resource::Table(table_id),
+    )
+    .await?;
+    require_ready_table(&state, table_id).await?;
+    submit(
+        &state,
+        IncreaseReplication {
+            client: state.client.clone(),
+            node: state.node.clone(),
+            partition: state.partition.clone(),
+        },
+        IncreaseReplicationContext {
+            table_id,
+            hash_start: request.hash_start,
+            replication_factor: request.replication_factor,
         },
     )
     .await?;

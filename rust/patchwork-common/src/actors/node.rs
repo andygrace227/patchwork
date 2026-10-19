@@ -1,10 +1,5 @@
-use super::crud::{Create, Delete, Get, GetCached, Update};
-use crate::datamodels::node::{Column, Entity, Model};
-use kameo::{
-    Actor,
-    message::{Context, Message},
-    reply::DelegatedReply,
-};
+use crate::datamodels::node::{ActiveModel, Column, Entity, Model};
+use kameo::{Actor, message::Context, messages, reply::DelegatedReply};
 use sea_orm::entity::prelude::*;
 use sea_orm::{QueryFilter, QueryOrder};
 use std::{
@@ -53,13 +48,17 @@ impl NodeActor {
     }
 }
 
-impl Message<Get> for NodeActor {
-    type Reply = DelegatedReply<Result<Option<Model>, DbErr>>;
-
-    async fn handle(&mut self, msg: Get, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+#[messages]
+impl NodeActor {
+    #[message(ctx)]
+    pub async fn get_node(
+        &mut self,
+        id: i64,
+        ctx: &mut Context<Self, DelegatedReply<Result<Option<Model>, DbErr>>>,
+    ) -> DelegatedReply<Result<Option<Model>, DbErr>> {
         let generation = {
             let cache = self.cache.lock().unwrap();
-            if let Some(node) = cache.entries.get(&msg.id) {
+            if let Some(node) = cache.entries.get(&id) {
                 return ctx.reply(Ok(Some(node.clone())));
             }
             cache.generation
@@ -68,118 +67,100 @@ impl Message<Get> for NodeActor {
         let cache = self.cache.clone();
         let cache_ttl = self.cache_ttl;
         ctx.spawn(async move {
-            let node = Entity::find_by_id(msg.id).one(&db).await?;
+            let node = Entity::find_by_id(id).one(&db).await?;
             if let Some(node) = &node {
                 let mut cache = cache.lock().unwrap();
                 if cache.generation == generation {
-                    cache.entries.insert(msg.id, node.clone(), cache_ttl);
+                    cache.entries.insert(id, node.clone(), cache_ttl);
                 }
             }
             Ok(node)
         })
     }
-}
 
-impl Message<GetCached> for NodeActor {
-    type Reply = DelegatedReply<Result<Option<Model>, DbErr>>;
-
-    async fn handle(
+    /// Uses the actor's bounded read cache. Missing rows and failures are not cached.
+    #[message(ctx)]
+    pub async fn get_node_cached(
         &mut self,
-        msg: GetCached,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        <Self as Message<Get>>::handle(self, Get { id: msg.id }, ctx).await
+        id: i64,
+        ctx: &mut Context<Self, DelegatedReply<Result<Option<Model>, DbErr>>>,
+    ) -> DelegatedReply<Result<Option<Model>, DbErr>> {
+        self.get_node(id, ctx).await
     }
-}
 
-impl Message<Create<Entity>> for NodeActor {
-    type Reply = DelegatedReply<Result<Model, DbErr>>;
-
-    async fn handle(
+    /// Leave the auto-increment primary key NotSet to let the database assign it.
+    #[message(ctx)]
+    pub async fn create_node(
         &mut self,
-        msg: Create<Entity>,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
+        data: ActiveModel,
+        ctx: &mut Context<Self, DelegatedReply<Result<Model, DbErr>>>,
+    ) -> DelegatedReply<Result<Model, DbErr>> {
         let db = self.db.clone();
         let cache = self.cache.clone();
         ctx.spawn(async move {
-            let node = msg.data.insert(&db).await?;
+            let node = data.insert(&db).await?;
             cache.lock().unwrap().clear();
             Ok(node)
         })
     }
-}
 
-impl Message<Update<Entity>> for NodeActor {
-    type Reply = DelegatedReply<Result<Model, DbErr>>;
-
-    async fn handle(
+    /// Replaces non-key fields. Returns an error if the row does not exist.
+    #[message(ctx)]
+    pub async fn update_node(
         &mut self,
-        msg: Update<Entity>,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
+        data: Model,
+        ctx: &mut Context<Self, DelegatedReply<Result<Model, DbErr>>>,
+    ) -> DelegatedReply<Result<Model, DbErr>> {
         let db = self.db.clone();
         let cache = self.cache.clone();
         ctx.spawn(async move {
             use sea_orm::IntoActiveModel;
-            let node = msg.data.into_active_model().reset_all().update(&db).await?;
+            let node = data.into_active_model().reset_all().update(&db).await?;
             cache.lock().unwrap().clear();
             Ok(node)
         })
     }
-}
 
-impl Message<Delete> for NodeActor {
-    type Reply = DelegatedReply<Result<u64, DbErr>>;
-
-    async fn handle(&mut self, msg: Delete, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+    /// Returns the number of rows deleted (zero or one).
+    #[message(ctx)]
+    pub async fn delete_node(
+        &mut self,
+        id: i64,
+        ctx: &mut Context<Self, DelegatedReply<Result<u64, DbErr>>>,
+    ) -> DelegatedReply<Result<u64, DbErr>> {
         let db = self.db.clone();
         let cache = self.cache.clone();
         ctx.spawn(async move {
-            let result = Entity::delete_by_id(msg.id).exec(&db).await?;
+            let result = Entity::delete_by_id(id).exec(&db).await?;
             cache.lock().unwrap().clear();
             Ok(result.rows_affected)
         })
     }
-}
 
-/// Selects one node outside the existing replica set.
-pub struct GetNodeExcluding {
-    pub node_ids: Vec<i64>,
-}
-
-impl Message<GetNodeExcluding> for NodeActor {
-    type Reply = DelegatedReply<Result<Option<Model>, DbErr>>;
-
-    async fn handle(
+    /// Selects one node outside the existing replica set.
+    #[message(ctx)]
+    pub async fn get_node_excluding(
         &mut self,
-        msg: GetNodeExcluding,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
+        node_ids: Vec<i64>,
+        ctx: &mut Context<Self, DelegatedReply<Result<Option<Model>, DbErr>>>,
+    ) -> DelegatedReply<Result<Option<Model>, DbErr>> {
         let db = self.db.clone();
         ctx.spawn(async move {
             Entity::find()
-                .filter(Column::NodeId.is_not_in(msg.node_ids))
+                .filter(Column::NodeId.is_not_in(node_ids))
                 .order_by_asc(Column::NodeId)
                 .one(&db)
                 .await
         })
     }
-}
 
-/// Pick distinct nodes at random for a new table's initial replicas.
-pub struct GetRandomNodes {
-    pub count: u64,
-}
-
-impl Message<GetRandomNodes> for NodeActor {
-    type Reply = DelegatedReply<Result<Vec<Model>, DbErr>>;
-
-    async fn handle(
+    /// Pick distinct nodes at random for a new table's initial replicas.
+    #[message(ctx)]
+    pub async fn get_random_nodes(
         &mut self,
-        msg: GetRandomNodes,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
+        count: u64,
+        ctx: &mut Context<Self, DelegatedReply<Result<Vec<Model>, DbErr>>>,
+    ) -> DelegatedReply<Result<Vec<Model>, DbErr>> {
         use sea_orm::{DbBackend, Order, QuerySelect, sea_query::Expr};
         let db = self.db.clone();
         ctx.spawn(async move {
@@ -189,7 +170,7 @@ impl Message<GetRandomNodes> for NodeActor {
             };
             Entity::find()
                 .order_by(Expr::cust(random), Order::Asc)
-                .limit(msg.count)
+                .limit(count)
                 .all(&db)
                 .await
         })

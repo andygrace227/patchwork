@@ -1,3 +1,4 @@
+use kameo_actors::pool::{ActorPool, Dispatch};
 use std::time::Duration;
 
 use axum::{
@@ -142,9 +143,9 @@ fn rejects_invalid_headers_signatures_claims_and_bootstrap_impersonation() {
 struct App {
     router: Router,
     db: DatabaseConnection,
-    node: ActorRef<NodeActor>,
-    partition: ActorRef<PartitionActor>,
-    table: ActorRef<TableActor>,
+    node: ActorRef<ActorPool<NodeActor>>,
+    partition: ActorRef<ActorPool<PartitionActor>>,
+    table: ActorRef<ActorPool<TableActor>>,
     executor: ActorRef<LongRunningWorkflowExecutor>,
 }
 
@@ -169,9 +170,18 @@ impl App {
             .await
             .unwrap();
         }
-        let node = NodeActor::spawn(NodeActor::new(db.clone()));
-        let partition = PartitionActor::spawn(PartitionActor::new(db.clone()));
-        let table = TableActor::spawn(TableActor::new(db.clone()));
+        let node = ActorPool::spawn(ActorPool::new(2, {
+            let db = db.clone();
+            move || NodeActor::spawn(NodeActor::new(db.clone()))
+        }));
+        let partition = ActorPool::spawn(ActorPool::new(2, {
+            let db = db.clone();
+            move || PartitionActor::spawn(PartitionActor::new(db.clone()))
+        }));
+        let table = ActorPool::spawn(ActorPool::new(2, {
+            let db = db.clone();
+            move || TableActor::spawn(TableActor::new(db.clone()))
+        }));
         let executor = LongRunningWorkflowExecutor::spawn(
             LongRunningWorkflowExecutor::with_config(
                 node.clone(),
@@ -341,66 +351,73 @@ async fn encryption_stub_only_passes_through_unencrypted_bytes() {
 }
 
 #[tokio::test]
-async fn split_test_api_is_opt_in_and_uses_existing_auth_and_workflow_errors() {
-    let app = App::new().await;
-    let path = "/test/tables/1/split";
-    let body = json!({"new_partition": 0});
-    if cfg!(feature = "test-api") {
-        assert_eq!(
-            app.request("POST", path, None, body.clone()).await.0,
-            StatusCode::UNAUTHORIZED
-        );
-        assert_eq!(
-            app.request("POST", path, Some(&signed(&claims())), body.clone())
-                .await
-                .0,
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-        assert_eq!(
-            app.request("POST", path, Some(INTERNAL), body.clone())
-                .await
-                .0,
-            StatusCode::NOT_FOUND
-        );
-        let table = table::ActiveModel {
-            table_name: Set("split-test".into()),
-            owner: Set(1),
-            partition_key_name: Set("p".into()),
-            sort_key_name: Set("s".into()),
-            is_ready: Set(false),
-            ..Default::default()
-        }
-        .insert(&app.db)
-        .await
-        .unwrap();
-        let path = format!("/test/tables/{}/split", table.table_id);
-        assert_eq!(
-            app.request("POST", &path, Some(INTERNAL), body.clone())
-                .await
-                .0,
-            StatusCode::CONFLICT
-        );
-        app.table
-            .ask(
-                patchwork_control_plane::actors::crud::Update::<table::Entity> {
-                    data: table::Model {
-                        is_ready: true,
-                        ..table
-                    },
-                },
-            )
+async fn test_apis_are_opt_in_and_use_existing_auth_and_workflow_errors() {
+    for (operation, body) in [
+        ("split", json!({"new_partition": 0})),
+        (
+            "increase-replication",
+            json!({"hash_start": 0, "replication_factor": 4}),
+        ),
+    ] {
+        let app = App::new().await;
+        let path = format!("/test/tables/1/{operation}");
+        if cfg!(feature = "test-api") {
+            assert_eq!(
+                app.request("POST", &path, None, body.clone()).await.0,
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                app.request("POST", &path, Some(&signed(&claims())), body.clone())
+                    .await
+                    .0,
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert_eq!(
+                app.request("POST", &path, Some(INTERNAL), body.clone())
+                    .await
+                    .0,
+                StatusCode::NOT_FOUND
+            );
+            let table = table::ActiveModel {
+                table_name: Set("split-test".into()),
+                owner: Set(1),
+                partition_key_name: Set("p".into()),
+                sort_key_name: Set("s".into()),
+                is_ready: Set(false),
+                ..Default::default()
+            }
+            .insert(&app.db)
             .await
             .unwrap();
-        // An empty partition ring fails inside the submitted split workflow.
-        assert_eq!(
-            app.request("POST", &path, Some(INTERNAL), body).await.0,
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-    } else {
-        assert_eq!(
-            app.request("POST", path, Some(INTERNAL), body).await.0,
-            StatusCode::NOT_FOUND
-        );
+            let path = format!("/test/tables/{}/{operation}", table.table_id);
+            assert_eq!(
+                app.request("POST", &path, Some(INTERNAL), body.clone())
+                    .await
+                    .0,
+                StatusCode::CONFLICT
+            );
+            app.table
+                .ask(Dispatch(
+                    patchwork_control_plane::actors::table::UpdateTable {
+                        data: table::Model {
+                            is_ready: true,
+                            ..table
+                        },
+                    },
+                ))
+                .await
+                .unwrap();
+            // An empty partition ring fails inside either submitted workflow.
+            assert_eq!(
+                app.request("POST", &path, Some(INTERNAL), body).await.0,
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+        } else {
+            assert_eq!(
+                app.request("POST", &path, Some(INTERNAL), body).await.0,
+                StatusCode::NOT_FOUND
+            );
+        }
+        app.stop().await;
     }
-    app.stop().await;
 }

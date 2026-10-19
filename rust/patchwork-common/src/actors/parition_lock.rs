@@ -1,27 +1,20 @@
 use super::PartitionActor;
 use crate::datamodels::parition_lock::{Column, Entity, Model};
-use kameo::{
-    message::{Context, Message},
-    reply::DelegatedReply,
-};
+use kameo::{message::Context, messages, reply::DelegatedReply};
 use sea_orm::entity::prelude::*;
 use sea_orm::{DbBackend, QueryFilter, SqlErr, Statement, TransactionTrait};
 
-/// lease_end is Unix seconds. Returns None if held or the requested lease has expired.
-pub struct AttemptLock {
-    pub table_id: i64,
-    pub hash_start: i64,
-    pub lease_end: i64,
-}
-
-impl Message<AttemptLock> for PartitionActor {
-    type Reply = DelegatedReply<Result<Option<Model>, DbErr>>;
-
-    async fn handle(
+#[messages]
+impl PartitionActor {
+    /// lease_end is Unix seconds. Returns None if held or the requested lease has expired.
+    #[message(ctx)]
+    pub async fn attempt_lock(
         &mut self,
-        msg: AttemptLock,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
+        table_id: i64,
+        hash_start: i64,
+        lease_end: i64,
+        ctx: &mut Context<Self, DelegatedReply<Result<Option<Model>, DbErr>>>,
+    ) -> DelegatedReply<Result<Option<Model>, DbErr>> {
         let db = self.db.clone();
         ctx.spawn(async move {
             let txn = db.begin().await?;
@@ -30,13 +23,13 @@ impl Message<AttemptLock> for PartitionActor {
             txn.execute_raw(Statement::from_sql_and_values(
                 DbBackend::MySql,
                 "DELETE FROM partition_lock WHERE table_id = ? AND hash_start = ? AND lease_end <= UNIX_TIMESTAMP()",
-                [msg.table_id.into(), msg.hash_start.into()],
+                [table_id.into(), hash_start.into()],
             )).await?;
 
             let inserted = txn.execute_raw(Statement::from_sql_and_values(
                 DbBackend::MySql,
                 "INSERT INTO partition_lock (table_id, hash_start, lease_end, lock_token) SELECT ?, ?, ?, UUID() WHERE ? > UNIX_TIMESTAMP()",
-                [msg.table_id.into(), msg.hash_start.into(), msg.lease_end.into(), msg.lease_end.into()],
+                [table_id.into(), hash_start.into(), lease_end.into(), lease_end.into()],
             )).await;
 
             match inserted {
@@ -54,30 +47,27 @@ impl Message<AttemptLock> for PartitionActor {
                 }
             }
 
-            let lock = Entity::find_by_id((msg.table_id, msg.hash_start)).one(&txn).await?;
+            let lock = Entity::find_by_id((table_id, hash_start)).one(&txn).await?;
             txn.commit().await?;
             Ok(lock)
         })
     }
-}
 
-pub struct FreeLock {
-    pub table_id: i64,
-    pub hash_start: i64,
-    // Use the token returned by AttemptLock.
-    pub lock_token: String,
-}
-
-impl Message<FreeLock> for PartitionActor {
-    type Reply = DelegatedReply<Result<bool, DbErr>>;
-
-    async fn handle(&mut self, msg: FreeLock, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+    #[message(ctx)]
+    pub async fn free_lock(
+        &mut self,
+        table_id: i64,
+        hash_start: i64,
+        /// Use the token returned by AttemptLock.
+        lock_token: String,
+        ctx: &mut Context<Self, DelegatedReply<Result<bool, DbErr>>>,
+    ) -> DelegatedReply<Result<bool, DbErr>> {
         let db = self.db.clone();
         ctx.spawn(async move {
             let result = Entity::delete_many()
-                .filter(Column::TableId.eq(msg.table_id))
-                .filter(Column::HashStart.eq(msg.hash_start))
-                .filter(Column::LockToken.eq(msg.lock_token))
+                .filter(Column::TableId.eq(table_id))
+                .filter(Column::HashStart.eq(hash_start))
+                .filter(Column::LockToken.eq(lock_token))
                 .exec(&db)
                 .await?;
             Ok(result.rows_affected > 0)
