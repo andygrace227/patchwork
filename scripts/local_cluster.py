@@ -372,7 +372,7 @@ class RemoteCluster:
         clear_ports([self.args.web_port])
         if not self.args.no_build:
             subprocess.run(["cargo", "build", "--release", "--manifest-path", str(ROOT / "rust" / "Cargo.toml"),
-                            "--target-dir", str(TARGET.parent), "-p", "patchwork-control-plane", "--bin", "patchwork-load"], cwd=ROOT, check=True)
+                            "--target-dir", str(TARGET.parent), "-p", "patchwork-load"], cwd=ROOT, check=True)
 
     def check_processes(self):
         pass

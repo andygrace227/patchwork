@@ -105,6 +105,11 @@ and partition ID. The `0` boundary above exists after the example split.
 
 ## TPS load generator
 
+The Rust worker lives in the `patchwork-load` crate. Build it separately with
+`cargo build --manifest-path rust/Cargo.toml -p patchwork-load --release`;
+the cluster launcher builds it automatically. Run `rust/target/release/patchwork-load --help`
+for standalone usage.
+
 Use the dashboard's **Load generator** panel with a ready table. Set target HTTP
 requests per second, duration, concurrent requests, read percentage, unique
 records, payload padding, and consistency. Send traffic through one control node

@@ -1843,7 +1843,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "bytes",
  "cano",
  "dotenvy",
  "jsonwebtoken",
@@ -1883,6 +1882,21 @@ dependencies = [
  "tonic",
  "tower",
  "wal-db",
+]
+
+[[package]]
+name = "patchwork-load"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bytes",
+ "dotenvy",
+ "rand 0.9.5",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

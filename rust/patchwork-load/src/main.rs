@@ -511,5 +511,4 @@ async fn main_result() -> Result<()> {
 }
 
 #[cfg(test)]
-#[path = "patchwork-load/tests.rs"]
 mod tests;

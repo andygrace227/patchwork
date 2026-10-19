@@ -11,11 +11,9 @@ debug = true
 test-api = []
 
 [dependencies]
-bytes = "1"
 kameo = "0.22.2"
 sea-orm = { version = "2", features = ["sqlx-mysql", "runtime-tokio-rustls", "macros", "with-json"], default-features = false }
 serde = { version = "1", features = ["derive"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1"
 anyhow = "1.0.104"
 axum = "0.8"
@@ -30,6 +28,7 @@ cano = "=0.15.2"
 kameo_actors = "0.8.1"
 
 [dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tower = { version = "0.5", features = ["util"] }
 prost = "0.14"
 patchwork-data-plane = { path = "../patchwork-data-plane" }
