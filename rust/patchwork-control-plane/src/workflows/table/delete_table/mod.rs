@@ -1,16 +1,8 @@
+use crate::clients::{NodeClient, PartitionClient, TableClient};
 use crate::workflows::stages::{unlock, workflow_steps};
 use anyhow::{Context, Result, ensure};
-use kameo::actor::ActorRef;
-use kameo_actors::pool::ActorPool;
 
-use crate::{
-    actors::{
-        NodeActor, PartitionActor, TableActor,
-        parition_lock::AttemptLock,
-        partition::{DeleteLockedPartition, GetTablePartitionsUncached as GetTablePartitions},
-    },
-    dataplane_client::Client,
-};
+use crate::dataplane_client::Client;
 
 #[derive(Clone)]
 pub struct DeleteTableContext {
@@ -20,9 +12,9 @@ pub struct DeleteTableContext {
 #[derive(Clone)]
 pub struct DeleteTable {
     pub client: Client,
-    pub node: ActorRef<ActorPool<NodeActor>>,
-    pub partition: ActorRef<ActorPool<PartitionActor>>,
-    pub table: ActorRef<ActorPool<TableActor>>,
+    pub node: NodeClient,
+    pub partition: PartitionClient,
+    pub table: TableClient,
 }
 
 mod steps;

@@ -1,23 +1,10 @@
 use super::copy_range::copy_range;
+use crate::clients::{NodeClient, PartitionClient, TableClient};
 use crate::dataplane_client::Client;
 use crate::workflows::data::fetch_range::FetchRangeCtx;
 use crate::workflows::stages::{unlock, workflow_steps};
-use crate::{
-    actors::{
-        NodeActor, PartitionActor, TableActor,
-        node::GetNodeExcluding,
-        parition_lock::AttemptLock,
-        partition::{
-            CreateLockedPartition, GetTablePartitionsUncached as GetTablePartitions,
-            UpdateLockedPartition,
-        },
-    },
-    datamodels::partition,
-    workflows::partition::circular_get,
-};
+use crate::{datamodels::partition, workflows::partition::circular_get};
 use anyhow::{Context, Result};
-use kameo::actor::ActorRef;
-use kameo_actors::pool::ActorPool;
 use sea_orm::ActiveValue::Set;
 
 /// Split the existing partition containing `new_partition` at that hash boundary.
@@ -30,9 +17,9 @@ pub struct SplitPartitionContext {
 #[derive(Clone)]
 pub struct SplitPartition {
     pub client: Client,
-    pub node: ActorRef<ActorPool<NodeActor>>,
-    pub partition: ActorRef<ActorPool<PartitionActor>>,
-    pub table: ActorRef<ActorPool<TableActor>>,
+    pub node: NodeClient,
+    pub partition: PartitionClient,
+    pub table: TableClient,
 }
 
 mod steps;

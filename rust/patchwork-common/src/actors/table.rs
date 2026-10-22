@@ -3,34 +3,6 @@ use kameo::{Actor, message::Context, messages, reply::DelegatedReply};
 use sea_orm::IntoActiveModel;
 use sea_orm::entity::prelude::*;
 use sea_orm::{DbBackend, Order, QueryFilter, QueryOrder};
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
-use ttl_cache::TtlCache;
-
-pub const CACHE_TTL: Duration = Duration::from_secs(5);
-pub const CACHE_SIZE: usize = 1024;
-
-struct TableCache {
-    rows: TtlCache<i64, Model>,
-    generation: u64,
-}
-
-impl TableCache {
-    fn new() -> Self {
-        Self {
-            rows: TtlCache::new(CACHE_SIZE),
-            generation: 0,
-        }
-    }
-
-    fn clear(&mut self) {
-        self.rows.clear();
-        // Older in-flight reads must not refill the cache after a write.
-        self.generation = self.generation.wrapping_add(1);
-    }
-}
 
 /// CRUD and table queries using a shared SeaORM connection pool.
 /// Requests may finish out of order. Await writes before dependent reads.
@@ -38,23 +10,13 @@ impl TableCache {
 #[derive(Actor)]
 pub struct TableActor {
     db: DatabaseConnection,
-    cache: Arc<Mutex<TableCache>>,
-    cache_ttl: Duration,
 }
 
 impl TableActor {
     /// Cloning DatabaseConnection shares its existing pool.
     /// Configure max_connections > 1 when opening it to allow concurrent queries.
     pub fn new(db: DatabaseConnection) -> Self {
-        Self::with_cache_ttl(db, CACHE_TTL)
-    }
-
-    pub fn with_cache_ttl(db: DatabaseConnection, cache_ttl: Duration) -> Self {
-        Self {
-            db,
-            cache_ttl,
-            cache: Arc::new(Mutex::new(TableCache::new())),
-        }
+        Self { db }
     }
 }
 
@@ -68,12 +30,7 @@ impl TableActor {
         ctx: &mut Context<Self, DelegatedReply<Result<Model, DbErr>>>,
     ) -> DelegatedReply<Result<Model, DbErr>> {
         let db = self.db.clone();
-        let cache = self.cache.clone();
-        ctx.spawn(async move {
-            let row = data.insert(&db).await?;
-            cache.lock().unwrap().clear();
-            Ok(row)
-        })
+        ctx.spawn(async move { data.insert(&db).await })
     }
 
     #[message(ctx)]
@@ -94,12 +51,9 @@ impl TableActor {
         ctx: &mut Context<Self, DelegatedReply<Result<Model, DbErr>>>,
     ) -> DelegatedReply<Result<Model, DbErr>> {
         let db = self.db.clone();
-        let cache = self.cache.clone();
         ctx.spawn(async move {
             // Model conversion marks fields Unchanged; reset them so updates are written.
-            let row = data.into_active_model().reset_all().update(&db).await?;
-            cache.lock().unwrap().clear();
-            Ok(row)
+            data.into_active_model().reset_all().update(&db).await
         })
     }
 
@@ -111,41 +65,7 @@ impl TableActor {
         ctx: &mut Context<Self, DelegatedReply<Result<u64, DbErr>>>,
     ) -> DelegatedReply<Result<u64, DbErr>> {
         let db = self.db.clone();
-        let cache = self.cache.clone();
-        ctx.spawn(async move {
-            let deleted = Entity::delete_by_id(id).exec(&db).await?.rows_affected;
-            cache.lock().unwrap().clear();
-            Ok(deleted)
-        })
-    }
-
-    /// Uses the actor's bounded read cache. Missing rows and failures are not cached.
-    #[message(ctx)]
-    pub async fn get_table_cached(
-        &mut self,
-        id: i64,
-        ctx: &mut Context<Self, DelegatedReply<Result<Option<Model>, DbErr>>>,
-    ) -> DelegatedReply<Result<Option<Model>, DbErr>> {
-        let generation = {
-            let cache = self.cache.lock().unwrap();
-            if let Some(row) = cache.rows.get(&id) {
-                return ctx.reply(Ok(Some(row.clone())));
-            }
-            cache.generation
-        };
-        let db = self.db.clone();
-        let cache = self.cache.clone();
-        let ttl = self.cache_ttl;
-        ctx.spawn(async move {
-            let row = Entity::find_by_id(id).one(&db).await?;
-            if let Some(row) = &row {
-                let mut cache = cache.lock().unwrap();
-                if cache.generation == generation {
-                    cache.rows.insert(id, row.clone(), ttl);
-                }
-            }
-            Ok(row)
-        })
+        ctx.spawn(async move { Ok(Entity::delete_by_id(id).exec(&db).await?.rows_affected) })
     }
 
     /// Pick a ready table for a background scaling check.

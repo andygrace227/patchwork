@@ -1,21 +1,16 @@
-use crate::actors::{node::GetNode, table::GetTableCached};
+use crate::clients::{NodeClient, PartitionClient, TableClient};
 use crate::telemetry::{measure, time};
 use anyhow::{Context, Result, ensure};
-use kameo::actor::ActorRef;
-use kameo_actors::pool::{ActorPool, Dispatch};
 use patchwork_common::dataplane_client::Record;
 use rand::seq::IndexedRandom;
 
-use crate::{
-    actors::{NodeActor, PartitionActor, TableActor, partition::GetTablePartitions},
-    dataplane_client::Client,
-};
+use crate::dataplane_client::Client;
 
 pub struct FetchRange {
     pub client: Client,
-    pub partition: ActorRef<ActorPool<PartitionActor>>,
-    pub node: ActorRef<ActorPool<NodeActor>>,
-    pub table: ActorRef<ActorPool<TableActor>>,
+    pub partition: PartitionClient,
+    pub node: NodeClient,
+    pub table: TableClient,
 }
 
 pub struct FetchRangeCtx {
@@ -35,7 +30,7 @@ impl FetchRange {
         let table_timing = measure("table_lookup");
         let table = self
             .table
-            .ask(Dispatch(GetTableCached { id: ctx.table_id }))
+            .get_table(ctx.table_id)
             .await?
             .context("Table is not alive.")?;
         ensure!(table.is_ready, "Table is not ready.");
@@ -46,9 +41,7 @@ impl FetchRange {
         let partition_timing = measure("partition_lookup");
         let partitions = self
             .partition
-            .ask(Dispatch(GetTablePartitions {
-                table_id: ctx.table_id,
-            }))
+            .get_table_partitions_cached(ctx.table_id)
             .await?;
         ensure!(!partitions.is_empty(), "Table has no partitions");
         drop(partition_timing);
@@ -68,18 +61,15 @@ impl FetchRange {
             });
             let replicas = time(
                 "replica_resolution",
-                super::replicas::resolve(&self.partition, partition.clone(), false, false),
+                super::replicas::resolve(&self.partition, partition.clone(), false),
             )
             .await?;
             let replica = *replicas
                 .choose(&mut rand::rng())
                 .context("Partition has no replicas")?;
-            let node = time(
-                "replica_lookup",
-                self.node.ask(Dispatch(GetNode { id: replica })),
-            )
-            .await?
-            .context("Replica node no longer exists")?;
+            let node = time("replica_lookup", self.node.get_node(replica))
+                .await?
+                .context("Replica node no longer exists")?;
             records.extend(
                 time(
                     "replica_grpc",
@@ -97,7 +87,7 @@ impl FetchRange {
     // versions are intentional: consistent writes apply timestamp/tie ordering.
     pub(crate) async fn from_replicas(
         client: &Client,
-        node_actor: &ActorRef<ActorPool<NodeActor>>,
+        node_actor: &NodeClient,
         ctx: &FetchRangeCtx,
         replicas: &[i64],
     ) -> Result<Vec<Record>> {
@@ -111,12 +101,9 @@ impl FetchRange {
         replicas.dedup();
         let mut records = Vec::new();
         for replica in replicas {
-            let node = time(
-                "replica_lookup",
-                node_actor.ask(Dispatch(GetNode { id: replica })),
-            )
-            .await?
-            .context("Source replica no longer exists")?;
+            let node = time("replica_lookup", node_actor.get_node(replica))
+                .await?
+                .context("Source replica no longer exists")?;
             records.extend(
                 client
                     .get_range_including_deleted(

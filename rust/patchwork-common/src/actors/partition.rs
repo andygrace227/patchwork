@@ -3,37 +3,6 @@ use kameo::{Actor, message::Context, messages, reply::DelegatedReply};
 use sea_orm::IntoActiveModel;
 use sea_orm::entity::prelude::*;
 use sea_orm::{QueryFilter, QueryOrder, QuerySelect};
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
-use ttl_cache::TtlCache;
-
-pub const CACHE_TTL: Duration = Duration::from_secs(5);
-pub const CACHE_SIZE: usize = 1024;
-
-struct PartitionCache {
-    rows: TtlCache<(i64, i64), Model>,
-    partitions: TtlCache<i64, Vec<Model>>,
-    generation: u64,
-}
-
-impl PartitionCache {
-    fn new() -> Self {
-        Self {
-            rows: TtlCache::new(CACHE_SIZE),
-            partitions: TtlCache::new(CACHE_SIZE),
-            generation: 0,
-        }
-    }
-
-    fn clear(&mut self) {
-        self.rows.clear();
-        self.partitions.clear();
-        // Older in-flight reads must not refill the cache after a write.
-        self.generation = self.generation.wrapping_add(1);
-    }
-}
 
 /// CRUD and partition queries using a shared SeaORM connection pool.
 /// Requests may finish out of order. Await writes before dependent reads.
@@ -41,23 +10,13 @@ impl PartitionCache {
 #[derive(Actor)]
 pub struct PartitionActor {
     pub(super) db: DatabaseConnection,
-    cache: Arc<Mutex<PartitionCache>>,
-    cache_ttl: Duration,
 }
 
 impl PartitionActor {
     /// Cloning DatabaseConnection shares its existing pool.
     /// Configure max_connections > 1 when opening it to allow concurrent queries.
     pub fn new(db: DatabaseConnection) -> Self {
-        Self::with_cache_ttl(db, CACHE_TTL)
-    }
-
-    pub fn with_cache_ttl(db: DatabaseConnection, cache_ttl: Duration) -> Self {
-        Self {
-            db,
-            cache_ttl,
-            cache: Arc::new(Mutex::new(PartitionCache::new())),
-        }
+        Self { db }
     }
 }
 
@@ -71,12 +30,7 @@ impl PartitionActor {
         ctx: &mut Context<Self, DelegatedReply<Result<Model, DbErr>>>,
     ) -> DelegatedReply<Result<Model, DbErr>> {
         let db = self.db.clone();
-        let cache = self.cache.clone();
-        ctx.spawn(async move {
-            let row = data.insert(&db).await?;
-            cache.lock().unwrap().clear();
-            Ok(row)
-        })
+        ctx.spawn(async move { data.insert(&db).await })
     }
 
     #[message(ctx)]
@@ -97,12 +51,9 @@ impl PartitionActor {
         ctx: &mut Context<Self, DelegatedReply<Result<Model, DbErr>>>,
     ) -> DelegatedReply<Result<Model, DbErr>> {
         let db = self.db.clone();
-        let cache = self.cache.clone();
         ctx.spawn(async move {
             // Model conversion marks fields Unchanged; reset them so updates are written.
-            let row = data.into_active_model().reset_all().update(&db).await?;
-            cache.lock().unwrap().clear();
-            Ok(row)
+            data.into_active_model().reset_all().update(&db).await
         })
     }
 
@@ -114,77 +65,12 @@ impl PartitionActor {
         ctx: &mut Context<Self, DelegatedReply<Result<u64, DbErr>>>,
     ) -> DelegatedReply<Result<u64, DbErr>> {
         let db = self.db.clone();
-        let cache = self.cache.clone();
-        ctx.spawn(async move {
-            let deleted = Entity::delete_by_id(id).exec(&db).await?.rows_affected;
-            cache.lock().unwrap().clear();
-            Ok(deleted)
-        })
-    }
-
-    /// Uses the actor's bounded read cache. Missing rows and failures are not cached.
-    #[message(ctx)]
-    pub async fn get_partition_cached(
-        &mut self,
-        id: (i64, i64),
-        ctx: &mut Context<Self, DelegatedReply<Result<Option<Model>, DbErr>>>,
-    ) -> DelegatedReply<Result<Option<Model>, DbErr>> {
-        let generation = {
-            let cache = self.cache.lock().unwrap();
-            if let Some(row) = cache.rows.get(&id) {
-                return ctx.reply(Ok(Some(row.clone())));
-            }
-            cache.generation
-        };
-        let db = self.db.clone();
-        let cache = self.cache.clone();
-        let ttl = self.cache_ttl;
-        ctx.spawn(async move {
-            let row = Entity::find_by_id(id).one(&db).await?;
-            if let Some(row) = &row {
-                let mut cache = cache.lock().unwrap();
-                if cache.generation == generation {
-                    cache.rows.insert(id, row.clone(), ttl);
-                }
-            }
-            Ok(row)
-        })
+        ctx.spawn(async move { Ok(Entity::delete_by_id(id).exec(&db).await?.rows_affected) })
     }
 
     /// Returns the table's partitions ordered by hash start.
     #[message(ctx)]
     pub async fn get_table_partitions(
-        &mut self,
-        table_id: i64,
-        ctx: &mut Context<Self, DelegatedReply<Result<Vec<Model>, DbErr>>>,
-    ) -> DelegatedReply<Result<Vec<Model>, DbErr>> {
-        let generation = {
-            let cache = self.cache.lock().unwrap();
-            if let Some(partitions) = cache.partitions.get(&table_id) {
-                return ctx.reply(Ok(partitions.clone()));
-            }
-            cache.generation
-        };
-        let db = self.db.clone();
-        let cache = self.cache.clone();
-        let ttl = self.cache_ttl;
-        ctx.spawn(async move {
-            let partitions = Entity::find()
-                .filter(Column::TableId.eq(table_id))
-                .order_by_asc(Column::HashStart)
-                .all(&db)
-                .await?;
-            let mut cache = cache.lock().unwrap();
-            if cache.generation == generation {
-                cache.partitions.insert(table_id, partitions.clone(), ttl);
-            }
-            Ok(partitions)
-        })
-    }
-
-    /// Fresh metadata for topology changes and table deletion.
-    #[message(ctx)]
-    pub async fn get_table_partitions_uncached(
         &mut self,
         table_id: i64,
         ctx: &mut Context<Self, DelegatedReply<Result<Vec<Model>, DbErr>>>,
@@ -229,7 +115,6 @@ impl PartitionActor {
     ) -> DelegatedReply<Result<Model, DbErr>> {
         use sea_orm::{DbBackend, Statement, TransactionTrait};
         let db = self.db.clone();
-        let cache = self.cache.clone();
         ctx.spawn(async move {
             if locks.is_empty() {
                 return Err(DbErr::Custom("Partition leases are required".into()));
@@ -249,7 +134,6 @@ impl PartitionActor {
             }
             let partition = data.insert(&txn).await?;
             txn.commit().await?;
-            cache.lock().unwrap().clear();
             Ok(partition)
         })
     }
@@ -264,7 +148,6 @@ impl PartitionActor {
     ) -> DelegatedReply<Result<Model, DbErr>> {
         use sea_orm::{DbBackend, Statement, TransactionTrait};
         let db = self.db.clone();
-        let cache = self.cache.clone();
         ctx.spawn(async move {
             if locks.is_empty() {
                 return Err(DbErr::Custom("Partition leases are required".into()));
@@ -284,7 +167,6 @@ impl PartitionActor {
             }
             let partition = data.update(&txn).await?;
             txn.commit().await?;
-            cache.lock().unwrap().clear();
             Ok(partition)
         })
     }
@@ -300,7 +182,6 @@ impl PartitionActor {
     ) -> DelegatedReply<Result<u64, DbErr>> {
         use sea_orm::{DbBackend, Statement, TransactionTrait};
         let db = self.db.clone();
-        let cache = self.cache.clone();
         ctx.spawn(async move {
             if locks.is_empty() {
                 return Err(DbErr::Custom("Partition leases are required".into()));
@@ -323,48 +204,7 @@ impl PartitionActor {
                 return Err(DbErr::Custom("Partition no longer exists".into()));
             }
             txn.commit().await?;
-            cache.lock().unwrap().clear();
             Ok(deleted.rows_affected)
-        })
-    }
-
-    /// Use the cached, ordered table ring for inconsistent ownership lookups.
-    #[message(ctx)]
-    pub async fn get_partition_at_or_before_cached(
-        &mut self,
-        table_id: i64,
-        hash_start: i64,
-        ctx: &mut Context<Self, DelegatedReply<Result<Option<Model>, DbErr>>>,
-    ) -> DelegatedReply<Result<Option<Model>, DbErr>> {
-        // Ask through the same handler so ownership and range reads share one cache.
-        let ring = self
-            .cache
-            .lock()
-            .unwrap()
-            .partitions
-            .get(&table_id)
-            .cloned();
-        if let Some(ring) = ring {
-            let next = ring.partition_point(|p| p.hash_start <= hash_start);
-            return ctx.reply(Ok(next.checked_sub(1).map(|i| ring[i].clone())));
-        }
-        let db = self.db.clone();
-        let cache = self.cache.clone();
-        let ttl = self.cache_ttl;
-        let generation = cache.lock().unwrap().generation;
-        ctx.spawn(async move {
-            let ring = Entity::find()
-                .filter(Column::TableId.eq(table_id))
-                .order_by_asc(Column::HashStart)
-                .all(&db)
-                .await?;
-            let next = ring.partition_point(|p| p.hash_start <= hash_start);
-            let partition = next.checked_sub(1).map(|i| ring[i].clone());
-            let mut cache = cache.lock().unwrap();
-            if cache.generation == generation {
-                cache.partitions.insert(table_id, ring, ttl);
-            }
-            Ok(partition)
         })
     }
 }

@@ -1,14 +1,10 @@
+use crate::clients::PartitionClient;
 use anyhow::{Context, Result};
 use cano::{CancellationToken, CanoError, Workflow};
-use kameo::actor::ActorRef;
-use kameo_actors::pool::{ActorPool, Dispatch};
 use std::{fmt::Debug, future::Future, hash::Hash};
 use tokio::sync::Mutex;
 
-use crate::{
-    actors::{PartitionActor, parition_lock::FreeLock},
-    datamodels::parition_lock::Model,
-};
+use crate::datamodels::parition_lock::Model;
 
 /// Every execution gets its own state. Only that workflow's steps share it.
 #[derive(cano::Resource)]
@@ -105,18 +101,11 @@ macro_rules! workflow_steps {
 pub(crate) use workflow_steps;
 
 /// Try every token in reverse order, including after a failed step.
-pub(crate) async fn unlock(
-    partition: &ActorRef<ActorPool<PartitionActor>>,
-    locks: &mut Vec<Model>,
-) -> Result<()> {
+pub(crate) async fn unlock(partition: &PartitionClient, locks: &mut Vec<Model>) -> Result<()> {
     let mut errors = Vec::new();
     for lock in locks.drain(..).rev() {
         match partition
-            .ask(Dispatch(FreeLock {
-                table_id: lock.table_id,
-                hash_start: lock.hash_start,
-                lock_token: lock.lock_token,
-            }))
+            .free_lock(lock.table_id, lock.hash_start, lock.lock_token)
             .await
         {
             Ok(true) => {}

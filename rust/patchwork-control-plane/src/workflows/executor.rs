@@ -11,6 +11,7 @@
 //! ); // Starts random table checks as well.
 //! ```
 
+use crate::clients::{NodeClient, PartitionClient, TableClient};
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
@@ -26,7 +27,6 @@ use kameo::{
     error::{ActorStopReason, Infallible},
     message::{Context, Message},
 };
-use kameo_actors::pool::ActorPool;
 use tokio::task::JoinHandle;
 
 use super::job::JobCompletion;
@@ -34,10 +34,7 @@ pub use super::{
     Workflow,
     job::{JobHandle, JobStatus},
 };
-use crate::{
-    actors::{NodeActor, PartitionActor, TableActor},
-    scale,
-};
+use crate::scale;
 
 struct QueuedJob {
     key: String,
@@ -65,9 +62,9 @@ impl Default for ExecutorConfig {
 }
 
 pub struct LongRunningWorkflowExecutor {
-    node: ActorRef<ActorPool<NodeActor>>,
-    partition: ActorRef<ActorPool<PartitionActor>>,
-    table: ActorRef<ActorPool<TableActor>>,
+    node: NodeClient,
+    partition: PartitionClient,
+    table: TableClient,
     config: ExecutorConfig,
     queued: VecDeque<QueuedJob>,
     running: HashMap<String, Option<i64>>,
@@ -79,19 +76,15 @@ pub struct LongRunningWorkflowExecutor {
 
 impl LongRunningWorkflowExecutor {
     /// Spawning this actor also starts random background scaling checks.
-    pub fn new(
-        node: ActorRef<ActorPool<NodeActor>>,
-        partition: ActorRef<ActorPool<PartitionActor>>,
-        table: ActorRef<ActorPool<TableActor>>,
-    ) -> Self {
+    pub fn new(node: NodeClient, partition: PartitionClient, table: TableClient) -> Self {
         Self::with_config(node, partition, table, ExecutorConfig::default())
             .expect("valid default configuration")
     }
 
     pub fn with_config(
-        node: ActorRef<ActorPool<NodeActor>>,
-        partition: ActorRef<ActorPool<PartitionActor>>,
-        table: ActorRef<ActorPool<TableActor>>,
+        node: NodeClient,
+        partition: PartitionClient,
+        table: TableClient,
         config: ExecutorConfig,
     ) -> Result<Self> {
         ensure!(

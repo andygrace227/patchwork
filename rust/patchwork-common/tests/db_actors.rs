@@ -1,22 +1,21 @@
 use kameo::actor::Spawn;
 use patchwork_common::actors::{
-    node::{CreateNode, DeleteNode, GetNode, GetNodeCached, UpdateNode},
+    node::{CreateNode, DeleteNode, GetNode, UpdateNode},
     partition::{CreatePartition, DeletePartition, GetPartition, UpdatePartition},
-    table::{CreateTable, DeleteTable, GetTable, GetTableCached, UpdateTable},
+    table::{CreateTable, DeleteTable, GetTable, UpdateTable},
 };
 use patchwork_common::{
     actors::{
         NodeActor, PartitionActor, TableActor,
         node::GetRandomNodes,
-        partition::{GetPartitionAtOrBeforeCached, GetTablePartitions, GetTablePartitionsUncached},
+        partition::{GetPartitionAtOrBefore, GetTablePartitions},
     },
     datamodels::{node, partition, table},
 };
 use sea_orm::{ActiveValue::Set, ConnectOptions, ConnectionTrait, Database, Schema};
 
 #[tokio::test]
-async fn node_cache_reuses_reads_expires_and_invalidates_on_writes() {
-    use std::time::Duration;
+async fn node_reads_reflect_database_changes() {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     db.execute(&Schema::new(db.get_database_backend()).create_table_from_entity(node::Entity))
         .await
@@ -38,33 +37,14 @@ async fn node_cache_reuses_reads_expires_and_invalidates_on_writes() {
     db.execute_unprepared("UPDATE node SET url = 'http://external'")
         .await
         .unwrap();
-    // An external change is hidden until TTL expiry; both read messages share the cache.
     assert_eq!(
-        nodes.ask(GetNodeCached { id: row.node_id }).await.unwrap(),
-        Some(row.clone())
-    );
-
-    let expiring = NodeActor::spawn(NodeActor::with_cache_ttl(db.clone(), Duration::ZERO));
-    assert_eq!(
-        expiring
+        nodes
             .ask(GetNode { id: row.node_id })
             .await
             .unwrap()
             .unwrap()
             .url,
         "http://external"
-    );
-    db.execute_unprepared("UPDATE node SET url = 'http://external-again'")
-        .await
-        .unwrap();
-    assert_eq!(
-        expiring
-            .ask(GetNodeCached { id: row.node_id })
-            .await
-            .unwrap()
-            .unwrap()
-            .url,
-        "http://external-again"
     );
 
     row.url = "http://actor-update".into();
@@ -74,11 +54,8 @@ async fn node_cache_reuses_reads_expires_and_invalidates_on_writes() {
         Some(row.clone())
     );
     nodes.ask(DeleteNode { id: row.node_id }).await.unwrap();
-    assert_eq!(
-        nodes.ask(GetNodeCached { id: row.node_id }).await.unwrap(),
-        None
-    );
-    // Missing nodes aren't cached, so registering that ID is immediately visible.
+    assert_eq!(nodes.ask(GetNode { id: row.node_id }).await.unwrap(), None);
+    // Registering a previously missing ID is immediately visible.
     nodes
         .ask(CreateNode {
             data: node::ActiveModel {
@@ -92,10 +69,8 @@ async fn node_cache_reuses_reads_expires_and_invalidates_on_writes() {
         nodes.ask(GetNode { id: row.node_id }).await.unwrap(),
         Some(row)
     );
-    for actor in [nodes, expiring] {
-        actor.stop_gracefully().await.unwrap();
-        actor.wait_for_shutdown().await;
-    }
+    nodes.stop_gracefully().await.unwrap();
+    nodes.wait_for_shutdown().await;
     db.close().await.unwrap();
 }
 
@@ -291,16 +266,7 @@ async fn all_models_support_crud_and_overlapping_requests() {
 }
 
 #[tokio::test]
-async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
-    use std::time::Duration;
-    assert_eq!(
-        patchwork_common::actors::table::CACHE_TTL,
-        Duration::from_secs(5)
-    );
-    assert_eq!(
-        patchwork_common::actors::partition::CACHE_TTL,
-        Duration::from_secs(5)
-    );
+async fn metadata_reads_reflect_database_changes() {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     let schema = Schema::new(db.get_database_backend());
     db.execute(&schema.create_table_from_entity(table::Entity))
@@ -326,16 +292,12 @@ async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
         .await
         .unwrap();
     assert_eq!(
-        tables.ask(GetTableCached { id: 1 }).await.unwrap(),
+        tables.ask(GetTable { id: 1 }).await.unwrap(),
         Some(row.clone())
     );
     db.execute_unprepared("UPDATE `table` SET table_name = 'external' WHERE table_id = 1")
         .await
         .unwrap();
-    assert_eq!(
-        tables.ask(GetTableCached { id: 1 }).await.unwrap(),
-        Some(row.clone())
-    );
     assert_eq!(
         tables
             .ask(GetTable { id: 1 })
@@ -347,18 +309,9 @@ async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
     );
     row.table_name = "actor update".into();
     tables.ask(UpdateTable { data: row.clone() }).await.unwrap();
-    assert_eq!(
-        tables.ask(GetTableCached { id: 1 }).await.unwrap(),
-        Some(row)
-    );
+    assert_eq!(tables.ask(GetTable { id: 1 }).await.unwrap(), Some(row));
     tables.ask(DeleteTable { id: 1 }).await.unwrap();
-    assert!(
-        tables
-            .ask(GetTableCached { id: 1 })
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(tables.ask(GetTable { id: 1 }).await.unwrap().is_none());
 
     assert!(
         partitions
@@ -389,6 +342,7 @@ async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
     db.execute_unprepared("UPDATE `partition` SET forward_to = 0 WHERE table_id = 1")
         .await
         .unwrap();
+    boundary.forward_to = Some(0);
     assert_eq!(
         partitions
             .ask(GetTablePartitions { table_id: 1 })
@@ -398,21 +352,13 @@ async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
     );
     assert_eq!(
         partitions
-            .ask(GetPartitionAtOrBeforeCached {
+            .ask(GetPartitionAtOrBefore {
                 table_id: 1,
                 hash_start: 10
             })
             .await
             .unwrap(),
         Some(boundary.clone())
-    );
-    assert_eq!(
-        partitions
-            .ask(GetTablePartitionsUncached { table_id: 1 })
-            .await
-            .unwrap()[0]
-            .forward_to,
-        Some(0)
     );
     boundary.replicas = partition::ReplicaNodes(vec![2, 3]);
     partitions
@@ -442,33 +388,19 @@ async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
             .is_empty()
     );
 
-    // A short TTL exercises real expiry without making the suite wait five seconds.
-    let expiring = PartitionActor::spawn(PartitionActor::with_cache_ttl(
-        db.clone(),
-        Duration::from_millis(20),
-    ));
-    assert!(
-        expiring
-            .ask(GetTablePartitions { table_id: 1 })
-            .await
-            .unwrap()
-            .is_empty()
-    );
     db.execute_unprepared(
         "INSERT INTO `partition` (table_id, hash_start, partition_id, replicas) VALUES (1, 0, 'new-partition', '[1]')",
     )
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(40)).await;
     assert_eq!(
-        expiring
+        partitions
             .ask(GetTablePartitions { table_id: 1 })
             .await
             .unwrap()
             .len(),
         1
     );
-    let expiring_tables = TableActor::spawn(TableActor::with_cache_ttl(db.clone(), Duration::ZERO));
     let created = tables
         .ask(CreateTable {
             data: table::ActiveModel {
@@ -483,29 +415,22 @@ async fn metadata_caches_expire_and_actor_writes_invalidate_them() {
         })
         .await
         .unwrap();
-    assert_eq!(
-        expiring_tables.ask(GetTableCached { id: 1 }).await.unwrap(),
-        Some(created)
-    );
+    assert_eq!(tables.ask(GetTable { id: 1 }).await.unwrap(), Some(created));
     db.execute_unprepared("UPDATE `table` SET table_name = 'after' WHERE table_id = 1")
         .await
         .unwrap();
     assert_eq!(
-        expiring_tables
-            .ask(GetTableCached { id: 1 })
+        tables
+            .ask(GetTable { id: 1 })
             .await
             .unwrap()
             .unwrap()
             .table_name,
         "after"
     );
-    for actor in [partitions, expiring] {
-        actor.stop_gracefully().await.unwrap();
-        actor.wait_for_shutdown().await;
-    }
-    for actor in [tables, expiring_tables] {
-        actor.stop_gracefully().await.unwrap();
-        actor.wait_for_shutdown().await;
-    }
+    partitions.stop_gracefully().await.unwrap();
+    partitions.wait_for_shutdown().await;
+    tables.stop_gracefully().await.unwrap();
+    tables.wait_for_shutdown().await;
     db.close().await.unwrap();
 }

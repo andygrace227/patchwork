@@ -1,9 +1,4 @@
 use super::*;
-use crate::actors::{
-    node::GetNode,
-    table::{DeleteTable as DeleteTableRow, GetTable, UpdateTable},
-};
-use kameo_actors::pool::Dispatch;
 
 impl Run {
     pub(super) async fn prepare(&mut self) -> Result<State> {
@@ -11,24 +6,15 @@ impl Run {
         let ctx = &self.ctx;
         // Stage 1: Mark the table unavailable before removing its records.
         // An already absent table needs no further work.
-        let Some(mut table) = workflow
-            .table
-            .ask(Dispatch(GetTable { id: ctx.table_id }))
-            .await?
-        else {
+        let Some(mut table) = workflow.table.get_table_uncached(ctx.table_id).await? else {
             return Ok(State::Done);
         };
         table.is_ready = false;
-        workflow
-            .table
-            .ask(Dispatch(UpdateTable { data: table }))
-            .await?;
+        workflow.table.update_table(table).await?;
 
         let partitions = workflow
             .partition
-            .ask(Dispatch(GetTablePartitions {
-                table_id: ctx.table_id,
-            }))
+            .get_table_partitions(ctx.table_id)
             .await?;
 
         self.partitions = partitions;
@@ -46,20 +32,14 @@ impl Run {
             locks.push(
                 workflow
                     .partition
-                    .ask(Dispatch(AttemptLock {
-                        table_id: ctx.table_id,
-                        hash_start: partition.hash_start,
-                        lease_end,
-                    }))
+                    .attempt_lock(ctx.table_id, partition.hash_start, lease_end)
                     .await?
                     .context("Partition is already locked; retry deleting the table")?,
             );
         }
         let current = workflow
             .partition
-            .ask(Dispatch(GetTablePartitions {
-                table_id: ctx.table_id,
-            }))
+            .get_table_partitions(ctx.table_id)
             .await?;
         ensure!(
             current == *partitions,
@@ -87,7 +67,7 @@ impl Run {
             nodes.push(
                 workflow
                     .node
-                    .ask(Dispatch(GetNode { id }))
+                    .get_node(id)
                     .await?
                     .context("Replica node no longer exists; table cleanup is incomplete")?,
             );
@@ -124,17 +104,10 @@ impl Run {
         for partition in partitions {
             workflow
                 .partition
-                .ask(Dispatch(DeleteLockedPartition {
-                    table_id: ctx.table_id,
-                    hash_start: partition.hash_start,
-                    locks: locks.clone(),
-                }))
+                .delete_locked_partition(ctx.table_id, partition.hash_start, locks.clone())
                 .await?;
         }
-        workflow
-            .table
-            .ask(Dispatch(DeleteTableRow { id: ctx.table_id }))
-            .await?;
+        workflow.table.delete_table(ctx.table_id).await?;
         Ok(State::Unlock)
     }
     pub(super) async fn unlock(&mut self) -> Result<State> {

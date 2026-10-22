@@ -42,23 +42,19 @@ async fn forwarding_uses_exact_same_table_boundaries_and_detects_loops() {
         forward_to: Some(0),
         replicas: ReplicaNodes(vec![1, 2]),
     };
-    for cached in [false, true] {
-        assert_eq!(
-            resolve(&actor, source.clone(), false, cached)
-                .await
-                .unwrap(),
-            vec![2, 3]
-        );
-        assert_eq!(
-            resolve(&actor, source.clone(), true, cached).await.unwrap(),
-            vec![1, 2, 3]
-        );
-    }
+    assert_eq!(
+        resolve(&actor, source.clone(), false).await.unwrap(),
+        vec![2, 3]
+    );
+    assert_eq!(
+        resolve(&actor, source.clone(), true).await.unwrap(),
+        vec![1, 2, 3]
+    );
     source.forward_to = Some(1); // Must not fall back to boundary zero.
-    assert!(resolve(&actor, source.clone(), false, false).await.is_err());
+    assert!(resolve(&actor, source.clone(), false).await.is_err());
     source.forward_to = Some(20);
     assert!(
-        resolve(&actor, source, true, false)
+        resolve(&actor, source, true)
             .await
             .unwrap_err()
             .to_string()

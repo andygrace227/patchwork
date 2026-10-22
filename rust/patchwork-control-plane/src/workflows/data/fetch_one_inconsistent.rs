@@ -1,25 +1,16 @@
-use crate::actors::{node::GetNode, table::GetTableCached};
+use crate::clients::{NodeClient, PartitionClient, TableClient};
 use crate::telemetry::{measure, time};
 use anyhow::{Context, Result, ensure};
-use kameo::actor::ActorRef;
-use kameo_actors::pool::{ActorPool, Dispatch};
 use patchwork_common::dataplane_client::Record;
 use rand::seq::SliceRandom;
 
-use crate::{
-    actors::{
-        NodeActor, PartitionActor, TableActor,
-        partition::GetPartitionAtOrBeforeCached as GetPartitionAtOrBefore,
-    },
-    dataplane_client::Client,
-};
+use crate::dataplane_client::Client;
 // Fetch the first record found, trying replicas in a random order.
-// Inconsistent reads reuse the five-second partition cache.
 pub struct GetOneInconsistent {
     pub client: Client,
-    pub partition: ActorRef<ActorPool<PartitionActor>>,
-    pub node: ActorRef<ActorPool<NodeActor>>,
-    pub table: ActorRef<ActorPool<TableActor>>,
+    pub partition: PartitionClient,
+    pub node: NodeClient,
+    pub table: TableClient,
 }
 
 pub struct GetOneInconsistentCtx {
@@ -33,7 +24,7 @@ impl GetOneInconsistent {
         let table_timing = measure("table_lookup");
         let table = self
             .table
-            .ask(Dispatch(GetTableCached { id: ctx.table_id }))
+            .get_table(ctx.table_id)
             .await?
             .context("Table is not alive.")?;
         ensure!(table.is_ready, "Table is not ready.");
@@ -42,27 +33,19 @@ impl GetOneInconsistent {
         let partition_timing = measure("partition_lookup");
         let partition = self
             .partition
-            .ask(Dispatch(GetPartitionAtOrBefore {
-                table_id: ctx.table_id,
-                hash_start: ctx.primary_key,
-            }))
+            .get_partition_at_or_before_cached(ctx.table_id, ctx.primary_key)
             .await?
             .context("Something is very wrong with partition creation")?;
         drop(partition_timing);
 
         let mut replicas = time(
             "replica_resolution",
-            super::replicas::resolve(&self.partition, partition, false, true),
+            super::replicas::resolve_cached(&self.partition, partition, false),
         )
         .await?;
         replicas.shuffle(&mut rand::rng());
         for replica in replicas {
-            let Ok(Some(node)) = time(
-                "replica_lookup",
-                self.node.ask(Dispatch(GetNode { id: replica })),
-            )
-            .await
-            else {
+            let Ok(Some(node)) = time("replica_lookup", self.node.get_node(replica)).await else {
                 continue;
             };
 

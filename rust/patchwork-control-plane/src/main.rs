@@ -5,6 +5,7 @@ use patchwork_control_plane::{
     actors::{NodeActor, PartitionActor, TableActor},
     api,
     auth::Auth,
+    clients::{NodeClient, PartitionClient, TableClient},
     workflows::executor::LongRunningWorkflowExecutor,
 };
 use sea_orm::{ConnectOptions, Database};
@@ -54,6 +55,10 @@ async fn main() -> Result<()> {
     let table = ActorPool::spawn(ActorPool::new(pool_size, {
         move || TableActor::spawn(TableActor::new(db.clone()))
     }));
+
+    let node = NodeClient::new(node);
+    let partition = PartitionClient::new(partition);
+    let table = TableClient::new(table);
 
     let executor = LongRunningWorkflowExecutor::spawn(LongRunningWorkflowExecutor::new(
         node.clone(),

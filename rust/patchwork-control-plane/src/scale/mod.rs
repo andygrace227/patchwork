@@ -1,13 +1,12 @@
-use kameo_actors::pool::{ActorPool, Dispatch};
+use crate::clients::{NodeClient, PartitionClient, TableClient};
 use std::time::Duration;
 
 use cano::{
     CancellationToken, CanoError, Resources, TaskConfig, TaskResult, TimerOutcome, Workflow,
 };
-use kameo::actor::{ActorRef, WeakActorRef};
+use kameo::actor::WeakActorRef;
 
 use crate::{
-    actors::{NodeActor, PartitionActor, TableActor, table::GetRandomReadyTable},
     dataplane_client::Client,
     workflows::{
         executor::{LongRunningWorkflowExecutor, SubmitWorkflow},
@@ -17,9 +16,9 @@ use crate::{
 
 /// Each control node samples independently; partition workflows retain their DB locks.
 pub(crate) async fn run_random_scale_checks(
-    node: ActorRef<ActorPool<NodeActor>>,
-    partition: ActorRef<ActorPool<PartitionActor>>,
-    table: ActorRef<ActorPool<TableActor>>,
+    node: NodeClient,
+    partition: PartitionClient,
+    table: TableClient,
     executor: WeakActorRef<LongRunningWorkflowExecutor>,
     min_interval: Duration,
     max_interval: Duration,
@@ -80,9 +79,9 @@ impl RandomDelay {
 
 struct SubmitRandomCheck {
     client: Client,
-    node: ActorRef<ActorPool<NodeActor>>,
-    partition: ActorRef<ActorPool<PartitionActor>>,
-    table: ActorRef<ActorPool<TableActor>>,
+    node: NodeClient,
+    partition: PartitionClient,
+    table: TableClient,
     executor: WeakActorRef<LongRunningWorkflowExecutor>,
 }
 
@@ -96,7 +95,7 @@ impl SubmitRandomCheck {
         let Some(executor) = self.executor.upgrade() else {
             return Ok(TaskResult::Single(State::Done));
         };
-        match self.table.ask(Dispatch(GetRandomReadyTable)).await {
+        match self.table.get_random_ready_table().await {
             Ok(Some(picked)) => {
                 if let Err(error) = executor
                     .ask(SubmitWorkflow::new(

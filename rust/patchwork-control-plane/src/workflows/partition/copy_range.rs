@@ -1,9 +1,7 @@
+use crate::clients::NodeClient;
 use anyhow::{Result, ensure};
-use kameo::actor::ActorRef;
-use kameo_actors::pool::ActorPool;
 
 use crate::{
-    actors::NodeActor,
     dataplane_client::Client,
     workflows::data::{
         fetch_range::{FetchRange, FetchRangeCtx},
@@ -15,7 +13,7 @@ use crate::{
 // and tombstones. Destinations need not be published in the partition map yet.
 pub(super) async fn copy_range(
     client: &Client,
-    node: &ActorRef<ActorPool<NodeActor>>,
+    node: &NodeClient,
     ctx: FetchRangeCtx,
     sources: &[i64],
     targets: &[i64],

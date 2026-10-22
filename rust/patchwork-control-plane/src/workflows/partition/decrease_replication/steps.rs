@@ -1,6 +1,4 @@
 use super::*;
-use crate::actors::node::GetNode;
-use kameo_actors::pool::Dispatch;
 
 impl Run {
     pub(super) async fn prepare(&mut self) -> Result<State> {
@@ -9,9 +7,7 @@ impl Run {
         // Fetch the hash ring. The next boundary marks the end of this partition.
         let partitions = workflow
             .partition
-            .ask(Dispatch(GetTablePartitions {
-                table_id: ctx.table_id,
-            }))
+            .get_table_partitions(ctx.table_id)
             .await?;
         let (source, next) = boundaries(&partitions, ctx.hash_start)?;
         ensure!(
@@ -62,11 +58,7 @@ impl Run {
             locks.push(
                 workflow
                     .partition
-                    .ask(Dispatch(AttemptLock {
-                        table_id: ctx.table_id,
-                        hash_start,
-                        lease_end,
-                    }))
+                    .attempt_lock(ctx.table_id, hash_start, lease_end)
                     .await?
                     .context("Partition is already locked; retry the replication change")?,
             );
@@ -74,9 +66,7 @@ impl Run {
         // Another operation may have finished while we were taking the locks.
         let current = workflow
             .partition
-            .ask(Dispatch(GetTablePartitions {
-                table_id: ctx.table_id,
-            }))
+            .get_table_partitions(ctx.table_id)
             .await?;
         ensure!(
             boundaries(&current, ctx.hash_start)? == (source, next),
@@ -105,7 +95,7 @@ impl Run {
                 obsolete.push(
                     workflow
                         .node
-                        .ask(Dispatch(GetNode { id: *id }))
+                        .get_node(*id)
                         .await?
                         .context("Replica node no longer exists")?,
                 );
@@ -144,15 +134,15 @@ impl Run {
 
         workflow
             .partition
-            .ask(Dispatch(UpdateLockedPartition {
-                data: partition::ActiveModel {
+            .update_locked_partition(
+                partition::ActiveModel {
                     table_id: Set(ctx.table_id),
                     hash_start: Set(ctx.hash_start),
                     replicas: Set(partition::ReplicaNodes(self.replicas.clone())),
                     ..Default::default()
                 },
-                locks: locks.clone(),
-            }))
+                locks.clone(),
+            )
             .await?;
         Ok(State::Cleanup)
     }

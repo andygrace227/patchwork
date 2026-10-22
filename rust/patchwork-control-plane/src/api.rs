@@ -1,5 +1,4 @@
-use crate::actors::table::GetTableCached;
-use kameo_actors::pool::{ActorPool, Dispatch};
+use crate::clients::{NodeClient, PartitionClient, TableClient};
 use std::sync::Arc;
 
 use axum::{
@@ -14,7 +13,6 @@ use kameo::actor::ActorRef;
 use serde::Deserialize;
 
 use crate::{
-    actors::{NodeActor, PartitionActor, TableActor},
     auth::{Auth, Principal},
     datamodels::table,
     dataplane_client::Client,
@@ -42,17 +40,17 @@ struct AppState {
     client: Client,
     permissions: PermissionClient,
     encryption: EncryptionClient,
-    node: ActorRef<ActorPool<NodeActor>>,
-    partition: ActorRef<ActorPool<PartitionActor>>,
-    table: ActorRef<ActorPool<TableActor>>,
+    node: NodeClient,
+    partition: PartitionClient,
+    table: TableClient,
     executor: ActorRef<LongRunningWorkflowExecutor>,
     telemetry: Arc<crate::telemetry::Timings>,
 }
 
 pub fn router(
-    node: ActorRef<ActorPool<NodeActor>>,
-    partition: ActorRef<ActorPool<PartitionActor>>,
-    table: ActorRef<ActorPool<TableActor>>,
+    node: NodeClient,
+    partition: PartitionClient,
+    table: TableClient,
     executor: ActorRef<LongRunningWorkflowExecutor>,
     auth: Auth,
 ) -> Router {
@@ -160,7 +158,7 @@ async fn authorize(
 async fn secret_key_id(state: &AppState, table_id: i64) -> Result<Option<i64>, ApiError> {
     state
         .table
-        .ask(Dispatch(GetTableCached { id: table_id }))
+        .get_table(table_id)
         .await
         .map_err(internal_error)?
         .map(|table| table.secret_key_id)
@@ -309,7 +307,7 @@ struct SplitPartitionRequest {
 async fn require_ready_table(state: &AppState, table_id: i64) -> Result<(), ApiError> {
     let table = state
         .table
-        .ask(Dispatch(GetTableCached { id: table_id }))
+        .get_table(table_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "table not found"))?;

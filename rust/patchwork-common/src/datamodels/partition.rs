@@ -2,7 +2,7 @@ use sea_orm::FromJsonQueryResult;
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "partition")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
@@ -23,7 +23,7 @@ pub struct Model {
 }
 
 /// All nodes holding this partition, with no designated primary.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, FromJsonQueryResult)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, FromJsonQueryResult)]
 pub struct ReplicaNodes(pub Vec<i64>);
 
 impl Model {

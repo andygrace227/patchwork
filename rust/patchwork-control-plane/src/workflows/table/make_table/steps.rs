@@ -1,6 +1,4 @@
 use super::*;
-use crate::actors::table::{CreateTable, UpdateTable};
-use kameo_actors::pool::Dispatch;
 
 impl Run {
     pub(super) async fn validate(&mut self) -> Result<State> {
@@ -19,10 +17,7 @@ impl Run {
             !ctx.sort_key_name.trim().is_empty(),
             "Sort key name must not be empty"
         );
-        let nodes = workflow
-            .node
-            .ask(Dispatch(GetRandomNodes { count: 3 }))
-            .await?;
+        let nodes = workflow.node.get_random_nodes(3).await?;
         ensure!(
             nodes.len() == 3,
             "Creating a table requires three distinct data nodes"
@@ -37,17 +32,15 @@ impl Run {
         // Stage 1: Create the table entry, but keep it unavailable until setup finishes.
         let table = workflow
             .table
-            .ask(Dispatch(CreateTable {
-                data: table::ActiveModel {
-                    table_name: Set(ctx.table_name.clone()),
-                    owner: Set(ctx.table_owner),
-                    partition_key_name: Set(ctx.partition_key_name.clone()),
-                    sort_key_name: Set(ctx.sort_key_name.clone()),
-                    secret_key_id: Set(ctx.secret_key_id),
-                    is_ready: Set(false),
-                    ..Default::default()
-                },
-            }))
+            .create_table(table::ActiveModel {
+                table_name: Set(ctx.table_name.clone()),
+                owner: Set(ctx.table_owner),
+                partition_key_name: Set(ctx.partition_key_name.clone()),
+                sort_key_name: Set(ctx.sort_key_name.clone()),
+                secret_key_id: Set(ctx.secret_key_id),
+                is_ready: Set(false),
+                ..Default::default()
+            })
             .await?;
         let table_id = table.table_id;
 
@@ -74,11 +67,7 @@ impl Run {
             locks.push(
                 workflow
                     .partition
-                    .ask(Dispatch(AttemptLock {
-                        table_id,
-                        hash_start: *data.hash_start.as_ref(),
-                        lease_end,
-                    }))
+                    .attempt_lock(table_id, *data.hash_start.as_ref(), lease_end)
                     .await?
                     .context("Initial partition is already locked")?,
             );
@@ -92,10 +81,7 @@ impl Run {
         for data in self.partitions.clone() {
             workflow
                 .partition
-                .ask(Dispatch(CreateLockedPartition {
-                    data,
-                    locks: locks.clone(),
-                }))
+                .create_locked_partition(data, locks.clone())
                 .await?;
         }
         // This is an empty table. There are no records to copy to the data nodes.
@@ -113,7 +99,7 @@ impl Run {
         table.is_ready = true;
         let table = workflow
             .table
-            .ask(Dispatch(UpdateTable { data: table }))
+            .update_table(table)
             .await
             .with_context(|| format!("Failed to mark table {table_id} ready"))?;
         self.created = Some(table);

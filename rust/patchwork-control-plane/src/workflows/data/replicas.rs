@@ -1,14 +1,28 @@
-use crate::actors::partition::{GetPartition, GetPartitionCached};
+use crate::clients::PartitionClient;
 use anyhow::{Context, Result, ensure};
-use kameo::actor::ActorRef;
-use kameo_actors::pool::{ActorPool, Dispatch};
 
-use crate::{actors::PartitionActor, datamodels::partition::Model};
+use crate::datamodels::partition::Model;
 
 // Resolve exact partition boundaries, not a second ownership lookup.
 // Reads use the final source; writes include each partition along the way.
 pub(super) async fn resolve(
-    actor: &ActorRef<ActorPool<PartitionActor>>,
+    actor: &PartitionClient,
+    partition: Model,
+    writes: bool,
+) -> Result<Vec<i64>> {
+    resolve_inner(actor, partition, writes, false).await
+}
+
+pub(super) async fn resolve_cached(
+    actor: &PartitionClient,
+    partition: Model,
+    writes: bool,
+) -> Result<Vec<i64>> {
+    resolve_inner(actor, partition, writes, true).await
+}
+
+async fn resolve_inner(
+    actor: &PartitionClient,
     mut partition: Model,
     writes: bool,
     cached: bool,
@@ -33,9 +47,9 @@ pub(super) async fn resolve(
         };
         let id = (partition.table_id, hash_start);
         partition = if cached {
-            actor.ask(Dispatch(GetPartitionCached { id })).await?
+            actor.get_partition_cached(id).await?
         } else {
-            actor.ask(Dispatch(GetPartition { id })).await?
+            actor.get_partition(id).await?
         }
         .context("Forwarded partition no longer exists")?;
     }

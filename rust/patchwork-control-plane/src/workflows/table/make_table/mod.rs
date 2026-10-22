@@ -1,16 +1,9 @@
+use crate::clients::{NodeClient, PartitionClient, TableClient};
 use crate::workflows::stages::{unlock, workflow_steps};
 use anyhow::{Context, Result, ensure};
-use kameo::actor::ActorRef;
-use kameo_actors::pool::ActorPool;
 use sea_orm::ActiveValue::Set;
 
-use crate::{
-    actors::{
-        NodeActor, PartitionActor, TableActor, node::GetRandomNodes, parition_lock::AttemptLock,
-        partition::CreateLockedPartition,
-    },
-    datamodels::{partition, table},
-};
+use crate::datamodels::{partition, table};
 
 #[derive(Clone)]
 pub struct MakeTableContext {
@@ -23,9 +16,9 @@ pub struct MakeTableContext {
 
 #[derive(Clone)]
 pub struct MakeTable {
-    pub node: ActorRef<ActorPool<NodeActor>>,
-    pub partition: ActorRef<ActorPool<PartitionActor>>,
-    pub table: ActorRef<ActorPool<TableActor>>,
+    pub node: NodeClient,
+    pub partition: PartitionClient,
+    pub table: TableClient,
 }
 
 // Divide the full signed 64-bit ring into thirds without overflowing i64.

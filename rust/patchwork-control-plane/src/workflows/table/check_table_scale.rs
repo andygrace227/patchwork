@@ -1,13 +1,11 @@
-use crate::actors::node::GetNode;
+use crate::clients::{NodeClient, PartitionClient, TableClient};
 use crate::workflows::stages::workflow_steps;
-use kameo_actors::pool::{ActorPool, Dispatch};
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use kameo::actor::ActorRef;
 
 use crate::{
-    actors::{NodeActor, PartitionActor, TableActor, partition::GetTablePartitions},
     dataplane_client::{AccessStatistics, Client},
     workflows::executor::LongRunningWorkflowExecutor,
 };
@@ -25,9 +23,9 @@ pub struct CheckTableScaleContext {
 #[derive(Clone)]
 pub struct CheckTableScale {
     pub client: Client,
-    pub node: ActorRef<ActorPool<NodeActor>>,
-    pub partition: ActorRef<ActorPool<PartitionActor>>,
-    pub table: ActorRef<ActorPool<TableActor>>,
+    pub node: NodeClient,
+    pub partition: PartitionClient,
+    pub table: TableClient,
     pub orchestrator: ActorRef<LongRunningWorkflowExecutor>,
 }
 
@@ -68,9 +66,7 @@ impl ScaleCheck {
         let partitions = self
             .workflow
             .partition
-            .ask(Dispatch(GetTablePartitions {
-                table_id: self.ctx.table_id,
-            }))
+            .get_table_partitions(self.ctx.table_id)
             .await?;
 
         self.partitions = partitions;
@@ -91,7 +87,7 @@ impl ScaleCheck {
             let node = self
                 .workflow
                 .node
-                .ask(Dispatch(GetNode { id: node }))
+                .get_node(node)
                 .await?
                 .context("Replica node no longer exists; table cleanup is incomplete")?;
             let telemetry = self

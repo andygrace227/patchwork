@@ -1,20 +1,11 @@
 use super::copy_range::copy_range;
+use crate::clients::{NodeClient, PartitionClient};
 use crate::workflows::data::fetch_range::FetchRangeCtx;
 use crate::workflows::stages::{unlock, workflow_steps};
 use anyhow::{Context, Result, ensure};
-use kameo::actor::ActorRef;
-use kameo_actors::pool::ActorPool;
 use sea_orm::ActiveValue::Set;
 
-use crate::{
-    actors::{
-        NodeActor, PartitionActor,
-        parition_lock::AttemptLock,
-        partition::{GetTablePartitionsUncached as GetTablePartitions, UpdateLockedPartition},
-    },
-    datamodels::partition,
-    dataplane_client::Client,
-};
+use crate::{datamodels::partition, dataplane_client::Client};
 
 #[derive(Clone)]
 pub struct DecreaseReplicationContext {
@@ -27,8 +18,8 @@ pub struct DecreaseReplicationContext {
 #[derive(Clone)]
 pub struct DecreaseReplication {
     pub client: Client,
-    pub node: ActorRef<ActorPool<NodeActor>>,
-    pub partition: ActorRef<ActorPool<PartitionActor>>,
+    pub node: NodeClient,
+    pub partition: PartitionClient,
 }
 
 mod steps;
