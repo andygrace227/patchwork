@@ -5,5 +5,5 @@ pub mod clients;
 pub mod encryption_client;
 pub mod permission_client;
 pub mod scale;
-pub mod telemetry;
 pub mod workflows;
+pub mod telemetry;
