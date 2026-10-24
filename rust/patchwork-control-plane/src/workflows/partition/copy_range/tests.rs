@@ -3,7 +3,6 @@ use crate::actors::node::CreateNode;
 use crate::{datamodels::node, dataplane_client::Client};
 use kameo::actor::Spawn;
 use kameo_actors::pool::{ActorPool, Dispatch};
-use patchwork_data_plane::{grpc, write_shard::WriteShard};
 use sea_orm::{ActiveValue::Set, ConnectionTrait, Database, Schema};
 
 #[tokio::test]
@@ -24,29 +23,30 @@ async fn copy_reads_all_sources_preserves_deletes_and_newer_destination_writes()
     let mut urls = Vec::new();
     let mut ids = Vec::new();
     for i in 0..4 {
-        let shard = patchwork_data_plane::initialize::shard(
-            dir.path()
-                .join(format!("{i}.sqlite"))
-                .to_str()
-                .unwrap()
-                .into(),
+        let shard_path = dir.path().join(format!("{i}.sqlite"));
+        let shard_stats = patchwork_data_plane::telemetry::AccessStatsActor::spawn(
+            patchwork_data_plane::telemetry::AccessStatsActor::new(
+                shard_path.with_extension("stats.sqlite"),
+            )
+            .await
+            .unwrap(),
+        );
+        let shard_wal = shard_path.with_extension("wal");
+        let shard = patchwork_data_plane::service::Service::new(
+            &shard_path,
+            &shard_wal,
+            shard_stats.clone(),
+            2,
         )
         .await
         .unwrap();
-        let shard_readers = shard.read_pool(2).unwrap();
-        let shard = WriteShard::spawn(shard);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let app = grpc::router(
-            shard.clone(),
-            shard_readers.clone(),
-            &dir.path().join(format!("{i}.wal")),
-        )
-        .unwrap();
+        let app = tonic::service::Routes::new(shard.server()).into_axum_router();
         servers.push(tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap()
         }));
-        shards.push((shard, shard_readers));
+        shards.push((shard, shard_stats));
         ids.push(
             nodes
                 .ask(Dispatch(CreateNode {
@@ -148,11 +148,10 @@ async fn copy_reads_all_sources_preserves_deletes_and_newer_destination_writes()
         server.abort();
         let _ = server.await;
     }
-    for (shard, shard_readers) in shards {
-        shard_readers.stop_gracefully().await.unwrap();
-        shard_readers.wait_for_shutdown().await;
-        shard.stop_gracefully().await.unwrap();
-        shard.wait_for_shutdown().await;
+    for (shard, stats) in shards {
+        shard.shutdown().await.unwrap();
+        stats.stop_gracefully().await.unwrap();
+        stats.wait_for_shutdown().await;
     }
     nodes.stop_gracefully().await.unwrap();
     nodes.wait_for_shutdown().await;

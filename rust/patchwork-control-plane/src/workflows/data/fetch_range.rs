@@ -59,11 +59,19 @@ impl FetchRange {
             let upper_bound = partitions.get(next).map_or(ctx.upper_bound, |partition| {
                 partition.hash_start.min(ctx.upper_bound)
             });
-            let replicas = time(
-                "replica_resolution",
-                super::replicas::resolve(&self.partition, partition.clone(), false),
-            )
-            .await?;
+            let replica_timing = measure("replica_resolution");
+            // During a split, reads use the source until copying finishes.
+            let replicas = if let Some(hash_start) = partition.forward_to {
+                let source = self
+                    .partition
+                    .get_partition((partition.table_id, hash_start))
+                    .await?
+                    .context("Forwarded partition no longer exists")?;
+                source.replicas.0
+            } else {
+                partition.replicas.0.clone()
+            };
+            drop(replica_timing);
             let replica = *replicas
                 .choose(&mut rand::rng())
                 .context("Partition has no replicas")?;

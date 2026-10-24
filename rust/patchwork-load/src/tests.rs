@@ -3,6 +3,8 @@ use axum::{
     Router,
     http::{HeaderMap, Method, StatusCode},
 };
+use serde_json::Value;
+use std::time::Duration;
 
 #[test]
 fn validates_inputs_and_preserves_extreme_keys() {
@@ -134,4 +136,19 @@ async fn cancellation_and_seed_failure_drain_in_flight_requests() {
         stop.await.unwrap();
     }
     server.abort();
+}
+
+mod grpc;
+
+#[test]
+fn dividing_rate_and_workers_preserves_totals_and_remainders() {
+    for loops in 1..=16 {
+        for total in [1, 5, 7, 501, 100_003] {
+            let parts: Vec<_> = (0..loops)
+                .map(|index| crate::runner::share(total, index, loops))
+                .collect();
+            assert_eq!(parts.iter().sum::<u64>(), total);
+            assert!(parts.iter().max().unwrap() - parts.iter().min().unwrap() <= 1);
+        }
+    }
 }

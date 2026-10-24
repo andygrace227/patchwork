@@ -1,101 +1,45 @@
-use anyhow::{Context, Result};
-use axum::serve::ListenerExt;
+use anyhow::Result;
 use kameo::actor::Spawn;
-use patchwork_data_plane::{
-    grpc, initialize,
-    replica_writer::ReplicaWriter,
-    telemetry::{
-        AccessStatsActor,
-        access_stats_actor::{FLUSH_INTERVAL, Flush, RETENTION},
-    },
-    write_handler::WriteHandler,
-    write_shard::WriteShard,
-};
+use patchwork_data_plane::{config::Config, service::Service, telemetry::AccessStatsActor};
+use tonic::transport::Server;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    match dotenvy::dotenv() {
-        Ok(_) => {}
-        Err(dotenvy::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("Could not load .env"),
-    }
-    let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into());
-    let shard_path =
-        std::env::var("SHARD_PATH").context("Set SHARD_PATH in .env or the environment")?;
-    let pool_size = std::env::var("READ_SHARD_POOL_SIZE")
-        .unwrap_or_else(|_| "4".into())
-        .parse::<usize>()
-        .context("READ_SHARD_POOL_SIZE must be a positive integer")?;
-    let stats_path = std::env::var("ACCESS_STATS_PATH")
-        .unwrap_or_else(|_| format!("{shard_path}.access-stats.sqlite"));
-    let flush_interval = std::env::var("ACCESS_STATS_FLUSH_SECONDS")
-        .unwrap_or_else(|_| FLUSH_INTERVAL.as_secs().to_string())
-        .parse::<u64>()
-        .context("ACCESS_STATS_FLUSH_SECONDS must be a positive integer")?;
-    let retention = std::env::var("ACCESS_STATS_RETENTION_SECONDS")
-        .unwrap_or_else(|_| RETENTION.as_secs().to_string())
-        .parse::<u64>()
-        .context("ACCESS_STATS_RETENTION_SECONDS must be a positive integer")?;
-    let access_stats = AccessStatsActor::spawn(
+    let config = Config::from_env()?;
+    let stats = AccessStatsActor::spawn(
         AccessStatsActor::with_config(
-            stats_path,
-            std::time::Duration::from_secs(flush_interval),
-            std::time::Duration::from_secs(retention),
+            &config.stats_path,
+            config.stats_flush_interval,
+            config.stats_retention,
         )
         .await?,
     );
-    let wal_path = std::path::PathBuf::from(format!("{shard_path}.wal"));
-    let shard = initialize::shard_with_access_stats(shard_path, access_stats.clone()).await?;
-    let readers = shard.read_pool(pool_size)?;
-    let shard = WriteShard::spawn(shard);
-    let writer = ReplicaWriter::spawn(ReplicaWriter::default());
-    let handler = WriteHandler::spawn(WriteHandler::new(shard.clone(), writer.clone(), &wal_path)?);
-    handler
-        .wait_for_startup_with_result(|result| {
-            result
-                .map(|_| ())
-                .map_err(|error| anyhow::anyhow!("{error}"))
-        })
-        .await?;
-    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    eprintln!(
-        "Data plane gRPC listening on {} with {} Tokio worker threads and {} read actors",
-        listener.local_addr()?,
-        tokio::runtime::Handle::current().metrics().num_workers(),
-        pool_size,
-    );
-    let result = axum::serve(
-        listener.tap_io(|stream| {
-            if let Err(error) = stream.set_nodelay(true) {
-                eprintln!("Could not enable TCP_NODELAY: {error}");
-            }
-        }),
-        grpc::router_with_handler(shard.clone(), readers.clone(), handler.clone()),
+    let service = Service::new(
+        &config.shard_path,
+        &config.wal_path,
+        stats.clone(),
+        config.read_connections,
     )
-    .with_graceful_shutdown(async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
-    .await;
-    handler.stop_gracefully().await?;
-    handler
+    .await?;
+    eprintln!(
+        "Data plane gRPC listening on {} with {} read connections",
+        config.bind_addr, config.read_connections
+    );
+    let result = Server::builder()
+        .tcp_nodelay(true)
+        .serve_with_shutdown(config.bind_addr, service.server(), async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await;
+    service.shutdown().await?;
+    stats.stop_gracefully().await?;
+    stats
         .wait_for_shutdown_with_result(|result| {
             result
                 .map(|_| ())
                 .map_err(|error| anyhow::anyhow!("{error}"))
         })
         .await?;
-    writer.stop_gracefully().await?;
-    writer.wait_for_shutdown().await;
-    readers.stop_gracefully().await?;
-    readers.wait_for_shutdown().await;
-    shard.stop_gracefully().await?;
-    shard.wait_for_shutdown().await;
-    access_stats
-        .ask(Flush {})
-        .await
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
-    access_stats.stop_gracefully().await?;
-    access_stats.wait_for_shutdown().await;
     result?;
     Ok(())
 }

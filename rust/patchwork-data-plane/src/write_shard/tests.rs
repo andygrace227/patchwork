@@ -7,11 +7,10 @@ use serde_json::json;
 #[tokio::test]
 async fn grouped_writes_match_ordered_single_writes_across_deletes_and_ties() {
     let dir = tempfile::tempdir().unwrap();
-    let mut grouped =
-        crate::initialize::shard(dir.path().join("grouped.sqlite").display().to_string())
-            .await
-            .unwrap();
-    let single = crate::initialize::shard(dir.path().join("single.sqlite").display().to_string())
+    let mut grouped = crate::utils::shard(dir.path().join("grouped.sqlite").display().to_string())
+        .await
+        .unwrap();
+    let single = crate::utils::shard(dir.path().join("single.sqlite").display().to_string())
         .await
         .unwrap();
     let mut mutations = Vec::new();
@@ -66,7 +65,7 @@ async fn grouped_writes_match_ordered_single_writes_across_deletes_and_ties() {
 #[tokio::test]
 async fn failure_in_a_later_sql_group_rolls_back_the_whole_batch() {
     let dir = tempfile::tempdir().unwrap();
-    let mut shard = crate::initialize::shard(dir.path().join("shard.sqlite").display().to_string())
+    let mut shard = crate::utils::shard(dir.path().join("shard.sqlite").display().to_string())
         .await
         .unwrap();
     shard.db.execute_unprepared("CREATE TRIGGER reject_later BEFORE INSERT ON data WHEN NEW.secondary_key = 257 BEGIN SELECT RAISE(ABORT, 'reject later group'); END").await.unwrap();
@@ -131,7 +130,7 @@ async fn auto_vacuum_handles_new_and_existing_shards() {
                 .unwrap();
             db.close().await.unwrap();
         }
-        let mut shard = crate::initialize::shard(path.clone()).await.unwrap();
+        let mut shard = crate::utils::shard(path.clone()).await.unwrap();
         assert_eq!(pragma(&shard.db, "auto_vacuum").await, 1);
         if existing {
             let row = shard
@@ -151,7 +150,7 @@ async fn auto_vacuum_handles_new_and_existing_shards() {
         assert!(pragma(&shard.db, "page_count").await < before);
         assert_eq!(pragma(&shard.db, "freelist_count").await, 0);
         shard.db.close().await.unwrap();
-        let reopened = crate::initialize::shard(path).await.unwrap();
+        let reopened = crate::utils::shard(path).await.unwrap();
         assert_eq!(pragma(&reopened.db, "auto_vacuum").await, 1);
         reopened.db.close().await.unwrap();
     }

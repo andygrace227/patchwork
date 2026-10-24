@@ -1,54 +1,49 @@
-use std::{path::Path, time::Duration};
-
 use kameo::actor::{ActorRef, Spawn};
 use patchwork_common::dataplane_client::Client;
-use patchwork_data_plane::{
-    grpc, initialize,
-    read_shard::ReadShardPool,
-    replica_writer::ReplicaWriter,
-    telemetry::AccessStatsActor,
-    write_handler::{FlushToShard, WriteHandler},
-    write_shard::WriteShard,
-};
+use patchwork_data_plane::{service::Service, telemetry::AccessStatsActor};
+use std::{path::Path, time::Duration};
+use tokio_stream::wrappers::TcpListenerStream;
 
 pub struct Node {
     pub url: String,
-    pub app: axum::Router,
     pub client: Client,
-    handler: ActorRef<WriteHandler>,
-    writer: ActorRef<ReplicaWriter>,
-    readers: ReadShardPool,
-    shard: ActorRef<WriteShard>,
+    #[allow(dead_code)]
+    pub app: patchwork_common::grpc::proto::data_plane_server::DataPlaneServer<Service>,
+    service: Service,
+    stats: ActorRef<AccessStatsActor>,
+    owns_stats: bool,
     server: tokio::task::JoinHandle<()>,
 }
 
 impl Node {
     pub async fn start(path: &Path, wal: &Path, stats: Option<ActorRef<AccessStatsActor>>) -> Self {
-        let path = path.display().to_string();
-        let shard = match stats {
-            Some(stats) => initialize::shard_with_access_stats(path, stats)
-                .await
-                .unwrap(),
-            None => initialize::shard(path).await.unwrap(),
+        let owns_stats = stats.is_none();
+        let stats = match stats {
+            Some(stats) => stats,
+            None => AccessStatsActor::spawn(
+                AccessStatsActor::new(format!("{}.access-stats.sqlite", path.display()))
+                    .await
+                    .unwrap(),
+            ),
         };
-        let readers = shard.read_pool(2).unwrap();
-        let shard = WriteShard::spawn(shard);
-        let writer = ReplicaWriter::spawn(ReplicaWriter::default());
-        let handler =
-            WriteHandler::spawn(WriteHandler::new(shard.clone(), writer.clone(), wal).unwrap());
-        let app = grpc::router_with_handler(shard.clone(), readers.clone(), handler.clone());
+        let service = Service::new(path, wal, stats.clone(), 2).await.unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let served = app.clone();
-        let server = tokio::spawn(async move { axum::serve(listener, served).await.unwrap() });
+        let served = service.server();
+        let app = service.server();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .serve_with_incoming(served, TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
         Self {
             url,
-            app,
             client: Client::new(),
-            handler,
-            writer,
-            readers,
-            shard,
+            app,
+            service,
+            stats,
+            owns_stats,
             server,
         }
     }
@@ -56,7 +51,6 @@ impl Node {
     pub async fn flush(&self) {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                self.handler.ask(FlushToShard {}).await.unwrap();
                 if self.client.get_write_backlog(&self.url).await.unwrap()["total"] == 0 {
                     break;
                 }
@@ -71,17 +65,14 @@ impl Node {
         self.flush().await;
         self.server.abort();
         let _ = self.server.await;
-        self.handler.stop_gracefully().await.unwrap();
-        self.handler
-            .wait_for_shutdown_with_result(|result| {
-                result.unwrap();
-            })
-            .await;
-        self.writer.stop_gracefully().await.unwrap();
-        self.writer.wait_for_shutdown().await;
-        self.readers.stop_gracefully().await.unwrap();
-        self.readers.wait_for_shutdown().await;
-        self.shard.stop_gracefully().await.unwrap();
-        self.shard.wait_for_shutdown().await;
+        self.service.shutdown().await.unwrap();
+        if self.owns_stats {
+            self.stats.stop_gracefully().await.unwrap();
+            self.stats
+                .wait_for_shutdown_with_result(|result| {
+                    result.unwrap();
+                })
+                .await;
+        }
     }
 }

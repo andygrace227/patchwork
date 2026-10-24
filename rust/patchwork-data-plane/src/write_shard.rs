@@ -1,10 +1,10 @@
 use anyhow::Result;
 use kameo::{
     Actor,
-    actor::{ActorRef, Spawn, WeakActorRef},
+    actor::{ActorRef, WeakActorRef},
+    error::ActorStopReason,
     messages,
 };
-use kameo_actors::pool::ActorPool;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, QueryFilter,
     QueryTrait, Statement, TransactionTrait, Value,
@@ -17,12 +17,11 @@ use wal_db::Lsn;
 use crate::{
     data,
     mutation::Mutation,
-    read_shard::{ReadShard, ReadShardPool},
     telemetry::{
-        self, AccessStatsActor,
+        self, AccessStatsActor, QueuedAccess,
         access_stats_actor::{
             GetTelemetry as GetAccessTelemetry, GetTelemetryForTable as GetAccessTelemetryForTable,
-            TrackAccess,
+            RecordBatch,
         },
     },
     write_handler::{BatchFinished, WriteHandler},
@@ -31,12 +30,25 @@ use crate::{
 pub const SQL_WRITE_BATCH_SIZE: usize = 256;
 
 /// Owns the single write connection for one shard.
-#[derive(Actor)]
 pub struct WriteShard {
     // SeaORM uses SQLx's per-connection prepared statement cache for data queries.
     db: DatabaseConnection,
     path: std::path::PathBuf,
     access_stats: ActorRef<AccessStatsActor>,
+}
+
+impl Actor for WriteShard {
+    type Args = Self;
+    type Error = anyhow::Error;
+
+    async fn on_start(state: Self, _: ActorRef<Self>) -> Result<Self> {
+        Ok(state)
+    }
+
+    async fn on_stop(&mut self, _: WeakActorRef<Self>, _: ActorStopReason) -> Result<()> {
+        self.db.clone().close().await?;
+        Ok(())
+    }
 }
 
 impl WriteShard {
@@ -192,15 +204,6 @@ impl WriteShard {
             access_stats,
         }
     }
-
-    pub fn read_pool(&self, size: usize) -> Result<ReadShardPool> {
-        anyhow::ensure!(size > 0, "Read shard pool must have at least one actor");
-        let path = self.path.clone();
-        let stats = self.access_stats.clone();
-        Ok(ActorPool::spawn(ActorPool::new(size, move || {
-            ReadShard::spawn((path.clone(), stats.clone()))
-        })))
-    }
 }
 
 #[messages]
@@ -220,20 +223,26 @@ impl WriteShard {
             }
         }
         txn.commit().await?;
-        for mutation in mutations.iter() {
-            if let Mutation::Write(record) = mutation {
-                if let Err(error) = self
-                    .access_stats
-                    .tell(TrackAccess {
-                        table_id: record.table_id,
-                        partition_key: record.partition_key,
-                        is_write: true,
-                        partition_id: record.partition_id.clone(),
-                    })
-                    .await
-                {
-                    eprintln!("Could not record write statistics: {error}");
-                }
+        let time_ms = telemetry::now_ms();
+        let accesses = mutations
+            .iter()
+            .filter_map(|mutation| {
+                let Mutation::Write(record) = mutation else {
+                    return None;
+                };
+                let partition_id = record.partition_id.as_ref().filter(|id| !id.is_empty())?;
+                Some(QueuedAccess {
+                    table_id: record.table_id,
+                    partition_key: record.partition_key,
+                    is_write: true,
+                    partition_id: partition_id.clone(),
+                    time_ms,
+                })
+            })
+            .collect::<Vec<_>>();
+        if !accesses.is_empty() {
+            if let Err(error) = self.access_stats.tell(RecordBatch { accesses }).await {
+                eprintln!("Could not queue write statistics: {error}");
             }
         }
         Ok(())
@@ -324,18 +333,6 @@ impl WriteShard {
                 None,
             )?)
             .await?;
-        if let Err(error) = self
-            .access_stats
-            .tell(TrackAccess {
-                table_id,
-                partition_key,
-                is_write: true,
-                partition_id: None,
-            })
-            .await
-        {
-            eprintln!("Could not record write statistics: {error}");
-        }
         Ok(result.rows_affected())
     }
 

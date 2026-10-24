@@ -1,6 +1,5 @@
 use kameo::actor::Spawn;
 use patchwork_control_plane::dataplane_client::Client;
-use patchwork_data_plane::{grpc, write_shard::WriteShard};
 use serde_json::json;
 
 #[tokio::test]
@@ -13,24 +12,26 @@ async fn client_calls_all_shard_operations() {
 
     let client = Client::new();
     let dir = tempfile::tempdir().unwrap();
-    let shard = patchwork_data_plane::initialize::shard(
-        dir.path().join("shard.sqlite").to_str().unwrap().into(),
+    let shard_path = dir.path().join("shard.sqlite");
+    let shard_stats = patchwork_data_plane::telemetry::AccessStatsActor::spawn(
+        patchwork_data_plane::telemetry::AccessStatsActor::new(
+            shard_path.with_extension("stats.sqlite"),
+        )
+        .await
+        .unwrap(),
+    );
+    let shard_wal = shard_path.with_extension("wal");
+    let shard = patchwork_data_plane::service::Service::new(
+        &shard_path,
+        &shard_wal,
+        shard_stats.clone(),
+        2,
     )
     .await
     .unwrap();
-    let shard_readers = shard.read_pool(2).unwrap();
-    let shard = WriteShard::spawn(shard);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
-    let app = patchwork_data_plane::grpc::router_with_writer(
-        shard.clone(),
-        shard_readers.clone(),
-        patchwork_data_plane::replica_writer::ReplicaWriter::spawn(
-            patchwork_data_plane::replica_writer::ReplicaWriter::default(),
-        ),
-        &dir.path().join("wal"),
-    )
-    .unwrap();
+    let app = tonic::service::Routes::new(shard.server()).into_axum_router();
     let connections = Arc::new(AtomicUsize::new(0));
     let accepted = connections.clone();
     let server = tokio::spawn(async move {
@@ -179,31 +180,35 @@ async fn client_calls_all_shard_operations() {
     assert_eq!(connections.load(Ordering::SeqCst), 2);
     server.abort();
     let _ = server.await;
-    shard_readers.stop_gracefully().await.unwrap();
-    shard_readers.wait_for_shutdown().await;
-    shard.stop_gracefully().await.unwrap();
-    shard.wait_for_shutdown().await;
+    shard.shutdown().await.unwrap();
+    shard_stats.stop_gracefully().await.unwrap();
+    shard_stats.wait_for_shutdown().await;
 }
 
 #[tokio::test]
 async fn range_totals_are_scoped_and_measure_payload_bytes() {
     let client = Client::new();
     let dir = tempfile::tempdir().unwrap();
-    let shard = patchwork_data_plane::initialize::shard(
-        dir.path().join("totals.sqlite").to_str().unwrap().into(),
+    let shard_path = dir.path().join("totals.sqlite");
+    let shard_stats = patchwork_data_plane::telemetry::AccessStatsActor::spawn(
+        patchwork_data_plane::telemetry::AccessStatsActor::new(
+            shard_path.with_extension("stats.sqlite"),
+        )
+        .await
+        .unwrap(),
+    );
+    let shard_wal = shard_path.with_extension("wal");
+    let shard = patchwork_data_plane::service::Service::new(
+        &shard_path,
+        &shard_wal,
+        shard_stats.clone(),
+        2,
     )
     .await
     .unwrap();
-    let shard_readers = shard.read_pool(2).unwrap();
-    let shard = WriteShard::spawn(shard);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let app = grpc::router(
-        shard.clone(),
-        shard_readers.clone(),
-        &dir.path().join("wal"),
-    )
-    .unwrap();
+    let app = tonic::service::Routes::new(shard.server()).into_axum_router();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let payload = json!({"text": "café"});
     for (table, key, secondary) in [(1, 10, 1), (1, 10, 2), (1, 20, 1), (2, 10, 1)] {
@@ -260,10 +265,9 @@ async fn range_totals_are_scoped_and_measure_payload_bytes() {
     );
     server.abort();
     let _ = server.await;
-    shard_readers.stop_gracefully().await.unwrap();
-    shard_readers.wait_for_shutdown().await;
-    shard.stop_gracefully().await.unwrap();
-    shard.wait_for_shutdown().await;
+    shard.shutdown().await.unwrap();
+    shard_stats.stop_gracefully().await.unwrap();
+    shard_stats.wait_for_shutdown().await;
 }
 
 #[tokio::test]
@@ -274,29 +278,30 @@ async fn put_with_replicas_writes_all_and_reports_partial_failure() {
     let mut servers = Vec::new();
     let mut urls = Vec::new();
     for index in 0..3 {
-        let shard = patchwork_data_plane::initialize::shard(
-            dir.path()
-                .join(format!("{index}.sqlite"))
-                .to_str()
-                .unwrap()
-                .into(),
+        let shard_path = dir.path().join(format!("{index}.sqlite"));
+        let shard_stats = patchwork_data_plane::telemetry::AccessStatsActor::spawn(
+            patchwork_data_plane::telemetry::AccessStatsActor::new(
+                shard_path.with_extension("stats.sqlite"),
+            )
+            .await
+            .unwrap(),
+        );
+        let shard_wal = shard_path.with_extension("wal");
+        let shard = patchwork_data_plane::service::Service::new(
+            &shard_path,
+            &shard_wal,
+            shard_stats.clone(),
+            2,
         )
         .await
         .unwrap();
-        let shard_readers = shard.read_pool(2).unwrap();
-        let shard = WriteShard::spawn(shard);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         urls.push(format!("http://{}", listener.local_addr().unwrap()));
-        let app = grpc::router(
-            shard.clone(),
-            shard_readers.clone(),
-            &dir.path().join(format!("{index}.wal")),
-        )
-        .unwrap();
+        let app = tonic::service::Routes::new(shard.server()).into_axum_router();
         servers.push(tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap()
         }));
-        shards.push((shard, shard_readers));
+        shards.push((shard, shard_stats));
     }
     let payload = json!({"data": "payload", "replicas": "also payload"});
     let replicas = vec![urls[1].clone(), format!("{}/", urls[1]), urls[2].clone()];
@@ -388,17 +393,15 @@ async fn put_with_replicas_writes_all_and_reports_partial_failure() {
         server.abort();
         let _ = server.await;
     }
-    for (shard, shard_readers) in shards {
-        shard_readers.stop_gracefully().await.unwrap();
-        shard_readers.wait_for_shutdown().await;
-        shard.stop_gracefully().await.unwrap();
-        shard.wait_for_shutdown().await;
+    for (shard, stats) in shards {
+        shard.shutdown().await.unwrap();
+        stats.stop_gracefully().await.unwrap();
+        stats.wait_for_shutdown().await;
     }
 }
 
 #[tokio::test]
 async fn inconsistent_writes_ack_early_and_consistent_writes_wait_for_neighbors() {
-    use patchwork_data_plane::{replica_writer::ReplicaWriter, write_handler::WriteHandler};
     use std::{sync::Arc, time::Duration};
     use tokio::sync::Semaphore;
 
@@ -406,49 +409,61 @@ async fn inconsistent_writes_ack_early_and_consistent_writes_wait_for_neighbors(
     let entered = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));
     let dir = tempfile::tempdir().unwrap();
-    let remote = patchwork_data_plane::initialize::shard(
-        dir.path().join("remote.sqlite").to_str().unwrap().into(),
+    let remote_path = dir.path().join("remote.sqlite");
+    let remote_stats = patchwork_data_plane::telemetry::AccessStatsActor::spawn(
+        patchwork_data_plane::telemetry::AccessStatsActor::new(
+            remote_path.with_extension("stats.sqlite"),
+        )
+        .await
+        .unwrap(),
+    );
+    let remote_wal = remote_path.with_extension("wal");
+    let remote = patchwork_data_plane::service::Service::new(
+        &remote_path,
+        &remote_wal,
+        remote_stats.clone(),
+        2,
     )
     .await
     .unwrap();
-    let remote_readers = remote.read_pool(2).unwrap();
-    let remote = WriteShard::spawn(remote);
-    let replica = grpc::router(
-        remote.clone(),
-        remote_readers.clone(),
-        &dir.path().join("remote-wal"),
-    )
-    .unwrap()
-    .layer(axum::middleware::from_fn({
-        let entered = entered.clone();
-        let release = release.clone();
-        move |request: axum::extract::Request, next: axum::middleware::Next| {
+    let replica = tonic::service::Routes::new(remote.server())
+        .into_axum_router()
+        .layer(axum::middleware::from_fn({
             let entered = entered.clone();
             let release = release.clone();
-            async move {
-                if request.uri().path() == "/patchwork.dataplane.DataPlane/WriteRecord" {
-                    entered.add_permits(1);
-                    release.acquire().await.unwrap().forget();
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let entered = entered.clone();
+                let release = release.clone();
+                async move {
+                    if request.uri().path() == "/patchwork.dataplane.DataPlane/WriteRecord" {
+                        entered.add_permits(1);
+                        release.acquire().await.unwrap().forget();
+                    }
+                    next.run(request).await
                 }
-                next.run(request).await
             }
-        }
-    }));
+        }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let replica_url = format!("http://{}", listener.local_addr().unwrap());
     let replica_server = tokio::spawn(async move { axum::serve(listener, replica).await.unwrap() });
-    let shard = patchwork_data_plane::initialize::shard(
-        dir.path().join("local.sqlite").to_str().unwrap().into(),
+    let shard_path = dir.path().join("local.sqlite");
+    let shard_stats = patchwork_data_plane::telemetry::AccessStatsActor::spawn(
+        patchwork_data_plane::telemetry::AccessStatsActor::new(
+            shard_path.with_extension("stats.sqlite"),
+        )
+        .await
+        .unwrap(),
+    );
+    let shard_wal = shard_path.with_extension("wal");
+    let shard = patchwork_data_plane::service::Service::new(
+        &shard_path,
+        &shard_wal,
+        shard_stats.clone(),
+        2,
     )
     .await
     .unwrap();
-    let readers = shard.read_pool(2).unwrap();
-    let shard = WriteShard::spawn(shard);
-    let writer = ReplicaWriter::spawn(ReplicaWriter::default());
-    let handler = WriteHandler::spawn(
-        WriteHandler::new(shard.clone(), writer.clone(), &dir.path().join("local-wal")).unwrap(),
-    );
-    let app = grpc::router_with_handler(shard.clone(), readers.clone(), handler.clone());
+    let app = tonic::service::Routes::new(shard.server()).into_axum_router();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -531,14 +546,10 @@ async fn inconsistent_writes_ack_early_and_consistent_writes_wait_for_neighbors(
             .code(),
         tonic::Code::InvalidArgument
     );
-    handler.stop_gracefully().await.unwrap();
-    handler.wait_for_shutdown().await;
-    writer.stop_gracefully().await.unwrap();
-    writer.wait_for_shutdown().await;
     server.abort();
     replica_server.abort();
-    readers.stop_gracefully().await.unwrap();
-    remote_readers.stop_gracefully().await.unwrap();
-    shard.stop_gracefully().await.unwrap();
-    remote.stop_gracefully().await.unwrap();
+    shard.shutdown().await.unwrap();
+    remote.shutdown().await.unwrap();
+    shard_stats.stop_gracefully().await.unwrap();
+    remote_stats.stop_gracefully().await.unwrap();
 }

@@ -38,11 +38,20 @@ impl GetOneInconsistent {
             .context("Something is very wrong with partition creation")?;
         drop(partition_timing);
 
-        let mut replicas = time(
-            "replica_resolution",
-            super::replicas::resolve_cached(&self.partition, partition, false),
-        )
-        .await?;
+        let replica_timing = measure("replica_resolution");
+        // During a split, reads use the source until copying finishes.
+        let mut replicas = if let Some(hash_start) = partition.forward_to {
+            let source = self
+                .partition
+                .get_partition_cached((partition.table_id, hash_start))
+                .await?
+                .context("Forwarded partition no longer exists")?;
+            source.replicas.0
+        } else {
+            partition.replicas.0
+        };
+        ensure!(!replicas.is_empty(), "Partition has no replicas");
+        drop(replica_timing);
         replicas.shuffle(&mut rand::rng());
         for replica in replicas {
             let Ok(Some(node)) = time("replica_lookup", self.node.get_node(replica)).await else {

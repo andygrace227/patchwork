@@ -5,8 +5,9 @@ use ringbuffer::{AllocRingBuffer, RingBuffer};
 
 use super::Access;
 
-pub const BUFFER_SIZE: usize = 4096;
+pub const BUFFER_SIZE: usize = 65_536;
 
+#[derive(Clone)]
 pub struct TelemetryCache {
     bins: BTreeMap<(i64, String), AllocRingBuffer<Access>>,
     start: Instant,
@@ -28,6 +29,28 @@ impl TelemetryCache {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.bins.is_empty()
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        if other.start < self.start {
+            self.start = other.start;
+            self.start_ms = other.start_ms;
+        }
+        for (key, incoming) in other.bins {
+            let Some(existing) = self.bins.get_mut(&key) else {
+                self.bins.insert(key, incoming);
+                continue;
+            };
+            // Workers report at different times. Keep the newest samples in time order.
+            let mut accesses: Vec<_> = existing.drain().chain(incoming).collect();
+            accesses.sort_unstable_by_key(|access| access.time);
+            let discard = accesses.len().saturating_sub(BUFFER_SIZE);
+            existing.extend(accesses.into_iter().skip(discard));
+        }
+    }
+
     pub fn inc(
         &mut self,
         table_id: i64,
@@ -35,16 +58,41 @@ impl TelemetryCache {
         is_write: bool,
         partition_id: Option<String>,
     ) {
+        self.inc_at(
+            table_id,
+            partition_key,
+            is_write,
+            partition_id,
+            super::now_ms(),
+        );
+    }
+
+    pub(crate) fn inc_at(
+        &mut self,
+        table_id: i64,
+        partition_key: i64,
+        is_write: bool,
+        partition_id: Option<String>,
+        time_ms: i64,
+    ) {
         let Some(partition_id) = partition_id.filter(|id| !id.is_empty()) else {
             return;
         };
+        let now = Instant::now();
+        let age =
+            std::time::Duration::from_millis(super::now_ms().saturating_sub(time_ms).max(0) as u64);
+        let time = now.checked_sub(age).unwrap_or(now);
+        if time < self.start {
+            self.start = time;
+            self.start_ms = time_ms;
+        }
         let entry = self
             .bins
             .entry((table_id, partition_id))
             .or_insert_with(|| AllocRingBuffer::new(BUFFER_SIZE));
         entry.enqueue(Access {
             partition_key,
-            time: Instant::now(),
+            time,
             is_write,
         });
     }

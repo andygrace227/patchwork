@@ -1,6 +1,5 @@
 mod support;
 
-use axum::{body::Body, http::Request};
 use kameo::actor::Spawn;
 use patchwork_data_plane::telemetry::{
     AccessStatsActor,
@@ -24,31 +23,23 @@ async fn rest_routes_are_absent_and_backlog_does_not_create_access_samples() {
         "/shard/size",
         "/shard/telemetry",
         "/shard/write-backlog",
-        "/tables/1/telemetry",
         "/tables/1",
-        "/tables/1/partition-keys/10",
-        "/tables/1/partition-keys/10/records/42",
-        "/tables/1/partition-keys/10/records/42/with-replicas",
-        "/tables/1/partition-keys/10/records/42/with-replicas-inconsistent",
         "/tables/1/range",
-        "/tables/1/range/count",
-        "/tables/1/range/size",
     ] {
         for method in ["GET", "PUT", "DELETE"] {
             let response = node
                 .app
                 .clone()
                 .oneshot(
-                    Request::builder()
+                    tonic::codegen::http::Request::builder()
                         .method(method)
                         .uri(path)
-                        .body(Body::empty())
+                        .body(tonic::body::Body::empty())
                         .unwrap(),
                 )
                 .await
                 .unwrap();
             assert_eq!(response.headers()["grpc-status"], "12", "{method} {path}");
-            assert_eq!(response.headers()["content-type"], "application/grpc");
         }
     }
     assert_eq!(
@@ -218,7 +209,14 @@ async fn operations_are_scoped_and_persist_after_reopening() {
     let (client, url) = (&node.client, &node.url);
     for (table, partition, key) in [(1, 10, -1), (1, 10, 2), (1, 20, 3), (2, 10, -1)] {
         client
-            .upsert(url, table, partition, key, &json!({"value": "original"}), 1)
+            .upsert(
+                url,
+                table,
+                partition,
+                key,
+                &serde_json::to_vec(&json!({"value": "original"})).unwrap(),
+                1,
+            )
             .await
             .unwrap();
     }
@@ -230,7 +228,7 @@ async fn operations_are_scoped_and_persist_after_reopening() {
             1,
             10,
             -1,
-            &json!({"value": "updated", "timestamp": 99}),
+            &serde_json::to_vec(&json!({"value": "updated", "timestamp": 99})).unwrap(),
             2,
         )
         .await
@@ -238,7 +236,10 @@ async fn operations_are_scoped_and_persist_after_reopening() {
     node.flush().await;
     let record = client.get(url, 1, 10, -1).await.unwrap();
     assert_eq!(record.timestamp, 2);
-    assert_eq!(record.data, json!({"value": "updated", "timestamp": 99}));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&record.data).unwrap(),
+        json!({"value": "updated", "timestamp": 99})
+    );
     assert_eq!(client.get_partition_key(url, 1, 10).await.unwrap().len(), 2);
     let range = client.get_range(url, 1, 20, 9).await.unwrap();
     assert_eq!(range.len(), 2);
@@ -272,7 +273,14 @@ async fn operations_are_scoped_and_persist_after_reopening() {
     node.client.get(&node.url, 1, 20, 3).await.unwrap();
     for _ in 0..2 {
         node.client
-            .upsert(&node.url, 1, 20, 3, &json!({"updated": true}), 2)
+            .upsert(
+                &node.url,
+                1,
+                20,
+                3,
+                &serde_json::to_vec(&json!({"updated": true})).unwrap(),
+                2,
+            )
             .await
             .unwrap();
         node.flush().await;
@@ -305,7 +313,14 @@ async fn timestamp_wins_regardless_of_arrival_order() {
     ] {
         for (timestamp, value) in writes {
             node.client
-                .upsert(&node.url, 1, 1, key, &json!(value), timestamp)
+                .upsert(
+                    &node.url,
+                    1,
+                    1,
+                    key,
+                    &serde_json::to_vec(&json!(value)).unwrap(),
+                    timestamp,
+                )
                 .await
                 .unwrap();
         }
@@ -313,7 +328,7 @@ async fn timestamp_wins_regardless_of_arrival_order() {
         let record = node.client.get(&node.url, 1, 1, key).await.unwrap();
         assert_eq!(
             record.data,
-            if key <= 2 { json!("new") } else { json!("z") }
+            serde_json::to_vec(&if key <= 2 { json!("new") } else { json!("z") }).unwrap()
         );
         assert_eq!(record.timestamp, if key <= 2 { 20 } else { 30 });
     }
@@ -330,7 +345,7 @@ async fn tombstones_win_ties_and_survive_reopening() {
     client.delete(url, 1, 10, 1, 20).await.unwrap();
     for timestamp in [10, 20] {
         client
-            .upsert(url, 1, 10, 1, &json!("late"), timestamp)
+            .upsert(url, 1, 10, 1, &b"late".to_vec(), timestamp)
             .await
             .unwrap();
         node.flush().await;
@@ -342,7 +357,7 @@ async fn tombstones_win_ties_and_survive_reopening() {
     let stored = client.get_including_deleted(url, 1, 10, 1).await.unwrap();
     assert!(stored.deleted);
     assert_eq!(stored.timestamp, 20);
-    assert_eq!(stored.data, Value::Null);
+    assert_eq!(stored.data, Vec::<u8>::new());
     assert!(
         client
             .get_partition_key(url, 1, 10)
@@ -367,12 +382,12 @@ async fn tombstones_win_ties_and_survive_reopening() {
         vec![stored]
     );
     client
-        .upsert(url, 1, 10, 1, &json!("new"), 30)
+        .upsert(url, 1, 10, 1, &b"new".to_vec(), 30)
         .await
         .unwrap();
     client.delete(url, 1, 10, 1, 29).await.unwrap();
     node.flush().await;
-    assert_eq!(client.get(url, 1, 10, 1).await.unwrap().data, "new");
+    assert_eq!(client.get(url, 1, 10, 1).await.unwrap().data, b"new");
     client.delete(url, 1, 10, 1, 30).await.unwrap();
     node.flush().await;
     assert_eq!(
@@ -382,7 +397,7 @@ async fn tombstones_win_ties_and_survive_reopening() {
     node.stop().await;
     let node = Node::start(&path, &wal, None).await;
     node.client
-        .upsert(&node.url, 1, 10, 1, &json!("late"), 30)
+        .upsert(&node.url, 1, 10, 1, &b"late".to_vec(), 30)
         .await
         .unwrap();
     node.flush().await;

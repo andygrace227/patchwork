@@ -13,10 +13,12 @@ BINARY = Path(__file__).resolve().parents[1] / "rust" / "target" / "release" / (
 
 
 class LoadGenerator:
-    def __init__(self, control_urls, directory, token=None):
+    def __init__(self, control_urls, directory, token=None, data_url=None, worker_threads=None):
         self.control_urls = control_urls
         self.directory = directory
         self.token = token
+        self.data_url = data_url
+        self.worker_threads = worker_threads
         self.lock = threading.Lock()
         self.process = self.thread = None
         self.closed = False
@@ -35,12 +37,20 @@ class LoadGenerator:
             if not BINARY.is_file():
                 raise RuntimeError("Rust load worker is missing. Restart without --no-build to build it.")
             command = [str(BINARY), "--report-dir", str(self.directory)]
-            for url in self.control_urls.values():
-                command.extend(["--control-url", url])
+            if self.data_url:
+                command.extend(["--data-url", self.data_url])
+            else:
+                for url in self.control_urls.values():
+                    command.extend(["--control-url", url])
+            environment = dict(os.environ)
+            if self.token:
+                environment["ATGS_INTERNAL_SERVICE_TOKEN"] = self.token
+            if self.worker_threads is not None:
+                environment["TOKIO_WORKER_THREADS"] = str(self.worker_threads)
             with (self.directory / "load-worker.log").open("w") as log:
                 process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                            stderr=log, text=True, bufsize=1,
-                                           env={**os.environ, "ATGS_INTERNAL_SERVICE_TOKEN": self.token} if self.token else None)
+                                           env=environment)
             try:
                 process.stdin.write(json.dumps(values) + "\n")
                 process.stdin.flush()

@@ -50,11 +50,24 @@ impl PutOneConsistent {
         let partition_id = partition.partition_id.clone();
         drop(partition_timing);
 
-        let replicas = time(
-            "replica_resolution",
-            super::replicas::resolve(&self.partition, partition, true),
-        )
-        .await?;
+        let replica_timing = measure("replica_resolution");
+        let mut replicas = partition.replicas.0;
+        ensure!(!replicas.is_empty(), "Partition has no replicas");
+        // During a split, writes go to both the new partition and its source.
+        if let Some(hash_start) = partition.forward_to {
+            let source = self
+                .partition
+                .get_partition((partition.table_id, hash_start))
+                .await?
+                .context("Forwarded partition no longer exists")?;
+            ensure!(!source.replicas.0.is_empty(), "Partition has no replicas");
+            for replica in source.replicas.0 {
+                if !replicas.contains(&replica) {
+                    replicas.push(replica);
+                }
+            }
+        }
+        drop(replica_timing);
         Self::to_replicas(
             &self.client,
             &self.node,

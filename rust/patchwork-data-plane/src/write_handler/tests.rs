@@ -68,7 +68,7 @@ async fn setup() -> (tempfile::TempDir, WriteHandler, DatabaseConnection) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("shard.sqlite");
     let shard = WriteShard::spawn(
-        crate::initialize::shard(path.to_str().unwrap().into())
+        crate::utils::shard(path.to_str().unwrap().into())
             .await
             .unwrap(),
     );
@@ -373,18 +373,20 @@ async fn full_backlog_rejects_writes_and_deletes_before_appending_to_wal() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("shard.sqlite");
-    let state = crate::initialize::shard(path.display().to_string())
-        .await
-        .unwrap();
-    let readers = state.read_pool(1).unwrap();
-    let shard = WriteShard::spawn(state);
-    let writer = ReplicaWriter::spawn(ReplicaWriter::default());
-    let handler =
-        WriteHandler::new(shard.clone(), writer.clone(), &dir.path().join("wal")).unwrap();
+    let telemetry = crate::telemetry::AccessStatsActor::spawn(
+        crate::telemetry::AccessStatsActor::new(dir.path().join("stats.sqlite"))
+            .await
+            .unwrap(),
+    );
+    let service =
+        crate::service::Service::new(&path, &dir.path().join("wal"), telemetry.clone(), 1)
+            .await
+            .unwrap();
+    let shard = service.write_shard.clone();
+    let actor = service.handler.clone();
     let db = Database::connect(format!("sqlite://{}", path.display()))
         .await
         .unwrap();
-    let actor = WriteHandler::spawn(handler);
     let _ = actor.ask(BatchState).await.unwrap();
     let (entered, ready) = oneshot::channel();
     let (release, wait) = oneshot::channel();
@@ -420,10 +422,18 @@ async fn full_backlog_rejects_writes_and_deletes_before_appending_to_wal() {
         error.status().unwrap().code(),
         tonic::Code::ResourceExhausted
     );
-    let app = crate::grpc::router_with_handler(shard.clone(), readers.clone(), actor.clone());
+    let app = service.server();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .serve_with_incoming(
+                app,
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+            )
+            .await
+            .unwrap()
+    });
     let mut client = DataPlaneClient::connect(url).await.unwrap();
     let error = client
         .write_record(proto::WriteRequest {
@@ -457,19 +467,10 @@ async fn full_backlog_rejects_writes_and_deletes_before_appending_to_wal() {
     assert_eq!(backlog.total, MAX_WRITE_BACKLOG);
     assert_eq!(backlog.in_flight, FLUSH_THRESHOLD);
     release.send(()).unwrap();
-    actor.stop_gracefully().await.unwrap();
-    actor
-        .wait_for_shutdown_with_result(|result| {
-            result.unwrap();
-        })
-        .await;
-    readers.stop_gracefully().await.unwrap();
-    readers.wait_for_shutdown().await;
-    stop(
-        WriteHandler::new(shard, writer, &dir.path().join("wal")).unwrap(),
-        db,
-    )
-    .await;
+    service.shutdown().await.unwrap();
+    telemetry.stop_gracefully().await.unwrap();
+    telemetry.wait_for_shutdown().await;
+    db.close().await.unwrap();
 }
 
 #[tokio::test]

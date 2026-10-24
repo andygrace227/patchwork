@@ -33,6 +33,15 @@ Default addresses:
 Use `--control-port`, `--data-port`, and `--mysql-port` to change the ports.
 Use `--web-port` to change the dashboard port and `--open-browser` to open it.
 Use `--no-build` to reuse the existing release build in `rust/target/release`.
+Tokio defaults to 5 worker threads per control node and 2 per data node. Override
+these with `--control-threads` and `--data-threads`; both must be positive integers.
+The launcher sets `TOKIO_WORKER_THREADS` for each node before startup, overriding
+any inherited value. For example:
+
+```sh
+python scripts/local_cluster.py --control-threads 5 --data-threads 2 --open-browser
+```
+
 The first release build takes longer; debug binaries are never used by the rig. All servers bind to localhost.
 The test database's root account has no password; the application uses the
 local `patchwork` account shown above.
@@ -102,6 +111,49 @@ The factor is the desired total number of copies. The endpoint is
 workflow finishes. The rig needs at least that many data nodes. After draining
 the write backlog, the added replica should contain the same records, tombstones,
 and partition ID. The `0` boundary above exists after the example split.
+
+## One data node, direct gRPC load
+
+To measure the data node on its own:
+
+```sh
+python3 scripts/local_data_node.py --open-browser
+```
+
+This starts one data node at `http://127.0.0.1:3210` and a dedicated dashboard at
+`http://127.0.0.1:3310`. It creates fresh SQLite/WAL files under
+`/tmp/patchwork-data-*` and needs neither MySQL nor a control node. The first run
+builds release binaries; use `--no-build` to reuse them.
+
+The defaults are `--data-threads 2`, `--load-threads 4`, and `--readers 4`.
+Use `--data-port` and `--web-port` to choose other ports, or `--no-web` to start
+only the node. Ctrl-C stops the load worker and node, preserving logs and reports.
+
+The page supports reads, local writes, mixed load, and up to 1,000,000 target
+requests per second. Read tests seed fresh record keys and wait for the write
+backlog to drain before timing starts. Keep seeding enabled to measure successful
+reads. Writes measure acknowledgement into the local write queue, rather than
+SQLite commit throughput. TPS includes completed misses/errors, which the page
+also shows separately.
+
+The existing Rust load worker supports direct mode outside the dashboard too:
+
+```sh
+TOKIO_WORKER_THREADS=4 rust/target/release/patchwork-load \
+  --data-url http://127.0.0.1:3210 --config data-load.json --report-dir /tmp
+```
+
+For example, `data-load.json` can contain:
+
+```json
+{"table_id": "1", "tps": 100000, "duration": 30, "workers": 256,
+ "read_percent": 100, "records": 10000, "keys": 100, "payload_bytes": 256,
+ "seed": true}
+```
+
+A downloaded report can also be supplied to `--config`. With a separately
+started data node reachable on the LAN, `--data-url` can target that node from
+another machine. The local launcher itself binds to localhost.
 
 ## TPS load generator
 

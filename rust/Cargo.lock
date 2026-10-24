@@ -1891,10 +1891,8 @@ name = "patchwork-data-plane"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
  "dotenvy",
  "kameo",
- "kameo_actors",
  "patchwork-common",
  "ringbuffer",
  "sea-orm",
@@ -1902,6 +1900,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tower",
  "wal-db",
@@ -1915,11 +1914,15 @@ dependencies = [
  "axum",
  "bytes",
  "dotenvy",
+ "futures-util",
+ "patchwork-common",
  "rand 0.9.5",
  "reqwest",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]

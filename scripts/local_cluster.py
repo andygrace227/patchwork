@@ -231,6 +231,7 @@ class Cluster:
             )
         for i, url in enumerate(self.data_urls):
             self.start_process(f"data-{i + 1}", [str(TARGET / "patchwork-data-plane")], {
+                "TOKIO_WORKER_THREADS": str(self.args.data_threads),
                 "BIND_ADDR": url.removeprefix("http://"),
                 "SHARD_PATH": str(self.directory / f"data-{i + 1}.sqlite"),
             })
@@ -238,6 +239,7 @@ class Cluster:
             self.wait_ready(lambda: data_request(url, "GetSize"), url)
         for i, url in enumerate(self.control_urls):
             self.start_process(f"control-{i + 1}", [str(TARGET / "patchwork-control-plane")], {
+                "TOKIO_WORKER_THREADS": str(self.args.control_threads),
                 "ATGS_INTERNAL_SERVICE_TOKEN": self.internal_token,
                 "BIND_ADDR": ("0.0.0.0:" + urlsplit(url).netloc.rsplit(":", 1)[1]) if self.args.lan_host else url.removeprefix("http://"), "DATABASE_URL": self.database_url,
             })
@@ -385,6 +387,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--control-nodes", type=int, default=2)
     parser.add_argument("--data-nodes", type=int, default=3)
+    parser.add_argument("--control-threads", type=int, default=5, help="Tokio worker threads per control node (default: 5)")
+    parser.add_argument("--data-threads", type=int, default=2, help="Tokio worker threads per data node (default: 2)")
     parser.add_argument("--control-port", type=int, default=3100, help="first control node port")
     parser.add_argument("--data-port", type=int, default=3200, help="first data node port")
     parser.add_argument("--mysql-port", type=int, default=13306)
@@ -408,6 +412,8 @@ def main():
             parser.error("--remote uses the dashboard and cannot be combined with --no-web or --smoke-test")
     if args.control_nodes < 1 or args.data_nodes < 1:
         parser.error("at least one control and one data node are required")
+    if args.control_threads < 1 or args.data_threads < 1:
+        parser.error("--control-threads and --data-threads must be positive integers")
     if args.smoke_test and args.data_nodes < 3:
         parser.error("table creation requires at least three data nodes for the smoke test")
 

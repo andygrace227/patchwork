@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path, time::Duration};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use kameo::{
@@ -8,24 +8,31 @@ use kameo::{
     messages,
 };
 use patchwork_common::datamodels::access_stats::{self, Entity};
-use sea_orm::{
-    ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection, EntityTrait,
-    IntoActiveModel, NotSet, QueryFilter, QueryOrder, Schema, TransactionTrait,
-};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
 use tokio::task::JoinHandle;
 
-use super::{Model, cache::TelemetryCache};
+use super::{Model, QueuedAccess, cache::TelemetryCache};
+use wal_db::{SegmentedStore, Wal};
 
 pub const FLUSH_INTERVAL: Duration = Duration::from_secs(60);
 pub const RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-/// One per host; share its ActorRef with every shard and read worker.
+struct InFlightBatch {
+    cache: TelemetryCache,
+    task: JoinHandle<Result<()>>,
+}
+
+/// One per host. Journal accesses, then commit snapshots without blocking its mailbox.
+/// Appends survive process restarts; background sync bounds power-loss exposure.
 pub struct AccessStatsActor {
     db: DatabaseConnection,
     cache: TelemetryCache,
     flush_interval: Duration,
     retention: Duration,
     timer: Option<JoinHandle<()>>,
+    sync_timer: Option<JoinHandle<()>>,
+    wal: Arc<Wal<SegmentedStore>>,
+    in_flight: Option<InFlightBatch>,
 }
 
 impl AccessStatsActor {
@@ -45,55 +52,96 @@ impl AccessStatsActor {
             "Retention is too long"
         );
         let path = path.as_ref();
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)?;
+        let db = super::store::open(path).await?;
+        let committed = super::store::checkpoint(&db).await?;
+        let wal = Arc::new(Wal::open_segmented(
+            format!("{}.wal", path.display()),
+            16 * 1024 * 1024,
+        )?);
+        anyhow::ensure!(
+            committed <= wal.len(),
+            "Telemetry journal is older than its database checkpoint"
+        );
+        let mut cache = TelemetryCache::new();
+        let cutoff = super::now_ms().saturating_sub(retention.as_millis() as i64);
+        for entry in wal.iter()? {
+            let entry = entry?;
+            if entry.lsn().get() < committed {
+                continue;
+            }
+            for access in serde_json::from_slice::<Vec<QueuedAccess>>(entry.data())? {
+                if access.time_ms >= cutoff {
+                    cache.inc_at(
+                        access.table_id,
+                        access.partition_key,
+                        access.is_write,
+                        Some(access.partition_id),
+                        access.time_ms,
+                    );
+                }
+            }
         }
-        let mut options = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
-        options.max_connections(1).sqlx_logging(false);
-        let db = Database::connect(options).await?;
-        db.execute_unprepared("PRAGMA journal_mode = WAL").await?;
-        let mut schema = Schema::new(db.get_database_backend()).create_table_from_entity(Entity);
-        schema.if_not_exists();
-        db.execute(&schema).await?;
-        let columns = db
-            .query_all_raw(sea_orm::Statement::from_string(
-                sea_orm::DbBackend::Sqlite,
-                "PRAGMA table_info(access_statistics)",
-            ))
-            .await?;
-        if !columns
-            .iter()
-            .any(|column| column.try_get::<String>("", "name").as_deref() == Ok("partition_id"))
-        {
-            db.execute_unprepared(
-                "ALTER TABLE access_statistics ADD COLUMN partition_id TEXT NULL",
-            )
-            .await?;
-        }
-        db.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS access_statistics_end_ms ON access_statistics (end_ms)",
-        )
-        .await?;
-        // Old history keeps its optional partition label; future samples use IDs only.
-        if columns
-            .iter()
-            .any(|column| column.try_get::<String>("", "name").as_deref() == Ok("hash_start"))
-        {
-            db.execute_unprepared("DROP INDEX IF EXISTS access_statistics_key_time")
-                .await?;
-            db.execute_unprepared("ALTER TABLE access_statistics DROP COLUMN hash_start")
-                .await?;
-        }
-        db.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS access_statistics_partition_time ON access_statistics (table_id, partition_id, start_ms)",
-        ).await?;
         Ok(Self {
             db,
-            cache: TelemetryCache::new(),
+            cache,
             flush_interval,
             retention,
             timer: None,
+            sync_timer: None,
+            wal,
+            in_flight: None,
         })
+    }
+    fn enqueue(&mut self, accesses: Vec<QueuedAccess>) -> Result<()> {
+        if accesses.is_empty() {
+            return Ok(());
+        }
+        let _ = self.wal.append(&serde_json::to_vec(&accesses)?)?;
+        for access in accesses {
+            self.cache.inc_at(
+                access.table_id,
+                access.partition_key,
+                access.is_write,
+                Some(access.partition_id),
+                access.time_ms,
+            );
+        }
+        Ok(())
+    }
+
+    async fn finish_batch(&mut self) -> Result<()> {
+        let Some(batch) = self.in_flight.take() else {
+            return Ok(());
+        };
+        let result = batch.task.await.unwrap_or_else(|error| Err(error.into()));
+        if result.is_err() {
+            let current = std::mem::replace(&mut self.cache, batch.cache);
+            self.cache.merge(current);
+        }
+        result
+    }
+
+    async fn start_flush(&mut self) -> Result<()> {
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|batch| batch.task.is_finished())
+        {
+            self.finish_batch().await?;
+        }
+        if self.in_flight.is_some() {
+            return Ok(());
+        }
+        let cache = std::mem::take(&mut self.cache);
+        let rows = cache.stats();
+        let end_lsn = self.wal.len();
+        let db = self.db.clone();
+        let wal = self.wal.clone();
+        let retention = self.retention;
+        let task = tokio::spawn(super::store::flush(db, wal, rows, end_lsn, retention));
+
+        self.in_flight = Some(InFlightBatch { cache, task });
+        Ok(())
     }
 }
 
@@ -104,11 +152,22 @@ impl Actor for AccessStatsActor {
     async fn on_start(mut state: Self, actor_ref: ActorRef<Self>) -> Result<Self> {
         let weak = actor_ref.downgrade();
         let interval = state.flush_interval;
+        let wal = state.wal.clone();
+        state.sync_timer = Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let wal = wal.clone();
+                match tokio::task::spawn_blocking(move || wal.sync()).await {
+                    Ok(Ok(())) => {}
+                    error => eprintln!("Could not sync telemetry journal: {error:?}"),
+                }
+            }
+        }));
         state.timer = Some(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
                 let Some(actor) = weak.upgrade() else { break };
-                if let Err(error) = actor.ask(Flush {}).await {
+                if let Err(error) = actor.ask(StartFlushBatch {}).await {
                     eprintln!("Could not flush access statistics: {error}");
                     if !actor.is_alive() {
                         break;
@@ -123,6 +182,9 @@ impl Actor for AccessStatsActor {
         if let Some(timer) = self.timer.take() {
             timer.abort();
         }
+        if let Some(timer) = self.sync_timer.take() {
+            timer.abort();
+        }
         self.flush().await?;
         self.db.clone().close().await?;
         Ok(())
@@ -132,57 +194,71 @@ impl Actor for AccessStatsActor {
 #[messages]
 impl AccessStatsActor {
     #[message]
+    pub async fn record_batch(&mut self, accesses: Vec<QueuedAccess>) -> Result<()> {
+        self.enqueue(accesses)
+    }
+
+    #[message]
     pub async fn track_access(
         &mut self,
         table_id: i64,
         partition_key: i64,
         is_write: bool,
         partition_id: Option<String>,
-    ) {
-        self.cache
-            .inc(table_id, partition_key, is_write, partition_id);
+    ) -> Result<()> {
+        let Some(partition_id) = partition_id.filter(|id| !id.is_empty()) else {
+            return Ok(());
+        };
+        self.enqueue(vec![QueuedAccess {
+            table_id,
+            partition_key,
+            is_write,
+            partition_id,
+            time_ms: super::now_ms(),
+        }])
     }
 
-    /// Append this sample and prune expired history in one transaction.
-    /// A failed write keeps the cache intact for the next attempt.
+    /// Start the disk write and immediately release the mailbox.
+    #[message]
+    pub async fn start_flush_batch(&mut self) -> Result<()> {
+        self.start_flush().await
+    }
+
+    /// Explicit flush and shutdown wait until all accesses accepted so far are stored.
     #[message]
     pub async fn flush(&mut self) -> Result<()> {
-        let rows = self.cache.stats();
-        let txn = self.db.begin().await?;
-        // Chunk below SQLite's bind-variable limit; the transaction covers every chunk.
-        for chunk in rows.chunks(50) {
-            Entity::insert_many(chunk.iter().cloned().map(|row| {
-                let mut row = row.into_active_model();
-                row.id = NotSet;
-                row
-            }))
-            .exec_without_returning(&txn)
-            .await?;
-        }
-        Entity::delete_many()
-            .filter(
-                access_stats::Column::EndMs
-                    .lt(super::now_ms().saturating_sub(self.retention.as_millis() as i64)),
-            )
-            .exec(&txn)
-            .await?;
-        txn.commit().await?;
-        self.cache = TelemetryCache::new();
-        Ok(())
+        self.finish_batch().await?;
+        self.start_flush().await?;
+        self.finish_batch().await
     }
 
     /// Current unflushed samples. Reading does not drain the cache.
     #[message]
-    pub async fn get_telemetry(&self) -> Result<Vec<Model>> {
-        self.cache
-            .stats()
-            .into_iter()
+    pub async fn get_telemetry(&mut self) -> Result<Vec<Model>> {
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|batch| batch.task.is_finished())
+        {
+            self.finish_batch().await?;
+        }
+        let rows = if let Some(batch) = &self.in_flight {
+            let mut cache = batch.cache.clone();
+            cache.merge(self.cache.clone());
+            cache.stats()
+        } else {
+            self.cache.stats()
+        };
+        rows.into_iter()
             .map(|row| Ok(row.into_telemetry()?))
             .collect()
     }
 
     #[message]
-    pub async fn get_telemetry_for_table(&self, table_id: i64) -> Result<HashMap<String, Model>> {
+    pub async fn get_telemetry_for_table(
+        &mut self,
+        table_id: i64,
+    ) -> Result<HashMap<String, Model>> {
         Ok(self
             .get_telemetry()
             .await?

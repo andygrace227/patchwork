@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Patchwork · Single data node</title>
+  <link rel="stylesheet" href="/static/cluster.css">
+  <style>
+    main { margin: 0 auto; max-width: 1100px; }
+    .settings { display: grid; grid-template-columns: repeat(auto-fit,minmax(180px,1fr)); gap: 16px; }
+    label { display: grid; gap: 6px; }
+    input, select { width: 100%; padding: 8px; border: 1px solid var(--line); border-radius: 5px; background: white; }
+    .metrics { display: grid; grid-template-columns: repeat(auto-fit,minmax(145px,1fr)); gap: 14px; margin: 24px 0; }
+    .metric { padding: 16px; background: white; border: 1px solid var(--line); border-radius: 8px; }
+    .metric strong { display: block; font-size: 25px; }
+    .actions { display: flex; gap: 10px; margin-top: 20px; }
+    fieldset { border: 0; padding: 0; margin: 0; }
+    #error { color: #a32e2e; white-space: pre-wrap; }
+    progress { width: 100%; }
+  </style>
+  <script src="/static/data-node.js" defer></script>
+</head>
+<body><main>
+  <header><div><p class="eyebrow">PATCHWORK / LOCAL LOAD TEST</p><h1>One data node</h1><p class="subtitle">Direct gRPC reads and local writes.</p></div><span id="phase" class="tag">idle</span></header>
+  <p id="node">Connecting…</p>
+  <section class="panel" style="padding:24px">
+    <form id="load-form">
+      <fieldset id="settings" class="settings">
+        <label>Table ID<input name="table_id" type="number" min="1" value="1" required></label>
+        <label>Target requests / second<input name="tps" type="number" min="1" max="1000000" value="100000" required></label>
+        <label>Duration (seconds)<input name="duration" type="number" min="1" max="3600" value="30" required></label>
+        <label>Concurrent requests<input name="workers" type="number" min="1" max="1024" value="256" required></label>
+        <label>Reads (%)<input name="read_percent" type="number" min="0" max="100" value="100" required></label>
+        <label>Records<input name="records" type="number" min="1" max="100000" value="10000" required></label>
+        <label>Partition keys<input name="keys" type="number" min="1" max="10000" value="100" required></label>
+        <label>Payload padding (bytes)<input name="payload_bytes" type="number" min="0" max="1048576" value="256" required></label>
+        <label>Distribution<select name="distribution"><option value="spread">Spread</option><option value="hot">One hot key</option></select></label>
+        <label>Hot partition key<input name="hot_key" type="number" value="10" required></label>
+        <label style="display:flex;align-items:center"><input name="seed" type="checkbox" checked style="width:auto">Seed records before reads</label>
+      </fieldset>
+      <div class="actions"><button id="start" type="submit">Start load</button><button id="stop" type="button" disabled>Stop</button><button id="download" type="button" disabled>Download report</button></div>
+    </form>
+  </section>
+  <div class="metrics">
+    <div class="metric">Current TPS<strong id="current">0</strong></div>
+    <div class="metric">Average TPS<strong id="average">0</strong></div>
+    <div class="metric">p95 latency<strong id="latency">0 ms</strong></div>
+    <div class="metric">In flight<strong id="inflight">0</strong></div>
+    <div class="metric">Errors / misses<strong id="errors">0 / 0</strong></div>
+    <div class="metric">Skipped slots<strong id="skipped">0</strong></div>
+  </div>
+  <progress id="progress" max="30" value="0"></progress>
+  <p id="detail">Ready to start.</p><p id="error" role="alert"></p>
+  <p class="subtitle">Seeding finishes committing before timed reads begin. Each run uses fresh record keys. Writes measure local admission; reads measure retrieval over gRPC.</p>
+  <p id="directory" class="subtitle"></p>
+</main></body>
+</html>

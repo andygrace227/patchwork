@@ -82,42 +82,48 @@ async fn executor_limits_jobs_keeps_tables_separate_and_recovers_after_failure()
     let handler_gates = gates.clone();
     let (started, mut requests) = mpsc::unbounded_channel();
     let dir = tempfile::tempdir().unwrap();
-    let shard = patchwork_data_plane::initialize::shard(
-        dir.path().join("shard.sqlite").to_str().unwrap().into(),
+    let shard_path = dir.path().join("shard.sqlite");
+    let shard_stats = patchwork_data_plane::telemetry::AccessStatsActor::spawn(
+        patchwork_data_plane::telemetry::AccessStatsActor::new(
+            shard_path.with_extension("stats.sqlite"),
+        )
+        .await
+        .unwrap(),
+    );
+    let shard_wal = shard_path.with_extension("wal");
+    let shard = patchwork_data_plane::service::Service::new(
+        &shard_path,
+        &shard_wal,
+        shard_stats.clone(),
+        2,
     )
     .await
     .unwrap();
-    let shard_readers = shard.read_pool(2).unwrap();
-    let shard = patchwork_data_plane::write_shard::WriteShard::spawn(shard);
-    let app = patchwork_data_plane::grpc::router(
-        shard.clone(),
-        shard_readers.clone(),
-        &dir.path().join("wal"),
-    )
-    .unwrap()
-    .layer(middleware::from_fn(move |request: Request, next: Next| {
-        let handler_gates = handler_gates.clone();
-        let started = started.clone();
-        async move {
-            assert_eq!(
-                request.uri().path(),
-                "/patchwork.dataplane.DataPlane/GetTelemetryForTable"
-            );
-            let (parts, body) = request.into_parts();
-            let bytes = to_bytes(body, 1024).await.unwrap();
-            let id = patchwork_common::grpc::proto::TableRequest::decode(&bytes[5..])
-                .unwrap()
-                .table_id;
-            started.send(id).unwrap();
-            handler_gates[(id - 1) as usize]
-                .acquire()
-                .await
-                .unwrap()
-                .forget();
-            next.run(Request::from_parts(parts, Body::from(bytes)))
-                .await
-        }
-    }));
+    let app = tonic::service::Routes::new(shard.server())
+        .into_axum_router()
+        .layer(middleware::from_fn(move |request: Request, next: Next| {
+            let handler_gates = handler_gates.clone();
+            let started = started.clone();
+            async move {
+                assert_eq!(
+                    request.uri().path(),
+                    "/patchwork.dataplane.DataPlane/GetTelemetryForTable"
+                );
+                let (parts, body) = request.into_parts();
+                let bytes = to_bytes(body, 1024).await.unwrap();
+                let id = patchwork_common::grpc::proto::TableRequest::decode(&bytes[5..])
+                    .unwrap()
+                    .table_id;
+                started.send(id).unwrap();
+                handler_gates[(id - 1) as usize]
+                    .acquire()
+                    .await
+                    .unwrap()
+                    .forget();
+                next.run(Request::from_parts(parts, Body::from(bytes)))
+                    .await
+            }
+        }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -277,10 +283,9 @@ async fn executor_limits_jobs_keeps_tables_separate_and_recovers_after_failure()
     executor.wait_for_shutdown().await;
     server.abort();
     let _ = server.await;
-    shard_readers.stop_gracefully().await.unwrap();
-    shard_readers.wait_for_shutdown().await;
-    shard.stop_gracefully().await.unwrap();
-    shard.wait_for_shutdown().await;
+    shard.shutdown().await.unwrap();
+    shard_stats.stop_gracefully().await.unwrap();
+    shard_stats.wait_for_shutdown().await;
     node.stop_gracefully().await.unwrap();
     partition.stop_gracefully().await.unwrap();
     table.stop_gracefully().await.unwrap();

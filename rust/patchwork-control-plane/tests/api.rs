@@ -12,7 +12,6 @@ use patchwork_control_plane::{
     dataplane_client::{Client, Record},
     workflows::executor::{ExecutorConfig, GetExecutorStatus, LongRunningWorkflowExecutor},
 };
-use patchwork_data_plane::write_shard::WriteShard;
 use reqwest::StatusCode;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, Database, Schema};
 use serde_json::json;
@@ -54,26 +53,25 @@ async fn routes_invoke_record_workflows_and_report_table_job_results() {
     let mut replicas = Vec::new();
     let mut urls = Vec::new();
     for timestamp in [1, 2] {
-        let shard = patchwork_data_plane::initialize::shard(
-            dir.path()
-                .join(format!("{timestamp}.sqlite"))
-                .to_str()
-                .unwrap()
-                .into(),
+        let shard_path = dir.path().join(format!("{timestamp}.sqlite"));
+        let shard_stats = patchwork_data_plane::telemetry::AccessStatsActor::spawn(
+            patchwork_data_plane::telemetry::AccessStatsActor::new(
+                shard_path.with_extension("stats.sqlite"),
+            )
+            .await
+            .unwrap(),
+        );
+        let shard_wal = shard_path.with_extension("wal");
+        let shard = patchwork_data_plane::service::Service::new(
+            &shard_path,
+            &shard_wal,
+            shard_stats.clone(),
+            2,
         )
         .await
         .unwrap();
-        let shard_readers = shard.read_pool(2).unwrap();
-        let shard = WriteShard::spawn(shard);
-        let (url, server) = serve(
-            patchwork_data_plane::grpc::router(
-                shard.clone(),
-                shard_readers.clone(),
-                &dir.path().join(format!("{timestamp}.wal")),
-            )
-            .unwrap(),
-        )
-        .await;
+        let (url, server) =
+            serve(tonic::service::Routes::new(shard.server()).into_axum_router()).await;
         client
             .upsert(&url, 1, 10, 42, &json!({"value": timestamp}), timestamp)
             .await
@@ -88,7 +86,7 @@ async fn routes_invoke_record_workflows_and_report_table_job_results() {
             .await
             .unwrap();
         replicas.push(replica.node_id);
-        shards.push((shard, shard_readers));
+        shards.push((shard, shard_stats));
         servers.push(server);
         urls.push(url);
     }
@@ -420,10 +418,9 @@ async fn routes_invoke_record_workflows_and_report_table_job_results() {
         server.abort();
         let _ = server.await;
     }
-    for (shard, shard_readers) in shards {
-        shard_readers.stop_gracefully().await.unwrap();
-        shard_readers.wait_for_shutdown().await;
-        shard.stop_gracefully().await.unwrap();
-        shard.wait_for_shutdown().await;
+    for (shard, stats) in shards {
+        shard.shutdown().await.unwrap();
+        stats.stop_gracefully().await.unwrap();
+        stats.wait_for_shutdown().await;
     }
 }

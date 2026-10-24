@@ -45,14 +45,13 @@ async fn grpc_and_sqlite_preserve_arbitrary_bytes_and_tombstones() {
         .unwrap();
     assert!(tombstone.deleted);
     assert!(tombstone.data.is_empty());
-    // The same listener exposes no REST handlers.
     let response = node
         .app
         .clone()
         .oneshot(
-            axum::http::Request::builder()
+            tonic::codegen::http::Request::builder()
                 .uri("/shard/size")
-                .body(axum::body::Body::empty())
+                .body(tonic::body::Body::empty())
                 .unwrap(),
         )
         .await
